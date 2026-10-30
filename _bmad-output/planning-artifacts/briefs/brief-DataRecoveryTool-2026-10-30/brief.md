@@ -1,11 +1,11 @@
 ---
-title: "Product Brief: Open-Source macOS Data Recovery Tool"
-status: draft
+title: "Product Brief: Salvage"
+status: final
 created: 2026-10-30
 updated: 2026-10-30
 ---
 
-# Product Brief: Open-Source macOS Data Recovery Tool
+# Product Brief: Salvage
 
 ## Executive Summary
 
@@ -13,7 +13,7 @@ Losing files — a formatted SD card, a dropped USB drive, an accidentally empti
 
 This project is a **native macOS data recovery app that is free, fully open source, and fully offline** — no telemetry, no cloud upload, no account, no paywall between "see what's recoverable" and "actually recover it." It targets the same core use cases the commercial incumbents own today — deleted-file undelete, lost-partition detection and reconstruction, and signature-based file carving across common filesystems — with the same approachable, scan-and-browse experience (file-type categorization, per-file recovery-confidence indicators, live previews before committing to a recovery) but built in the open, auditable by anyone, and trustworthy by construction rather than by brand reputation.
 
-[ASSUMPTION] Working title: **OpenRecover** — a placeholder name, easy to change before any public release.
+Product name (confirmed): **Salvage**.
 
 ## The Problem
 
@@ -36,7 +36,7 @@ Being honest about the moat: this is **not** a claim of superior recovery techno
 - **Auditable recovery logic.** For a category of software whose entire job is reading a user's most sensitive data at the lowest level, "trust us" is a weak proposition. Open source lets technically-minded users (and eventually security researchers) verify the app does only what it claims.
 - **Community-extensible.** New file-signature definitions, filesystem support, and bug fixes can come from contributors, not just a single vendor's roadmap.
 
-[ASSUMPTION] License: MIT, chosen to maximize adoption and allow commercial/derivative use — open question, see Addendum for the MIT vs. GPL-family tradeoff.
+License (confirmed): MIT, chosen to maximize adoption and allow commercial/derivative use.
 
 ## Who This Serves
 
@@ -77,7 +77,7 @@ This scope is ambitious for a first release; the Architecture and Epics/Stories 
 
 ## Risks & Open Questions
 
-- **Notarization requires a paid Apple Developer ID ($99/yr), in tension with "free and open source."** Mac App Store distribution isn't an option for this category (raw disk access needs more than the sandbox allows — see Scope), so notarized direct download is the only path, and unsigned builds trigger Gatekeeper friction that undercuts the trust pitch. Needs a funding answer (maintainer-funded, Sponsors, a sponsoring org) before public release.
+- ~~Notarization requires a paid Apple Developer ID ($99/yr), in tension with "free and open source."~~ **RESOLVED** — Developer ID signing/notarization is already available under HSmithDev LLC's existing membership, so this is covered. Mac App Store distribution still isn't an option for this category (raw disk access needs more than the sandbox allows — see Scope), so notarized direct download remains the distribution path.
 - **Recovery-confidence accuracy.** A "recovery chances" indicator is only trustworthy if it's honest; overpromising on carved files with no metadata (the hardest case) would undercut the whole trust-based pitch. Needs a deliberately conservative scoring approach.
 - **Full Disk Access / `/dev/diskN` entitlement mechanics weren't fully confirmed in research.** Working assumption: Full Disk Access + Developer ID signing suffices (matches competitors) — verify with a hands-on spike before Architecture commits to it.
 - **Legal/liability framing.** Standard open-source "as-is, no warranty" disclaimers apply, but a tool that reads raw user disks should say plainly, in-product, what it does and doesn't do (read-only, no network access) — this is as much a trust feature as a legal one.

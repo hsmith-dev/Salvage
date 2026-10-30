@@ -1,24 +1,23 @@
 ---
-title: "PRD: OpenRecover"
+title: "PRD: Salvage"
 status: final
 created: 2026-10-30
 updated: 2026-10-30
 ---
 
-# PRD: OpenRecover
-*Working title — confirm. See Assumptions Index.*
+# PRD: Salvage
 
 ## 0. Document Purpose
 
 This PRD is for whoever builds and reviews this product next: the PM/maintainer (Harrison), and the downstream BMAD workflows (UX, Architecture, Epics & Stories) that consume it. It builds on, and does not duplicate, the product brief and its addendum at `_bmad-output/planning-artifacts/briefs/brief-DataRecoveryTool-2026-10-30/` — read those for the fuller competitive landscape, recovery-technique background, and options considered (Electron vs. native, MIT vs. GPL). This document is structured capability-first: a Glossary anchors vocabulary, Features (§4) group Functional Requirements (FR-1 through FR-N, globally numbered, stable across reorganization), and every inferred `[ASSUMPTION]` is indexed in §9 for explicit confirmation.
 
-**Three unresolved items block public release, not just this document's completeness: product name (Open Question 1), license (Open Question 2), and who funds the required $99/yr Apple Developer Program membership (Open Question 3). The feature set below is otherwise ready to hand to UX/Architecture.**
+**The three items that previously blocked public release are now resolved: the product name is Salvage, the license is MIT, and Developer ID signing/notarization is already available under HSmithDev LLC (see Open Questions 1–3 for the record). Nothing in this PRD blocks handing the feature set to UX/Architecture.**
 
 ## 1. Vision
 
 Mac users who lose files — a corrupted external drive, a formatted SD card, an accidentally emptied Trash, a partition that silently disappeared — currently have one real option: hand raw, unfiltered access to their most sensitive data to a closed-source commercial tool (Disk Drill, EaseUS, Stellar) they cannot inspect, usually behind a paywall gating the moment they actually need the recovered files.
 
-OpenRecover is a native macOS app that does the same job — scan a device, find what's recoverable, let the user browse and recover it — using the same proven techniques the category relies on (metadata-based undelete, signature-based file carving, lost-partition reconstruction), but fully open source, fully offline, and entirely free. No telemetry, no account, no scan/recover paywall split. The pitch isn't a better recovery algorithm on day one — mature closed-source tools have a head start there — it's that a tool whose entire job is reading your most sensitive data at the lowest level should be a tool you (or anyone) can actually verify, not one you're asked to trust on faith.
+Salvage is a native macOS app that does the same job — scan a device, find what's recoverable, let the user browse and recover it — using the same proven techniques the category relies on (metadata-based undelete, signature-based file carving, lost-partition reconstruction), but fully open source, fully offline, and entirely free. No telemetry, no account, no scan/recover paywall split. The pitch isn't a better recovery algorithm on day one — mature closed-source tools have a head start there — it's that a tool whose entire job is reading your most sensitive data at the lowest level should be a tool you (or anyone) can actually verify, not one you're asked to trust on faith.
 
 macOS is the deliberate starting point, not the ceiling. Once the recovery engine is solid, Linux and Windows support is an explicit intended direction — the engine is architected as a portable core from the start so a future cross-platform front end doesn't mean starting over.
 
@@ -42,7 +41,7 @@ macOS is the deliberate starting point, not the ceiling. Once the recovery engin
 
 - **UJ-1. Sam recovers two years of photos off a drive that stopped mounting.**
   - **Persona + context:** Sam, a freelance photographer, plugs in an external SSD that macOS now refuses to mount — the Finder shows no volume at all.
-  - **Entry state:** No prior app usage. Downloads OpenRecover, grants Full Disk Access when prompted.
+  - **Entry state:** No prior app usage. Downloads Salvage, grants Full Disk Access when prompted.
   - **Path:** Opens the app, selects the external SSD from the device list (realizes FR-1). Starts a scan; sees live progress and files appearing by type as the scan runs (FR-2, FR-11). The scan surfaces a "Lost Partition" result distinct from the (absent) mounted volume (FR-9).
   - **Climax:** Sam opens the lost partition's results, sees thousands of photos bucketed under Pictures with high-confidence badges (recovered via intact metadata, FR-4, FR-12), previews a few to confirm they're intact (FR-13), and selects "Recover All" to a new external drive (FR-14).
   - **Resolution:** Recovery summary confirms file count, size, and destination; Sam opens the folder in Finder and confirms the photos are back, in their original folder structure and filenames.
@@ -50,7 +49,7 @@ macOS is the deliberate starting point, not the ceiling. Once the recovery engin
 
 - **UJ-2. Priya checks the tool is safe before trusting it with a client drive.**
   - **Persona + context:** Priya, a freelance editor under an NDA, needs to recover deleted project files from a USB drive but won't run a closed-source tool against client data.
-  - **Entry state:** Found OpenRecover via its GitHub repo, not an app store. Reads the in-app "what this app reads and writes" explanation before doing anything else (FR-19).
+  - **Entry state:** Found Salvage via its GitHub repo, not an app store. Reads the in-app "what this app reads and writes" explanation before doing anything else (FR-19).
   - **Path:** Confirms in Activity Monitor / Little Snitch (her own tooling, not the app's) that no network connections occur during a scan (realizes FR-17, FR-18). Runs the scan against the USB drive.
   - **Climax:** Recovers the deleted files to a separate destination folder; the app never asked for network access and the source drive's modification time didn't change.
   - **Resolution:** Priya trusts the tool for future client work specifically because she could verify the claim herself, not because of a brand name.
@@ -58,7 +57,7 @@ macOS is the deliberate starting point, not the ceiling. Once the recovery engin
 
 ## 3. Glossary
 
-- **Block device** — A storage device macOS can address at the raw byte/sector level (internal drive, external HDD/SSD, USB flash drive, SD/memory card). The unit OpenRecover scans.
+- **Block device** — A storage device macOS can address at the raw byte/sector level (internal drive, external HDD/SSD, USB flash drive, SD/memory card). The unit Salvage scans.
 - **Source disk** — The block device being scanned/recovered from. Never written to (see FR-15).
 - **Destination** — The location, on a different volume than the source disk, where recovered files are copied.
 - **Scan session** — One run of scanning a selected source disk, producing a set of recoverable results.
@@ -294,9 +293,9 @@ App includes a plain-language, in-app explanation of exactly what it reads from 
 
 ## 8. Open Questions
 
-1. **Product name** — "OpenRecover" is a placeholder invented during the brief, not user-confirmed.
-2. **License** — MIT (current default assumption, maximizes adoption/reuse) vs. a GPL-family copyleft license (stronger guarantee that forks stay open, arguably fits the privacy/trust mission better). Carried from the brief, still unresolved.
-3. **Who funds the $99/yr Apple Developer Program fee** required for Developer ID signing and notarization? Unsigned builds undercut the trust pitch via Gatekeeper friction. `[NOTE FOR PM: phase-blocking before any public release, not a detail to defer indefinitely.]`
+1. **~~Product name~~ — RESOLVED.** Salvage.
+2. **~~License~~ — RESOLVED.** MIT.
+3. **~~Who funds the $99/yr Apple Developer Program fee~~ — RESOLVED.** Developer ID signing/notarization is already available under HSmithDev LLC.
 4. **(Pre-Architecture technical spike, with 9 and 10 below — one connected investigation, not three unrelated unknowns) Exact Full Disk Access / SIP entitlement mechanics** for raw `/dev/diskN` access were not independently confirmed during research. Needs a hands-on technical spike before Architecture finalizes the access model — current working assumption (FDA + Developer ID signing suffices, matching competitors) should be treated as unverified until then.
 5. **Minimum supported macOS version.** Not yet set `[ASSUMPTION: macOS 14 Sonoma or later, pending confirmation against real target-user OS distribution]`.
 6. **Should a command-line interface accompany the GUI** (TestDisk/PhotoRec-style, for power users or scripting)? Not decided.
@@ -307,8 +306,6 @@ App includes a plain-language, in-app explanation of exactly what it reads from 
 
 ## 9. Assumptions Index
 
-- §Title / Product name: working title "OpenRecover" — placeholder, needs confirmation (also Open Question 1).
-- §Monetization: license defaulted to MIT — needs confirmation against the GPL-family alternative (also Open Question 2).
 - FR-2: progress-update staleness threshold assumed at 2 seconds.
 - §Cross-Cutting NFRs / Accessibility: standard Apple HIG / VoiceOver support assumed as the baseline for primary flows, not separately specified per feature.
 - §Platform: minimum macOS version assumed as macOS 14 Sonoma or later (also Open Question 5).
@@ -339,11 +336,11 @@ App includes a plain-language, in-app explanation of exactly what it reads from 
 - The sole network exception is a manual, user-initiated "Check for Updates" action (FR-17) — any future addition of network behavior needs the same bar of justification and disclosure.
 
 **Cost**
-- Apple's $99/yr Developer Program membership is required for Developer ID signing and notarization, regardless of the app itself being free — this is a real, recurring cost for a project with no monetization, and the funding source is unresolved (Open Question 3).
+- Apple's $99/yr Developer Program membership is required for Developer ID signing and notarization, regardless of the app itself being free. This is already covered — signing/notarization is available under HSmithDev LLC's existing Developer Program membership (see Open Question 3) — so this is no longer a release blocker, though it remains a real recurring cost worth tracking for a project with no monetization.
 
 ## Monetization
 
-Free and fully open source, released under the MIT license `[ASSUMPTION: MIT chosen for adoption/reuse; a GPL-family copyleft license was identified as a real competing option tied to the privacy/trust mission — see Open Question 2]`. No license key, no feature gating between "free scan" and "paid recovery," no subscription, no in-app purchase. This is a stated product value (differentiation, per the brief) as much as a pricing decision — any future monetization discussion would need to be reconciled against the trust positioning in §4.6, not layered on quietly.
+Free and fully open source, released under the MIT license (confirmed). No license key, no feature gating between "free scan" and "paid recovery," no subscription, no in-app purchase. This is a stated product value (differentiation, per the brief) as much as a pricing decision — any future monetization discussion would need to be reconciled against the trust positioning in §4.6, not layered on quietly.
 
 ## Platform
 
