@@ -214,8 +214,8 @@ struct NTFSRecord {
         return a.subdata(in: offset..<offset + length)
     }
 
-    /// Returns nil when the name is unusable (invalid UTF-16, empty, or containing a separator), so a
-    /// different namespace's name can be chosen instead of a silently altered one.
+    /// Returns nil when the name is unusable (invalid UTF-16, empty, "." or "..", or containing a
+    /// separator), so a different namespace's name can be chosen instead of a silently altered one.
     static func fileName(_ v: Data) throws -> NTFSFileName? {
         guard v.count >= 0x42 else { throw ScanError.malformed("Truncated $FILE_NAME.") }
         let count = Int(v[0x40]), namespace = v[0x41]
@@ -224,7 +224,9 @@ struct NTFSRecord {
         let invalid = transcode(units.makeIterator(), from: UTF16.self, to: UTF32.self, stoppingOnError: true) { _ in }
         let reference = try v.number(0, 8)
         let name = String(decoding: units, as: UTF16.self)
-        guard !invalid, !name.isEmpty, !name.contains("/"), !name.contains("\0") else { return nil }
+        guard !invalid, !name.isEmpty, name != ".", name != "..", !name.contains("/"), !name.contains("\0") else {
+            return nil
+        }
         return NTFSFileName(parent: reference & 0x0000_ffff_ffff_ffff, parentSequence: UInt16(reference >> 48),
                             namespace: namespace, name: name)
     }
@@ -233,9 +235,14 @@ struct NTFSRecord {
     /// continues in other records.
     static func nonResidentStream(_ a: Data, geometry g: NTFSGeometry) throws -> NTFSDataStream? {
         guard a.count >= 0x40 else { throw ScanError.malformed("Truncated non-resident NTFS attribute.") }
+        // Both VCNs come from disk. An empty extent has lastVCN == startVCN - 1, and no extent can map
+        // more clusters than the volume holds, so both stay well inside Int64 before any arithmetic.
+        let startVCN = try signed(a.number(0x10, 8))
         let lastVCN = Int64(bitPattern: try a.number(0x18, 8))
-        guard lastVCN >= -1 else { throw ScanError.malformed("Invalid NTFS VCN range.") }
-        let vcnCount = lastVCN + 1
+        guard startVCN < g.clusterCount, lastVCN >= startVCN - 1, lastVCN < g.clusterCount else {
+            throw ScanError.malformed("Invalid NTFS VCN range.")
+        }
+        let vcnCount = try checkedAdd(lastVCN - startVCN, 1)
         let runsOffset = Int(try a.number(0x20, 2))
         let allocated = try signed(a.number(0x28, 8)), real = try signed(a.number(0x30, 8))
         let initialized = try signed(a.number(0x38, 8))
