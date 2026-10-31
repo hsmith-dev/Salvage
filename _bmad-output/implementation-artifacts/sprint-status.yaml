@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 10-31-2026 09:25
-last_updated: 10-31-2026 17:10
+last_updated: 10-31-2026 18:05
 project: Salvage
 project_key: NOKEY
 tracking_system: file-system
@@ -50,18 +50,18 @@ development_status:
   1-12-read-physical-drives-via-a-read-only-privileged-helper: review
   epic-1-retrospective: optional
 
-  epic-2: backlog
-  2-1-apfs-parsing-strategy-spike: backlog
-  2-2-scan-and-recover-deleted-files-from-an-apfs-drive: backlog
-  2-3-scan-and-recover-deleted-files-from-an-hfs-drive: backlog
-  2-4-unlock-and-recover-from-a-filevault-encrypted-volume: backlog
+  epic-2: in-progress
+  2-1-apfs-parsing-strategy-spike: in-progress
+  2-2-scan-and-recover-deleted-files-from-an-apfs-drive: in-progress
+  2-3-scan-and-recover-deleted-files-from-an-hfs-drive: in-progress
+  2-4-unlock-and-recover-from-a-filevault-encrypted-volume: in-progress
   epic-2-retrospective: optional
 
-  epic-3: backlog
-  3-1-carve-files-from-raw-bytes-when-metadata-is-gone: backlog
-  3-2-organize-reconstructed-files-sensibly: backlog
-  3-3-discover-a-lost-partition: backlog
-  3-4-recover-files-from-a-lost-partition: backlog
+  epic-3: in-progress
+  3-1-carve-files-from-raw-bytes-when-metadata-is-gone: in-progress
+  3-2-organize-reconstructed-files-sensibly: in-progress
+  3-3-discover-a-lost-partition: in-progress
+  3-4-recover-files-from-a-lost-partition: in-progress
   epic-3-retrospective: optional
 
   epic-4: in-progress
