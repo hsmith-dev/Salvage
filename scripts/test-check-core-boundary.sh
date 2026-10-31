@@ -19,9 +19,10 @@ status=0
 
 core_violation_file="SalvageCore/Sources/SalvageCore/__TestForbiddenImport.swift"
 app_violation_file="Salvage/__TestDiskArbitrationLeak.swift"
+spike_harness_file="scripts/spike-raw-device-access/Sources/spike-raw-device-access/__TestDiskArbitrationImport.swift"
 
 cleanup() {
-    rm -f "$core_violation_file" "$app_violation_file"
+    rm -f "$core_violation_file" "$app_violation_file" "$spike_harness_file"
 }
 trap cleanup EXIT
 
@@ -75,7 +76,26 @@ assert_fails "DiskArbitration leak" "$app_violation_file"
 rm -f "$app_violation_file"
 
 echo
-echo "=== Post-condition: tree is clean again after both injected scenarios ==="
+echo "=== Scenario: DiskArbitration imported inside the spike-raw-device-access exclusion (must still pass) ==="
+# scripts/spike-raw-device-access/ is a deliberate, narrow exclusion from check #2 (it's
+# disposable spike tooling, never wired into SalvageDiskIO/SalvageCore/Salvage -- see that
+# script's comments). This asserts the exclusion actually works for a real import there.
+echo "import DiskArbitration" > "$spike_harness_file"
+assert_passes "DiskArbitration import inside the spike-raw-device-access exclusion"
+rm -f "$spike_harness_file"
+
+echo
+echo "=== Scenario: DiskArbitration imported just outside the exclusion must still be caught ==="
+# Guards against the exclusion pattern being (or becoming, via a future typo) broader than
+# intended -- e.g. a bare 'scripts/' prefix match would also swallow this file, which sits
+# directly under scripts/ rather than under scripts/spike-raw-device-access/.
+scripts_root_violation_file="scripts/__TestDiskArbitrationLeak.swift"
+echo "import DiskArbitration" > "$scripts_root_violation_file"
+assert_fails "DiskArbitration leak just outside the spike-harness exclusion" "$scripts_root_violation_file"
+rm -f "$scripts_root_violation_file"
+
+echo
+echo "=== Post-condition: tree is clean again after all injected scenarios ==="
 assert_passes "clean after teardown"
 
 echo

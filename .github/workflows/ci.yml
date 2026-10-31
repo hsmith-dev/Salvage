@@ -52,6 +52,16 @@ jobs:
       - name: Run SalvageDiskIO tests
         run: swift test --package-path SalvageDiskIO
 
+      # Disposable spike tooling (Story 1.2's FDA/raw-device-access harness, see
+      # scripts/spike-raw-device-access/), but it's still real code with safety-critical
+      # boot-disk-detection logic -- build and test it like every other package in the repo
+      # rather than letting it go unchecked by CI.
+      - name: Build spike-raw-device-access harness (swift build)
+        run: swift build --package-path scripts/spike-raw-device-access
+
+      - name: Run spike-raw-device-access harness tests
+        run: swift test --package-path scripts/spike-raw-device-access
+
       # Unsigned debug build: CI has no Developer ID identity/team configured (see release.yml
       # for the signed/notarized release pipeline), so signing is explicitly disabled here.
       - name: Build Salvage app (xcodebuild)

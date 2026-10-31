@@ -11,6 +11,15 @@ set -uo pipefail
 #   3. SalvageCore's resolved dependency graph must never pull in a transitive dependency that
 #      itself requires one of those same non-portable platform frameworks.
 #
+# One deliberate, narrow exclusion from check #2: `scripts/spike-raw-device-access/`, the
+# disposable SwiftPM CLI harness built for Story 1.2's FDA/raw-device-access spike (see
+# _bmad-output/implementation-artifacts/spec-1-2-full-disk-access-raw-device-access-spike.md).
+# Its Boundaries & Constraints explicitly keep that harness outside the shipping app and outside
+# SalvageDiskIO/SalvageCore/Salvage entirely -- AD-1/AD-9's "exclusive owner" rule binds the
+# three hexagonal modules, not standalone spike tooling never wired into them. If the harness is
+# ever promoted into the shipping app, it must move under SalvageDiskIO and this exclusion must
+# be removed.
+#
 # Exits non-zero and names the offending file/import/dependency on any violation; exits 0 only
 # when every check passes cleanly. Intended to be run both locally and as a CI step
 # (.github/workflows/ci.yml).
@@ -42,7 +51,7 @@ fi
 echo
 echo "== [2/3] DiskArbitration must only be imported inside SalvageDiskIO =="
 all_disk_arbitration_imports="$(grep -rnE --exclude-dir=.git --exclude-dir=.build --exclude-dir=DerivedData --include='*.swift' "${import_prefix}DiskArbitration\\b" . 2>/dev/null)"
-leaked="$(printf '%s\n' "$all_disk_arbitration_imports" | grep -v '^\./SalvageDiskIO/' | grep -v '^$')"
+leaked="$(printf '%s\n' "$all_disk_arbitration_imports" | grep -v '^\./SalvageDiskIO/' | grep -v '^\./scripts/spike-raw-device-access/' | grep -v '^$')"
 if [ -n "$leaked" ]; then
     echo "VIOLATION: DiskArbitration imported outside SalvageDiskIO:"
     echo "$leaked"
