@@ -77,12 +77,12 @@ context:
 
 ## Tasks & Acceptance
 
-- [ ] Boot sector and `$MFT` bootstrap with fixups.
-- [ ] Attribute parsing (`$SI`, `$FN`, `$DATA` resident and non-resident, run lists).
-- [ ] Path reconstruction with orphan handling.
-- [ ] Deleted-record detection with the `$Bitmap` check.
-- [ ] Set `isImplemented = true` and update the routing tests.
-- [ ] Synthetic-image tests covering the matrix.
+- [x] Boot sector and `$MFT` bootstrap with fixups.
+- [x] Attribute parsing (`$SI`, `$FN`, `$DATA` resident and non-resident, run lists).
+- [x] Path reconstruction with orphan handling.
+- [x] Deleted-record detection with the `$Bitmap` check.
+- [x] Set `isImplemented = true` and update the routing tests.
+- [x] Synthetic-image tests covering the matrix.
 
 **Acceptance criteria:**
 - Given an NTFS device with deleted-but-not-overwritten files, when scanned, those files appear with their original filename, path and timestamp.
@@ -94,3 +94,22 @@ context:
 - `swift test --package-path SalvageCore`
 - `./scripts/check-core-boundary.sh`
 - `xcodebuild -project Salvage.xcodeproj -scheme Salvage -configuration Debug -destination 'platform=macOS' CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO build`
+
+## Implementation Notes
+
+Format references: community NTFS on-disk documentation (boot sector, FILE record, attribute and run-list layouts). Original Swift; no code copied, no dependency added. Code lives in `Parsers/NTFSVolume.swift` (scan, MFT streaming, paths, `$Bitmap`) and `Parsers/NTFSRecord.swift` (pure geometry, fixup, record and run-list parsing).
+
+Judgment calls:
+- **Two passes over the MFT.** Pass 1 indexes directories (live and deleted) and `$Bitmap`; pass 2 emits files in MFT order. An in-use record that fails its fixup or parse in pass 1 is remembered and reported when pass 2 reaches it, or when a file's parent chain passes through it, so discoveries before it are kept and no child is shown under a wrong or orphaned path. Damage to records 5 (root) or 6 (`$Bitmap`) fails immediately.
+- **Deleted parents.** NTFS increments a record's sequence number when it frees the record. A parent matches when its sequence equals the reference, or when the parent is itself deleted and its sequence is the reference plus one. So a file deleted together with its folder keeps its original path. Anything else (reused, missing, or not a directory) goes under `/Orphaned Files/`. When the break is higher up the chain, the intact lower part is kept, e.g. `/Orphaned Files/Dir/file.txt`.
+- **Live files with a broken parent chain** also go under `/Orphaned Files/` rather than failing the scan. A cycle or a chain deeper than 1024 is `malformed` for any record.
+- **`$ATTRIBUTE_LIST` is not followed.** A file is emitted only when its unnamed `$DATA` is complete in the base record (VCN 0 extent whose runs cover the full allocated size). Otherwise it is skipped, so a wrong size is never emitted. If `$MFT` itself needs an attribute list, the scan reports `unsupportedFilesystem`. Extension records are never emitted on their own. A directory whose `$FILE_NAME` lives only in an extension record isn't indexed, so its children go under `/Orphaned Files/`. Hard links: the first name in the preferred namespace (Win32/Win32+DOS, then POSIX, then DOS) decides the path.
+- **Names.** A `$FILE_NAME` with invalid UTF-16, an empty name, `/` or NUL is ignored rather than decoded lossily. If no usable name remains, the file is skipped. An in-use base record with no `$FILE_NAME` attribute at all (and no attribute list) is `malformed`.
+- **Damaged deleted records.** A deleted record whose fixup or attribute/run-list structure is invalid is skipped silently. The same damage in an in-use record is `malformed`.
+- **`contiguous`** is true only for exactly one non-sparse run, so resident files report `false`. Runs inside one attribute must not overlap. Cross-file overlap isn't tracked.
+- **Record count** is the `$MFT` `$DATA` *initialized* size divided by the record size. Bytes beyond it were never written as records.
+- **`$Bitmap` check** reads one cached page (up to 64 KiB) at a time. Any used cluster in any non-sparse run of a deleted file skips it.
+- **Index buffers** (`INDX`) are not read: paths come from `$FILE_NAME` parent references. The shared `applyNTFSFixup` handles them and is tested on one.
+- **Bounds:** at most 512 attributes per record and 16384 runs per attribute. Cluster size is capped at 2 MiB (negative-exponent encodings up to 2^12 sectors). MFT records must be 512 B to 64 KiB, a power of two.
+- **Routing tests.** In `ScanSessionTests.swift`, the NTFS partition was removed from `recognizedButUnimplementedVolumesAreSkipped`, so the ext partition moved up to start right after the exFAT one. `"ntfs"` was removed from `wholeDiskUnimplementedFormatIsUnsupported`'s arguments; its body still has an `ntfs` branch, left in place to keep the diff minimal. The positive routing test is `NTFSRoutesThroughDiscoveryWholeDiskAndPartitioned` in `NTFSVolumeTests.swift`.
+- The worktree branch was fast-forwarded from `efbcc71` to `main` (`96f165f`) before starting, because the spec and its `c1b21a3` baseline weren't on the branch.
