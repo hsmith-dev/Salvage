@@ -63,10 +63,10 @@ context:
 
 ## Tasks & Acceptance
 
-- [ ] Timestamp decoding for live FAT32 and exFAT files, plus tests.
-- [ ] FAT32 deleted entries (LFN reconstruction, short-name fallback, free-cluster check), plus tests.
-- [ ] exFAT deleted entry sets (checksum with restored in-use bits, bitmap-free check, fragmented → skip), plus tests.
-- [ ] Tests showing deleted entries never abort a scan or cross-link live files.
+- [x] Timestamp decoding for live FAT32 and exFAT files, plus tests.
+- [x] FAT32 deleted entries (LFN reconstruction, short-name fallback, free-cluster check), plus tests.
+- [x] exFAT deleted entry sets (checksum with restored in-use bits, bitmap-free check, fragmented → skip), plus tests.
+- [x] Tests showing deleted entries never abort a scan or cross-link live files.
 
 **Acceptance criteria:**
 - Given a FAT32/exFAT device with deleted-but-not-overwritten files, when the scan completes, those files appear with their original filename, path and timestamp, and `isDeleted == true`.
@@ -77,3 +77,16 @@ context:
 - `swift test --package-path SalvageCore`
 - `./scripts/check-core-boundary.sh`
 - `xcodebuild -project Salvage.xcodeproj -scheme Salvage -configuration Debug -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO -only-testing:SalvageTests test`
+
+## Implementation Notes
+
+Only `FATVolume.swift` and the new `DeletedFileTests.swift` were changed. Judgment calls:
+
+- **The deleted LFN checksum can't be checked directly.** The checksum covers the short name's first byte, and deletion overwrites that byte with 0xE5. The checksum is also a bijection in that byte, so some first byte always matches any checksum, and "a matching byte exists" proves nothing. Instead, the lost byte is taken from the recovered long name the way short names are generated: its first character (after any leading `.` or space), uppercased, or `_` when that character isn't valid 8.3 ASCII. The LFN name is used only when the checksum matches one of those candidates. Otherwise the code falls back to the `_`-prefixed short name. A short name the user chose by hand that doesn't start with the long name's first letter therefore falls back to the short name. That is the safe direction.
+- **Choosing the deleted LFN run.** Without ordinals, the code takes the trailing slots before the short entry that share its checksum. It then drops any older slots before the last slot holding a 0x0000 terminator, since a stale slot from an earlier deleted file can share the checksum. If a name is an exact multiple of 13 units (so it has no terminator) and a stale same-checksum slot comes before it, padding validation fails and the short-name fallback is used.
+- **Single-cluster FAT-chained exFAT files are kept.** The spec skips fragmented deleted exFAT files that have a FAT chain. A deleted file whose stream lacks NoFatChain but fits in one cluster can't be fragmented, so it is emitted after the same bitmap-free check. Files with NoFatChain clear that span more than one cluster are skipped.
+- **A partly overwritten exFAT set yields to live entries.** While a deleted set is being collected, any entry with its in-use bit set, or a new deleted primary (0x05), abandons the set. That entry is then processed normally. Live entries are never swallowed into a stale set.
+- **Deleted entries are reported as `contiguous: true`.** FAT32 deletion zeroes the chain, so contiguity is assumed. For exFAT, NoFatChain is set or the file is a single cluster. Story 1.10 can read the run directly. `rawRecord` keeps the original on-disk bytes: the LFN slots actually used plus the short entry, or the exFAT set with its in-use bits still cleared.
+- **What isn't reported.** Deleted directories and volume labels (FAT32 attribute 0x10/0x08, exFAT directory attribute) are not emitted or descended into. Zero-length deleted files are emitted without a cluster check, just as live ones are. Two deleted entries that point at the same free clusters are both emitted, because neither claims clusters.
+- **Timestamp validation.** Each field is range-checked by hand: real days per month including leap years, hour ≤ 23, minute ≤ 59, 2-second count ≤ 29, exFAT 10 ms increment ≤ 199. Anything out of range gives `nil`, so Foundation never quietly normalizes a bad date. The exFAT UTC offset counts as valid only when bit 7 is set and the signed 7-bit quarter-hour value is within −12:00…+14:00. Otherwise, and for every FAT32 timestamp, the value is read as local time in `TimeZone.current`.
+- **Known limitation (not handled):** some FAT32 drivers, notably Windows, clear the high 16 bits of the first cluster when deleting. Deleted files above cluster 65535 on those volumes then point at the wrong low cluster. They are only emitted if that wrong run happens to be free, and Story 1.8's confidence scoring should treat them as weaker.
