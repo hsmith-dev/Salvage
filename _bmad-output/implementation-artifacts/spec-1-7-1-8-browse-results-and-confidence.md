@@ -2,7 +2,7 @@
 title: 'Browse Results by File Type, with the Recovery-Confidence Indicator (Stories 1.7 + 1.8)'
 type: 'feature'
 created: '2026-10-31'
-status: 'ready-for-dev'
+status: 'review'
 baseline_commit: '0654e86'
 route: 'dispatch'
 context:
@@ -83,3 +83,30 @@ context:
 - `./scripts/check-core-boundary.sh && ./scripts/check-no-network.sh`
 - `xcodebuild -project Salvage.xcodeproj -scheme Salvage -configuration Debug -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO -only-testing:SalvageTests test`
 - `xcodebuild -project Salvage.xcodeproj -scheme Salvage -configuration Debug -destination 'platform=macOS' CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO build`
+
+## Implementation Notes
+
+The spec has no task list, so there was nothing to tick. Judgment calls:
+
+- **"Each category has its own `RecoveryMethod` floor":** read as "each `RecoveryMethod` has its own confidence floor", which is AD-7's floor rule. `FileCategory` has no method of its own. `RecoveredFile.recoveryMethod` is always `.metadata` in v1.
+- **Evidence derivation (`RecoveredFile.recoveryEvidence`):** `fragmentCount` counts the non-hole `.runs` entries. `.resident` counts as 1 and `.unmapped` as 0. `overwriteConfidence` is always 0. In the carved branch, a NaN or negative `overwriteConfidence` gives Low; it is never trusted as safe.
+- **Magic-byte hook:** `FileCategory.classify(fileName:signature:)` checks the signature only when the extension is unknown. `fromSignature` returns nil until carving needs it.
+- **When results replace progress (`ResultsViewModel.showsResults`):**
+  - A completed scan always shows the dashboard, even with zero files, so it can say "No recoverable files found on this device."
+  - A cancelled or failed scan shows the dashboard only when files were found.
+  - A failed scan with no files stays on `ScanProgressView`, which keeps its error and Retry.
+  - The dashboard repeats the failure text and the Retry button, using the same condition as `ScanProgressView`.
+  - `ResultsView` is keyed by `scan.endedAt`, so each finished scan gets a fresh model.
+- **System files:** the "Show system files" toggle sits on both the dashboard and the browser, and one model flag drives both. While hidden, system files are also left out of the bucket counts and totals, and a caption states how many are hidden. A path counts as a system file when any component is `._*`, `.DS_Store`, `.fseventsd`, `.Spotlight-V100` or `.Trashes`.
+- **Unmapped files:**
+  - They are kept out of the bucket counts and totals and shown in their own "Can't be recovered" section on the dashboard.
+  - In the browser they are listed with a disabled checkbox. `setChecked` refuses them.
+- **Responsiveness:**
+  - Per-file data (category, confidence, system flag, lowercased search key) is computed once, off the main actor, in `ResultsViewModel.build`.
+  - Filtering and sorting run in a detached task from `.task(id: model.query)`. A stale result is dropped by a generation check.
+  - The `Table` is lazy (NSTableView), and the table sort comparators map to the model's own `Sort`.
+  - A test covers 100k files.
+- **Space key:** Space toggles the preview pane for the selected row, like Quick Look. A single click selects and previews.
+- **Integration slots:** each slot has the exact signature of the view that will replace it. The call sites are marked `INTEGRATION SLOT` in `FileBrowserView` (`previewPane` and `recoverySheet(_:)`), so swapping is a rename plus deleting the placeholder file.
+- **Recover button:** disabled when nothing is ticked or when `scan.source` is nil. The sheet's `onDone` only dismisses it and keeps the ticked files.
+- **Accent color:** there is no asset catalog, so `Color.salvageAccent` is a dynamic `NSColor` built from the DESIGN.md hex values. It is used only on the Recover button.

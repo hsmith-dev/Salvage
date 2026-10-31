@@ -22,6 +22,9 @@ struct ContentView: View {
         } detail: {
             if scan.state == .idle {
                 Text("Select a device to start scanning.").foregroundStyle(.secondary)
+            } else if ResultsViewModel.showsResults(state: scan.state, isActive: scan.isActive, fileCount: scan.files.count) {
+                // A fresh results surface per finished scan.
+                ResultsView(scan: scan).id(scan.endedAt)
             } else { ScanProgressView(model: scan) }
         }
         // Closing the window stops the scan but keeps its checkpoint; only Cancel scan discards it.
