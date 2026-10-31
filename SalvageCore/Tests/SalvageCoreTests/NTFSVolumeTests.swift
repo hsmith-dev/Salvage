@@ -703,4 +703,103 @@ struct NTFSVolumeTests {
         let events = await scan(deleted.build())
         #expect(events.last == .completed && !files(events).contains { $0.name == "deleted.txt" })
     }
+
+    // MARK: - Content mapping
+
+    /// Fills `clusters` with a byte pattern unique to each cluster and returns it.
+    private func fill(_ image: inout Data, _ clusters: [Int], at volume: Int = 0) -> Data {
+        var written = Data()
+        for cluster in clusters {
+            let bytes = Data((0..<sector).map { UInt8(truncatingIfNeeded: cluster &* 31 &+ $0 &* 7 &+ 1) })
+            image.replaceSubrange(volume + cluster * sector..<volume + (cluster + 1) * sector, with: bytes)
+            written += bytes
+        }
+        return written
+    }
+
+    private func readBack(_ file: RecoveredFile?, _ image: Data) async throws -> Data {
+        let file = try #require(file)
+        return try await FileContentReader(reader: ImageReader(data: image)).prefix(of: file, limit: .max)
+    }
+
+    @Test func liveDeletedFragmentedAndResidentFilesReadBackTheirBytes() async throws {
+        var model = NTFSImage.standard()
+        // Fragmented, with two physically adjacent runs that must coalesce.
+        model.records[27] = file("frag.bin", data: nonResident(0x80, [.at(200, 1), .at(201, 1), .at(195, 1)], size: 1300))
+        model.records[28] = deletedFile("gone.bin", [.at(230, 1), .at(220, 2)], size: 1400)
+        var image = model.build()
+        let report = fill(&image, [150, 151]), deleted = fill(&image, [160])
+        let frag = fill(&image, [200, 201, 195]), gone = fill(&image, [230, 220, 221])
+        let found = files(await scan(image))
+        func named(_ name: String) -> RecoveredFile? { found.first { $0.name == name } }
+
+        #expect(named("report.txt")?.content == .runs([DataRun(deviceOffset: 150 * 512, length: 700)]))
+        #expect(try await readBack(named("report.txt"), image) == report.prefix(700))
+        #expect(named("frag.bin")?.content == .runs([DataRun(deviceOffset: 200 * 512, length: 1024),
+                                                     DataRun(deviceOffset: 195 * 512, length: 276)]))
+        #expect(try await readBack(named("frag.bin"), image) == frag.prefix(1300))
+        #expect(named("deleted.txt")?.isDeleted == true)
+        #expect(try await readBack(named("deleted.txt"), image) == deleted.prefix(100))
+        #expect(named("gone.bin")?.isDeleted == true)
+        #expect(try await readBack(named("gone.bin"), image) == gone.prefix(1400))
+        // Resident data, live and deleted, comes straight from the record.
+        #expect(named("hello.txt")?.content == .resident(Data("hello".utf8)))
+        #expect(try await readBack(named("hello.txt"), image) == Data("hello".utf8))
+        #expect(named("reused.txt")?.content == .resident(Data("r".utf8)))
+        // Every emitted file has a mapping.
+        #expect(found.allSatisfy { $0.content != .unmapped })
+    }
+
+    @Test func emptyFilesMapToNoBytes() async throws {
+        var model = NTFSImage.standard()
+        model.records[27] = file("empty-resident.txt", data: resident(0x80, Data()))
+        model.records[28] = file("empty.bin", data: nonResident(0x80, runs: Data([0]), clusters: 0, size: 0))
+        let image = model.build()
+        let found = files(await scan(image))
+        let residentEmpty = found.first { $0.name == "empty-resident.txt" }, runsEmpty = found.first { $0.name == "empty.bin" }
+        #expect(residentEmpty?.content == .resident(Data()) && runsEmpty?.content == .runs([]))
+        #expect(try await readBack(residentEmpty, image).isEmpty)
+        #expect(try await readBack(runsEmpty, image).isEmpty)
+    }
+
+    @Test func sparseRunsAndTheUninitializedTailReadAsZeros() async throws {
+        var model = NTFSImage.standard()
+        model.records[27] = file("sparse.bin", data: nonResident(0x80, [.at(200, 1), .sparse(2), .at(210, 1)], size: 1900,
+                                                                 flags: 0x8000))
+        // Only 600 of 1000 bytes were ever written; stale bytes in the rest of the clusters must not leak.
+        model.records[28] = file("prealloc.bin", data: nonResident(0x80, [.at(220, 2)], size: 1000, initialized: 600))
+        var image = model.build()
+        let sparse = fill(&image, [200, 210]), prealloc = fill(&image, [220, 221])
+        let found = files(await scan(image))
+        let sparseFile = found.first { $0.name == "sparse.bin" }, preallocFile = found.first { $0.name == "prealloc.bin" }
+        #expect(sparseFile?.content == .runs([DataRun(deviceOffset: 200 * 512, length: 512), DataRun(deviceOffset: nil, length: 1024),
+                                              DataRun(deviceOffset: 210 * 512, length: 364)]))
+        #expect(try await readBack(sparseFile, image) == sparse.prefix(512) + Data(count: 1024) + sparse.suffix(512).prefix(364))
+        #expect(preallocFile?.content == .runs([DataRun(deviceOffset: 220 * 512, length: 600), DataRun(deviceOffset: nil, length: 400)]))
+        #expect(try await readBack(preallocFile, image) == prealloc.prefix(600) + Data(count: 400))
+    }
+
+    @Test func compressedEncryptedAndAttributeListFilesAreUnmapped() async {
+        var model = NTFSImage.standard()
+        model.records[27] = file("compressed.bin", data: nonResident(0x80, [.at(200, 1), .sparse(3)], size: 2000, flags: 0x8001))
+        model.records[28] = file("encrypted.bin", data: nonResident(0x80, [.at(205, 1)], size: 300, flags: 0x4000))
+        // $DATA is complete in the base record, but the attribute list means the record isn't the whole file.
+        model.records[29] = record(sequence: 1, flags: 1, [
+            standardInformation(), resident(0x20, Data(count: 32)), fileName("listed.txt", parent: 5, sequence: 5),
+            resident(0x80, Data("l".utf8))])
+        let found = files(await scan(model.build()))
+        for name in ["compressed.bin", "encrypted.bin", "listed.txt"] {
+            #expect(found.first { $0.name == name }?.content == .unmapped)
+        }
+    }
+
+    @Test func runsAreDeviceAbsoluteInsideAPartition() async throws {
+        var volume = NTFSImage.standard().build()
+        let report = fill(&volume, [150, 151])
+        var image = Data(count: 512) + volume
+        image.put(446+4, 7, 1); image.put(446+8, 1, 4); image.put(446+12, UInt64(volume.count / 512), 4); image.put(510, 0xaa55, 2)
+        let found = files(await scan(image)).first { $0.name == "report.txt" }
+        #expect(found?.content == .runs([DataRun(deviceOffset: 512 + 150 * 512, length: 700)]))
+        #expect(try await readBack(found, image) == report.prefix(700))
+    }
 }

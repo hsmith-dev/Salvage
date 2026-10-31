@@ -243,7 +243,50 @@ actor NTFSVolume {
                                            recordOffset: try checkedAdd(extent.offset, offset),
                                            allocationStart: number,
                                            contiguous: data.runs.count == 1 && data.runs[0].lcn != nil,
-                                           rawRecord: fixed)))
+                                           rawRecord: fixed),
+            content: try content(of: data, hasAttributeList: record.hasAttributeList, g)))
+    }
+
+    /// Where the unnamed `$DATA` stream's bytes live. Compressed or encrypted streams, and files with
+    /// an `$ATTRIBUTE_LIST` (whose attributes may be spread over records), are left unmapped.
+    func content(of data: NTFSDataStream, hasAttributeList: Bool, _ g: NTFSGeometry) throws -> FileContent {
+        guard !hasAttributeList, !data.isCompressedOrEncrypted else { return .unmapped }
+        if let value = data.residentValue { return .resident(value) }
+        // Bytes up to the initialized size come from the run list (or its sparse holes); NTFS
+        // defines everything past it as zeros, so that tail is a hole whatever the clusters hold.
+        var mapped: [DataRun] = [], remaining = data.initialized
+        for run in data.runs where remaining > 0 {
+            let length = min(try checkedMultiply(run.length, g.clusterBytes), remaining)
+            // decodeRuns keeps every placed run inside clusterCount, which fits the extent.
+            let offset = try run.lcn.map { try checkedAdd(extent.offset, checkedMultiply($0, g.clusterBytes)) }
+            mapped.append(DataRun(deviceOffset: offset, length: length))
+            remaining -= length
+        }
+        // nonResidentStream guarantees the runs cover the allocated size, which is at least `initialized`.
+        guard remaining == 0 else { return .unmapped }
+        if data.size > data.initialized { mapped.append(DataRun(deviceOffset: nil, length: data.size - data.initialized)) }
+        return .runs(Self.coalesce(mapped))
+    }
+
+    /// Merges runs that continue one another on the device, and consecutive holes.
+    static func coalesce(_ runs: [DataRun]) -> [DataRun] {
+        var result: [DataRun] = []
+        for run in runs where run.length > 0 {
+            if let last = result.last {
+                let adjacent: Bool
+                switch (last.deviceOffset, run.deviceOffset) {
+                case (nil, nil): adjacent = true
+                case let (a?, b?): adjacent = a + last.length == b
+                default: adjacent = false
+                }
+                if adjacent {
+                    result[result.count - 1] = DataRun(deviceOffset: last.deviceOffset, length: last.length + run.length)
+                    continue
+                }
+            }
+            result.append(run)
+        }
+        return result
     }
 
     /// The directory's path ("" for the root), "/Orphaned Files…" when the chain is broken, or nil
