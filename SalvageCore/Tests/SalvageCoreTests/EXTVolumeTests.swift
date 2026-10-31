@@ -770,4 +770,167 @@ struct EXTVolumeTests {
         #expect(found.map(\.path) == ["/caf\\xE9.txt"])
         #expect(found.first?.sourceMetadata.rawRecord.suffix(nameBytes.count) == nameBytes)
     }
+
+    // MARK: Content mapping
+
+    /// Reads a file back exactly as preview and recovery will.
+    func readBack(_ file: RecoveredFile?, from image: Data) async throws -> Data {
+        guard let file else { throw ScanError.malformed("missing file") }
+        return try await FileContentReader(reader: ImageReader(data: image), chunkSize: 512).prefix(of: file, limit: .max)
+    }
+    /// Distinct bytes for one block, so a block read from the wrong place never compares equal.
+    func pattern(_ block: Int, _ blockSize: Int = 1024) -> Data {
+        Data((0..<blockSize).map { UInt8(truncatingIfNeeded: block &* 31 &+ $0 &* 7 &+ 1) })
+    }
+    @discardableResult
+    func fill(_ image: inout EXTImage, _ blocks: [Int]) -> Data {
+        var expected = Data()
+        for block in blocks {
+            image.data.replaceSubrange(block * image.blockSize..<(block + 1) * image.blockSize, with: pattern(block, image.blockSize))
+            expected += pattern(block, image.blockSize)
+        }
+        return expected
+    }
+    func ext4Root(_ entries: [(Int, String, UInt8)]) -> EXTImage {
+        var image = EXTImage(ext4: true)
+        image.inode(2, directory: true, size: 1024, links: 2, flags: 0x80000,
+                    blocks: EXTImage.extentNode([(0, 1, 32)]), used: [32])
+        image.directory(32, this: 2, parent: 2, entries)
+        return image
+    }
+
+    @Test func fragmentedBlockMapFileReadsBackThroughCoalescedRuns() async throws {
+        var image = ext2Image()
+        let hello = Data("hello".utf8)
+        // big.bin: 12 direct blocks, then 63 and 64 through the indirect block 62.
+        let expected = fill(&image, Array(50..<62) + [63, 64]).prefix(13 * 1024 + 10)
+        let bytes = image.image
+        let found = await runEXT(ImageReader(data: bytes))
+        #expect(found.error == nil)
+        let big = found.files.first { $0.name == "big.bin" }
+        #expect(big?.content == .runs([DataRun(deviceOffset: 50 * 1024, length: 12 * 1024),
+                                       DataRun(deviceOffset: 63 * 1024, length: 2 * 1024)]))
+        #expect(try await readBack(big, from: bytes) == expected)
+        let small = found.files.first { $0.name == "hello.txt" }
+        #expect(small?.content == .runs([DataRun(deviceOffset: 40 * 1024, length: 1024)]))
+        #expect(try await readBack(small, from: bytes) == hello)
+    }
+
+    @Test func contiguousAndTreeExtentFilesReadBack() async throws {
+        var image = ext4Root([(12, "flat.txt", 1), (13, "tree.bin", 1)])
+        image.inode(12, size: 2000, flags: 0x80000, blocks: EXTImage.extentNode([(0, 2, 60)]), used: [60, 61])
+        image.inode(13, size: 3 * 1024, flags: 0x80000, blocks: EXTImage.extentIndex([(0, 70)], depth: 1),
+                    used: [70, 71, 80, 81])
+        image.data.replaceSubrange(70 * 1024..<71 * 1024, with: EXTImage.extentNode([(0, 1, 71), (1, 2, 80)], size: 1024))
+        let flat = fill(&image, [60, 61]).prefix(2000)
+        let tree = fill(&image, [71, 80, 81])
+        let bytes = image.image
+        let found = await runEXT(ImageReader(data: bytes))
+        #expect(found.error == nil)
+        #expect(found.files[0].content == .runs([DataRun(deviceOffset: 60 * 1024, length: 2048)]))
+        #expect(found.files[1].content == .runs([DataRun(deviceOffset: 71 * 1024, length: 1024),
+                                                DataRun(deviceOffset: 80 * 1024, length: 2048)]))
+        #expect(try await readBack(found.files[0], from: bytes) == flat)
+        #expect(try await readBack(found.files[1], from: bytes) == tree)
+    }
+
+    @Test func emptyFileHasNoRuns() async throws {
+        var image = ext4Root([(12, "empty", 1), (13, "empty-mapped", 1)])
+        image.inode(12, size: 0, flags: 0x80000, blocks: EXTImage.extentNode([]))
+        // Blocks past EOF (preallocation) are never part of the content.
+        image.inode(13, size: 0, flags: 0x80000, blocks: EXTImage.extentNode([(0, 1, 60)]), used: [60])
+        let bytes = image.image
+        let found = await runEXT(ImageReader(data: bytes))
+        #expect(found.error == nil)
+        #expect(found.files.map(\.content) == [.runs([]), .runs([])])
+        #expect(try await readBack(found.files[0], from: bytes).isEmpty)
+    }
+
+    @Test func blocksPastTheSizeAreClipped() async throws {
+        var image = ext4Root([(12, "prealloc", 1)])
+        image.inode(12, size: 1500, flags: 0x80000, blocks: EXTImage.extentNode([(0, 4, 60)]), used: [60, 61, 62, 63])
+        let expected = fill(&image, [60, 61, 62, 63]).prefix(1500)
+        let bytes = image.image
+        let found = await runEXT(ImageReader(data: bytes))
+        #expect(found.files.first?.content == .runs([DataRun(deviceOffset: 60 * 1024, length: 2048)]))
+        #expect(try await readBack(found.files.first, from: bytes) == expected)
+    }
+
+    @Test func sparseBlocksAndMissingTailAreHoles() async throws {
+        var image = EXTImage()
+        image.inode(2, directory: true, size: 1024, links: 2, blocks: EXTImage.blockMap([32]), used: [32])
+        image.directory(32, this: 2, parent: 2, [(12, "middle", 1), (13, "tail", 1)])
+        // Logical block 1 is unmapped; logical blocks 1-4 of "tail" are never written.
+        image.inode(12, size: 3 * 1024, blocks: EXTImage.blockMap([40, 0, 42]), used: [40, 42])
+        image.inode(13, size: 4 * 1024 + 100, blocks: EXTImage.blockMap([50]), used: [50])
+        let first = fill(&image, [40]), last = fill(&image, [42]), tail = fill(&image, [50])
+        fill(&image, [41])  // Physically between 40 and 42 but not part of the file.
+        let bytes = image.image
+        let found = await runEXT(ImageReader(data: bytes))
+        #expect(found.error == nil)
+        #expect(found.files[0].content == .runs([DataRun(deviceOffset: 40 * 1024, length: 1024),
+                                                DataRun(deviceOffset: nil, length: 1024),
+                                                DataRun(deviceOffset: 42 * 1024, length: 1024)]))
+        #expect(try await readBack(found.files[0], from: bytes) == first + Data(count: 1024) + last)
+        #expect(found.files[1].content == .runs([DataRun(deviceOffset: 50 * 1024, length: 1024),
+                                                DataRun(deviceOffset: nil, length: 3 * 1024 + 100)]))
+        #expect(try await readBack(found.files[1], from: bytes) == tail + Data(count: 3 * 1024 + 100))
+    }
+
+    @Test func uninitializedExtentsReadAsZerosAndAreNotCoalescedWithData() async throws {
+        var image = ext4Root([(12, "mixed", 1), (13, "unwritten", 1)])
+        // Physically adjacent blocks 60-62, but block 61 is an uninitialized extent.
+        image.inode(12, size: 3 * 1024, flags: 0x80000,
+                    blocks: EXTImage.extentNode([(0, 1, 60), (1, 32768 + 1, 61), (2, 1, 62)]), used: [60, 61, 62])
+        image.inode(13, size: 2048, flags: 0x80000, blocks: EXTImage.extentNode([(0, 32768 + 2, 70)]), used: [70, 71])
+        let a = fill(&image, [60]); fill(&image, [61, 70, 71]); let c = fill(&image, [62])
+        let bytes = image.image
+        let found = await runEXT(ImageReader(data: bytes))
+        #expect(found.error == nil)
+        #expect(found.files[0].content == .runs([DataRun(deviceOffset: 60 * 1024, length: 1024),
+                                                DataRun(deviceOffset: nil, length: 1024),
+                                                DataRun(deviceOffset: 62 * 1024, length: 1024)]))
+        #expect(try await readBack(found.files[0], from: bytes) == a + Data(count: 1024) + c)
+        #expect(found.files[1].content == .runs([DataRun(deviceOffset: nil, length: 2048)]))
+        #expect(try await readBack(found.files[1], from: bytes) == Data(count: 2048))
+    }
+
+    @Test func deletedFilesReadBackFromTheirValidatedMapping() async throws {
+        var image = deletedImage(stale: [(13, "gone.txt"), (14, "frag.bin")])
+        image.inode(13, size: 600, links: 0, dtime: 1, blocks: EXTImage.blockMap([90]))
+        image.inode(14, size: 2 * 1024 + 7, links: 0, dtime: 1, blocks: EXTImage.blockMap([95, 97, 98]))
+        let gone = fill(&image, [90]).prefix(600)
+        let frag = fill(&image, [95, 97, 98]).prefix(2 * 1024 + 7)
+        let bytes = image.image
+        let found = await runEXT(ImageReader(data: bytes))
+        #expect(found.files.map(\.path) == ["/live.txt", "/gone.txt", "/frag.bin"])
+        #expect(found.files[1].isDeleted && found.files[2].isDeleted)
+        #expect(found.files[1].content == .runs([DataRun(deviceOffset: 90 * 1024, length: 1024)]))
+        #expect(found.files[2].content == .runs([DataRun(deviceOffset: 95 * 1024, length: 1024),
+                                                DataRun(deviceOffset: 97 * 1024, length: 2048)]))
+        #expect(try await readBack(found.files[1], from: bytes) == gone)
+        #expect(try await readBack(found.files[2], from: bytes) == frag)
+    }
+
+    @Test func runsAreDeviceAbsoluteInsideAPartition() async throws {
+        var volume = ext2Image()
+        let expected = fill(&volume, Array(50..<62) + [63, 64]).prefix(13 * 1024 + 10)
+        var image = Data(repeating: 0, count: 512) + volume.image
+        image.put(446 + 4, 0x83, 1); image.put(446 + 8, 1, 4); image.put(446 + 12, UInt64(volume.image.count / 512), 4)
+        image.put(510, 0xaa55, 2)
+        let found = files(await scan(image))
+        let big = found.first { $0.name == "big.bin" }
+        #expect(big?.content == .runs([DataRun(deviceOffset: 512 + 50 * 1024, length: 12 * 1024),
+                                       DataRun(deviceOffset: 512 + 63 * 1024, length: 2 * 1024)]))
+        #expect(try await readBack(big, from: image) == expected)
+        #expect(try await readBack(found.first { $0.name == "hello.txt" }, from: image) == Data("hello".utf8))
+    }
+
+    @Test func encryptedInodeContentIsUnmapped() async {
+        var image = ext4Root([(12, "secret", 1)])
+        image.inode(12, size: 10, flags: 0x80000 | 0x800, blocks: EXTImage.extentNode([(0, 1, 60)]), used: [60])
+        let found = await runEXT(image)
+        #expect(found.error == nil)
+        #expect(found.files.first?.content == .unmapped)
+    }
 }
