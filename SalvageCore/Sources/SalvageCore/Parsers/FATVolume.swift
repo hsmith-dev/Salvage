@@ -247,26 +247,70 @@ actor FATVolume {
         }
         return UInt32(try fatPage.number(Int(position - pageOffset), 4)) & (exfat ? 0xffffffff : 0x0fffffff)
     }
-    func validateFile(_ cluster: UInt32, length: Int64, contiguous: Bool, owner: String) async throws {
-        if length == 0 { return }
+    /// Claims the allocation and returns the device-absolute runs of the clusters holding its first
+    /// `length` bytes, in file order with physically adjacent clusters coalesced.
+    @discardableResult
+    func validateFile(_ cluster: UInt32, length: Int64, contiguous: Bool, owner: String) async throws -> [DataRun] {
+        if length == 0 { return [] }
         try validCluster(cluster)
         let required = (length - 1) / clusterBytes + 1
         guard required <= clusterCount else { throw ScanError.malformed("File exceeds volume.") }
         if contiguous {
             guard Int64(cluster) - 2 <= clusterCount - required else { throw ScanError.malformed("Contiguous file exceeds volume.") }
             for offset in 0..<required { try await claim(cluster + UInt32(offset), owner: owner) }
-            return
+            return try contiguousRuns(from: cluster, count: required)
         }
         var seen: Set<UInt32> = [], current: UInt32? = cluster
         var count: Int64 = 0
+        var runs: [DataRun] = []
         while let value = current {
             try Task.checkCancellation()
             guard seen.insert(value).inserted, count < clusterCount else { throw ScanError.malformed("Allocation cycle.") }
             try await claim(value, owner: owner)
+            // Clusters chained past the file's size are claimed but carry none of its bytes.
+            if count < required { try appendCluster(value, to: &runs) }
             count += 1
             current = try await next(value)
         }
         guard count >= required else { throw ScanError.malformed("Truncated file allocation.") }
+        return runs
+    }
+
+    // MARK: Content mapping
+
+    /// Device-absolute offset of `cluster`'s first byte (`clusterOffset` is volume-relative).
+    func deviceOffset(_ cluster: UInt32) throws -> Int64 { try checkedAdd(extent.offset, clusterOffset(cluster)) }
+    /// Appends one cluster, extending the last run when the cluster is physically adjacent to it.
+    func appendCluster(_ cluster: UInt32, to runs: inout [DataRun]) throws {
+        let offset = try deviceOffset(cluster)
+        if let last = runs.last, let start = last.deviceOffset, try checkedAdd(start, last.length) == offset {
+            runs[runs.count - 1] = DataRun(deviceOffset: start, length: try checkedAdd(last.length, clusterBytes))
+        } else {
+            runs.append(DataRun(deviceOffset: offset, length: clusterBytes))
+        }
+    }
+    /// One run of `count` clusters starting at `first`; the caller has already bounded the run.
+    func contiguousRuns(from first: UInt32, count: Int64) throws -> [DataRun] {
+        guard count > 0 else { return [] }
+        try validCluster(first)
+        guard Int64(first) - 2 <= clusterCount - count else { throw ScanError.malformed("Contiguous file exceeds volume.") }
+        return [DataRun(deviceOffset: try deviceOffset(first), length: try checkedMultiply(count, clusterBytes))]
+    }
+    /// The file's content: the cluster runs cut to `validBytes`, then (exFAT only, when the valid
+    /// data length is below the size) a trailing hole up to `sizeBytes`, since bytes past the valid
+    /// data length read as zeros. A size-0 file maps to no runs.
+    static func content(_ runs: [DataRun], sizeBytes: Int64, validBytes: Int64) -> FileContent {
+        guard sizeBytes > 0 else { return .runs([]) }
+        var result: [DataRun] = [], remaining = validBytes
+        for run in runs where remaining > 0 {
+            let length = min(run.length, remaining)
+            result.append(DataRun(deviceOffset: run.deviceOffset, length: length))
+            remaining -= length
+        }
+        // The clusters always cover the size, so a shortfall here can't happen; refuse to guess if it does.
+        guard remaining == 0 else { return .unmapped }
+        if sizeBytes > validBytes { result.append(DataRun(deviceOffset: nil, length: sizeBytes - validBytes)) }
+        return .runs(result)
     }
     func directory(_ first: UInt32, path: String, length: Int64?, contiguous: Bool) async throws -> [(UInt32, String, Int64?, Bool)] {
         var current: UInt32? = first, seen: Set<UInt32> = []
@@ -357,12 +401,13 @@ actor FATVolume {
                         if entry[11] & 0x10 != 0 {
                             try validCluster(cluster); children.append((cluster, fullPath, nil, false))
                         } else {
-                            try await validateFile(cluster, length: size, contiguous: false, owner: "file:\(location)")
+                            let runs = try await validateFile(cluster, length: size, contiguous: false, owner: "file:\(location)")
                             try await emit(RecoveredFile(name: name, path: fullPath, sizeBytes: size,
                                 modified: Self.fatTimestamp(entry, localZone: localTimeZone),
                                 sourceMetadata: SourceMetadata(filesystem: .fat32, volumeOffset: extent.offset,
                                     recordOffset: location, allocationStart: UInt64(cluster), contiguous: false,
-                                    rawRecord: lfn.reduce(Data(), +) + entry)))
+                                    rawRecord: lfn.reduce(Data(), +) + entry),
+                                content: Self.content(runs, sizeBytes: size, validBytes: size)))
                         }
                     }
                 }
@@ -467,10 +512,11 @@ actor FATVolume {
             try validCluster(cluster)
             return (cluster, fullPath, size, contiguous)
         }
-        try await validateFile(cluster, length: size, contiguous: contiguous, owner: "file:\(location)")
+        let runs = try await validateFile(cluster, length: size, contiguous: contiguous, owner: "file:\(location)")
         try await emit(RecoveredFile(name: set.name, path: fullPath, sizeBytes: size, modified: set.modified,
              sourceMetadata: SourceMetadata(filesystem: .exfat, volumeOffset: extent.offset,
-                recordOffset: location, allocationStart: UInt64(cluster), contiguous: contiguous, rawRecord: raw)))
+                recordOffset: location, allocationStart: UInt64(cluster), contiguous: contiguous, rawRecord: raw),
+             content: Self.content(runs, sizeBytes: size, validBytes: set.validBytes)))
         return nil
     }
 
@@ -550,11 +596,14 @@ actor FATVolume {
         if required > 0 {
             guard try await freeRun(from: cluster, required: required) else { return nil }
         }
+        // The assumed contiguous run that freeRun just validated; nothing else is guessed.
+        let runs = try contiguousRuns(from: cluster, count: required)
         let file = RecoveredFile(name: name, path: path + "/" + name, sizeBytes: size,
             modified: Self.fatTimestamp(entry, localZone: localTimeZone), isDeleted: true,
             sourceMetadata: SourceMetadata(filesystem: .fat32, volumeOffset: extent.offset,
                 recordOffset: location, allocationStart: UInt64(cluster), contiguous: true,
-                rawRecord: used.reduce(Data(), +) + entry))
+                rawRecord: used.reduce(Data(), +) + entry),
+            content: Self.content(runs, sizeBytes: size, validBytes: size))
         return DeletedCandidate(file: file, first: Int64(cluster), count: required)
     }
     /// Rebuilds a deleted long name, or returns nil so the caller falls back to the short name.
@@ -634,11 +683,13 @@ actor FATVolume {
             guard set.contiguous || required == 1 else { return nil }
             guard try await freeRun(from: set.cluster, required: required) else { return nil }
         }
+        let runs = try contiguousRuns(from: set.cluster, count: required)
         let file = RecoveredFile(name: set.name, path: path + "/" + set.name, sizeBytes: set.sizeBytes,
             modified: set.modified, isDeleted: true,
             sourceMetadata: SourceMetadata(filesystem: .exfat, volumeOffset: extent.offset,
                 recordOffset: location, allocationStart: UInt64(set.cluster), contiguous: true,
-                rawRecord: entries.reduce(Data(), +)))
+                rawRecord: entries.reduce(Data(), +)),
+            content: Self.content(runs, sizeBytes: set.sizeBytes, validBytes: set.validBytes))
         return DeletedCandidate(file: file, first: Int64(set.cluster), count: required)
     }
 

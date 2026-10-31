@@ -76,3 +76,13 @@ This work is split across three agents, one per section below. Each agent edits 
 - EXT: Judgment call: an inode with `EXT4_ENCRYPT_FL` (0x800) is `.unmapped`. The superblock `encrypt` feature is already refused and deleted candidates with the flag are already skipped, but a hostile live inode could still carry it; its blocks would be ciphertext, so mapping them would hand preview/recovery the wrong bytes.
 - EXT: Building the runs uses checked arithmetic; any overflow (not reachable after geometry validation) yields `.unmapped` instead of aborting the scan. A mapping whose runs are not in strictly increasing logical order (also not reachable) does the same.
 - EXT: Inline data is unchanged: it is still refused as malformed in `mapping`.
+
+## Implementation Notes — Section A (FAT32/exFAT)
+
+- **Single source of truth for live runs.** `validateFile` now returns the coalesced device-absolute runs it built while claiming clusters, so the mapping is exactly the chain (or NoFatChain run) the parser validated and cross-link checked; no second chain walk.
+- **Clusters chained past the size** are still claimed (cross-link detection is unchanged) but are not included in the runs; runs are cut to the file's bytes.
+- **exFAT `ValidDataLength` < `DataLength`** (live and deleted): runs are cut at the valid length and followed by a trailing hole (`deviceOffset: nil`) up to the size, because exFAT defines bytes past the valid length as zeros and the clusters there may hold stale data. Not called out in the frozen section; mirrors the NTFS initialized-size rule.
+- **Deleted files** map only the assumed contiguous run `[first, first + required)` that `freeRun` already proved free and in-heap. Deleted exFAT FAT-chained files remain limited to one cluster (existing rule), so their single run is also contiguous.
+- **Size-0 files** (live or deleted, any first cluster) map to `.runs([])`.
+- **Defensive fallback:** if the runs ever fail to cover the valid length (should be impossible after validation), the file is emitted `.unmapped` rather than with a partial mapping.
+- Tests: `Tests/SalvageCoreTests/FATContentTests.swift` (15 tests) read every case back through `FileContentReader(reader: ImageReader(data:))`: fixture files, contiguous, fragmented out-of-order with coalescing, over-long chain, empty, deleted, deleted empty, VDL holes, and volumes placed at a non-zero partition offset.
