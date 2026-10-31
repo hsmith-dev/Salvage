@@ -105,8 +105,13 @@ struct PrivilegedOpenClient: PrivilegedOpening {
         case .mounted: .io("The device was mounted again. Close files on it and retry.")
         case .permissionDenied: .permissionDenied
         case .malformedRequest, .openFailed: .io("Salvage's read-only disk access couldn't open this device.")
+        case .notRootOwned, .diskImage: .unsafeTarget(otherUsersDeviceReason)
         }
     }
+
+    /// A user's own disk images and devices open directly; anything the helper is asked for
+    /// that isn't a root-owned physical disk belongs to someone else.
+    static let otherUsersDeviceReason = "This device or disk image wasn't attached by you, so Salvage can't read it. Attach it from your own account and try again."
 }
 
 struct SMAppServiceDaemonControl: HelperServiceControl {
@@ -124,13 +129,15 @@ struct SMAppServiceDaemonControl: HelperServiceControl {
 }
 
 /// One short-lived XPC connection per open request. The helper must carry the same Team ID as
-/// this app and the helper's exact identifier, enforced by XPC on every message.
+/// this app and the helper's exact identifier, enforced by XPC on every message. Release builds
+/// also require the helper to be signed with Developer ID (see `codeSigningRequirement`).
 struct XPCPrivilegedOpenTransport: PrivilegedOpenTransport {
     var timeout: Duration = .seconds(15)
 
     func send(_ request: PrivilegedOpenRequest) async -> PrivilegedOpenReply {
         guard let team = currentProcessTeamIdentifier(),
-              let requirement = codeSigningRequirement(identifier: PrivilegedOpenProtocol.helperIdentifier, teamID: team) else {
+              let requirement = codeSigningRequirement(identifier: PrivilegedOpenProtocol.helperIdentifier, teamID: team,
+                                                   allowDevelopmentCertificates: PrivilegedOpenProtocol.allowsDevelopmentSigning) else {
             return .unavailable
         }
         let queue = DispatchQueue(label: "dev.hsmith.Salvage.PrivilegedOpenClient")

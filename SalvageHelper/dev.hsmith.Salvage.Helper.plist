@@ -15,5 +15,10 @@
 	<array>
 		<string>dev.hsmith.Salvage</string>
 	</array>
+	<key>SpawnConstraint</key>
+	<dict>
+		<key>signing-identifier</key>
+		<string>dev.hsmith.Salvage.Helper</string>
+	</dict>
 </dict>
 </plist>

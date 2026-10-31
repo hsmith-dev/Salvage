@@ -334,6 +334,7 @@
 				9AE7193EEF770B6D57E63809 /* CopyFiles */,
 				83B2A3489C888A82F8D87AE5 /* Frameworks */,
 				9EE0F32D91846475B1438A6A /* Embed Dependencies */,
+				4BCD221BA7CDCFD216265625 /* Pin helper SpawnConstraint team */,
 			);
 			buildRules = (
 			);
@@ -390,6 +391,28 @@
 			);
 		};
 /* End PBXProject section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		4BCD221BA7CDCFD216265625 /* Pin helper SpawnConstraint team */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Pin helper SpawnConstraint team";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\nplist=\"${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Library/LaunchDaemons/dev.hsmith.Salvage.Helper.plist\"\nteam=\"${DEVELOPMENT_TEAM:-}\"\nif ! printf '%s' \"$team\" | grep -Eq '^[A-Z0-9]{10}$'; then\n  echo \"note: no valid DEVELOPMENT_TEAM; helper SpawnConstraint pins the signing identifier only\"\n  exit 0\nfi\n/usr/libexec/PlistBuddy -c \"Delete :SpawnConstraint:team-identifier\" \"$plist\" >/dev/null 2>&1 || true\n/usr/libexec/PlistBuddy -c \"Add :SpawnConstraint:team-identifier string $team\" \"$plist\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		4880B3F6663380198770BD94 /* Sources */ = {
@@ -645,6 +668,7 @@
 				PRODUCT_NAME = SalvageHelper;
 				SDKROOT = macosx;
 				SKIP_INSTALL = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) SALVAGE_HELPER_ALLOW_DEVELOPMENT";
 				SWIFT_STRICT_CONCURRENCY = complete;
 				SWIFT_VERSION = 6.0;
 			};

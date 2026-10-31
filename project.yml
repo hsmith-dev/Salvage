@@ -49,6 +49,24 @@ targets:
         INFOPLIST_KEY_NSHumanReadableCopyright: ""
         CODE_SIGN_STYLE: Automatic
         MACOSX_DEPLOYMENT_TARGET: "14.0"
+    postBuildScripts:
+      # Story 1.12 / AD-13: pin the helper's launchd SpawnConstraint to this build's team. The
+      # source plist pins only the signing identifier, because the Team ID is never hardcoded
+      # (see the header). DEVELOPMENT_TEAM comes from Xcode's team picker locally and from the
+      # release workflow in CI; with no valid team (unsigned CI builds) the plist is left as is.
+      # Runs after the copy phase and before the app is signed, so the seal covers the result.
+      - name: Pin helper SpawnConstraint team
+        basedOnDependencyAnalysis: false
+        script: |
+          set -euo pipefail
+          plist="${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Library/LaunchDaemons/dev.hsmith.Salvage.Helper.plist"
+          team="${DEVELOPMENT_TEAM:-}"
+          if ! printf '%s' "$team" | grep -Eq '^[A-Z0-9]{10}$'; then
+            echo "note: no valid DEVELOPMENT_TEAM; helper SpawnConstraint pins the signing identifier only"
+            exit 0
+          fi
+          /usr/libexec/PlistBuddy -c "Delete :SpawnConstraint:team-identifier" "$plist" >/dev/null 2>&1 || true
+          /usr/libexec/PlistBuddy -c "Add :SpawnConstraint:team-identifier string $team" "$plist"
     dependencies:
       - package: SalvageCore
         product: SalvageCore
@@ -90,6 +108,12 @@ targets:
         SKIP_INSTALL: YES
         CODE_SIGN_STYLE: Automatic
         MACOSX_DEPLOYMENT_TARGET: "14.0"
+      configs:
+        # Debug only: the helper also accepts an Apple Development-signed app, so a Debug build
+        # signed in Xcode can be tested end to end. Release always requires Developer ID
+        # (HelperShared/PrivilegedOpenProtocol.swift, `allowsDevelopmentSigning`).
+        Debug:
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) SALVAGE_HELPER_ALLOW_DEVELOPMENT"
 
   SalvageTests:
     type: bundle.unit-test

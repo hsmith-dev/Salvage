@@ -16,6 +16,9 @@ protocol RawDeviceOperations: Sendable {
     func protectedDisks() async throws -> Set<String>
     func identity(_ name: String) async throws -> RawDeviceIdentity
     func mountSources() async throws -> [String]
+    /// Whole-disk names above the media named by a mount source (`nil`: lookup failed, treated
+    /// as mounted). Lets the mount check see APFS volumes of a container synthesized on the disk.
+    nonisolated func ancestorWholeDisks(ofMediaNamed name: String) -> Set<String>?
     func unmount(_ name: String) async throws
     func openReadOnly(_ name: String, expected: RawDeviceIdentity) async throws -> Int32
     func closeDescriptor(_ descriptor: Int32) async
@@ -76,7 +79,8 @@ public actor RawBlockReader: BlockReader {
             guard try await operations.identity(name) == first else { throw ScanError.deviceChanged }
             try await checkProtection(name, operations: operations)
             try Task.checkCancellation()
-            try ensureUnmounted(name, sources: await operations.mountSources())
+            try ensureUnmounted(name, sources: await operations.mountSources(),
+                                ancestorWholeDisks: operations.ancestorWholeDisks(ofMediaNamed:))
             try Task.checkCancellation()
             let descriptor = try await operations.openReadOnly(name, expected: first)
             do {
@@ -101,6 +105,7 @@ public actor RawBlockReader: BlockReader {
     static let bootDriveReason = "Your boot drive can't be scanned while macOS is running from it."
     static let notWholeDriveReason = "This device can't be scanned because its system name isn't a whole drive."
     static let bootUnresolvedReason = "Couldn't identify your startup drive safely. The scan was refused."
+    static let writableDescriptorReason = "Salvage only reads drives, and this drive wasn't opened read-only. The scan was refused."
 
     /// Cleanup is explicit and awaited before the app starts another session.
     public func close() async {
@@ -178,9 +183,15 @@ func openRawDevice(_ name: String, expected: RawDeviceIdentity, directOpen: (Str
     return descriptor
 }
 
-/// The fd must be a character device with the expected device number; it is then switched to
-/// uncached reads. On any mismatch the fd is closed and the device treated as changed.
+/// The fd must be open read-only (never trust that a helper, or a future code path, honored
+/// O_RDONLY) and be a character device with the expected device number; it is then switched to
+/// uncached reads. On any failure the fd is closed: a writable handle is refused as unsafe, any
+/// other mismatch means the device changed.
 func validateRawDescriptor(_ descriptor: Int32, expected: RawDeviceIdentity) throws {
+    let flags = fcntl(descriptor, F_GETFL)
+    guard flags >= 0, flags & O_ACCMODE == O_RDONLY else {
+        Darwin.close(descriptor); throw ScanError.unsafeTarget(RawBlockReader.writableDescriptorReason)
+    }
     var node = stat()
     guard fstat(descriptor, &node) == 0,
           isExpectedCharacterDevice(mode: node.st_mode, rdev: node.st_rdev, expected: expected.deviceNumber),
@@ -216,6 +227,9 @@ private actor NativeRawDeviceOperations: RawDeviceOperations {
                                  blockSize: block.intValue, deviceNumber: node.st_rdev)
     }
     func mountSources() async throws -> [String] { try ownedMountSources() }
+    nonisolated func ancestorWholeDisks(ofMediaNamed name: String) -> Set<String>? {
+        registryAncestorWholeDisks(ofMediaNamed: name)
+    }
     func unmount(_ name: String) async throws {
         try await unmountOnMain(name)
     }
@@ -244,7 +258,7 @@ private actor NativeRawDeviceOperations: RawDeviceOperations {
         // The helper path does suspend; the helper re-checks registry ID, device number, boot
         // refusal and mount state itself, and `prepare` re-validates identity after the open.
         guard try await identity(name) == expected else { throw ScanError.deviceChanged }
-        try ensureUnmounted(name, sources: ownedMountSources())
+        try ensureUnmounted(name, sources: ownedMountSources(), ancestorWholeDisks: registryAncestorWholeDisks(ofMediaNamed:))
         return try await openRawDevice(name, expected: expected, directOpen: { path in
             let fd = Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
             return fd >= 0 ? .opened(fd) : .failed(errno: errno)
@@ -298,9 +312,11 @@ final class OneShotCompletion: @unchecked Sendable {
     }
 }
 
-/// The production and injected paths share this refusal rule.
-func ensureUnmounted(_ name: String, sources: [String]) throws {
-    if isMounted(name, sources: sources) {
+/// The production and injected paths share this refusal rule, which is also the helper's
+/// (HelperShared `isMounted`): a mount on the disk itself, or on media layered on it such as an
+/// APFS volume of a container synthesized from one of its partitions.
+func ensureUnmounted(_ name: String, sources: [String], ancestorWholeDisks: (String) -> Set<String>?) throws {
+    if isMounted(name, sources: sources, ancestorWholeDisks: ancestorWholeDisks) {
         throw ScanError.io("The device was mounted again. Close files on it and retry.")
     }
 }
