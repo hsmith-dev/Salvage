@@ -12,6 +12,7 @@ Licensed under the [MIT License](LICENSE).
 - `SalvageCore/` -- the domain engine (filesystem parsers, carving, recovery-confidence scoring); depends on nothing but Foundation.
 - `SalvageDiskIO/` -- the macOS disk-I/O adapter (DiskArbitration, raw block-device reads, FileVault unlock).
 - `Salvage/` -- the SwiftUI app target; the composition root wiring `SalvageDiskIO` into `SalvageCore`.
+- `SalvageHelper/` -- the privileged read-only helper (a launchd daemon embedded in `Salvage.app`, Architecture AD-13) that opens physical drives' raw nodes read-only for `SalvageDiskIO`; it compiles only its own `main.swift` plus `SalvageDiskIO/Sources/SalvageDiskIO/HelperShared/`.
 - `scripts/spike-raw-device-access/` -- a standalone, disposable SwiftPM CLI harness built for Story 1.2's Full Disk Access / raw-device-access spike (see `_bmad-output/implementation-artifacts/spec-1-2-full-disk-access-raw-device-access-spike.md`). It is never wired into `Salvage.app`, `SalvageCore`, or `SalvageDiskIO`, so its direct `import DiskArbitration` is a deliberate, narrow exclusion from `scripts/check-core-boundary.sh`'s repo-wide DiskArbitration-ownership check (AD-1/AD-9 bind the three hexagonal modules, not standalone spike tooling).
 
 ## Planning and architecture docs

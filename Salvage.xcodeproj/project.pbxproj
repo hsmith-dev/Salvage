@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		0062F4592C4C75593540D448 /* ScanProgressView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B06FDFC018E70AED252E2AD4 /* ScanProgressView.swift */; };
+		074A456E4F66C3ABB0932402 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 40F847D0B32D43697B452ADB /* main.swift */; };
 		0D31EF07325DE657CECF20A8 /* RecoveryCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F82CDD0036874C3DF40E624 /* RecoveryCoordinatorTests.swift */; };
 		13470E4C7A849C2924C5A455 /* SalvageDiskIO in Frameworks */ = {isa = PBXBuildFile; productRef = CA3B2287E3126452573584A3 /* SalvageDiskIO */; };
 		141EC4A99902299F276C46AF /* ScanCheckpointStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A823EAB151C49C3DEBC69CF6 /* ScanCheckpointStore.swift */; };
@@ -30,15 +31,28 @@
 		836C443FB69E9C1B42F4BAEC /* SalvageCore in Frameworks */ = {isa = PBXBuildFile; productRef = 93F6F4111F1AFB9602871901 /* SalvageCore */; };
 		83D05F08C8BEEF5CD38636E0 /* SalvageApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1DE755CB1D6209CEB18BBAE /* SalvageApp.swift */; };
 		852D2C18EBC9D9A45C4D231C /* UpdateCommands.swift in Sources */ = {isa = PBXBuildFile; fileRef = A242CDC4F6EB012427768849 /* UpdateCommands.swift */; };
+		85C2877FBB0C3485CEFD1B16 /* dev.hsmith.Salvage.Helper.plist in CopyFiles */ = {isa = PBXBuildFile; fileRef = 3709825BAFDE3BFED067D1F2 /* dev.hsmith.Salvage.Helper.plist */; };
 		8BCAD4919CAAC175B3B5163F /* SalvageCore in Frameworks */ = {isa = PBXBuildFile; productRef = 24B9B3143713F56A6DE6C2A1 /* SalvageCore */; };
 		95F307E01DE955699B4AEA7B /* SalvageDiskIO in Frameworks */ = {isa = PBXBuildFile; productRef = CCE774775C4FCB8528BDC040 /* SalvageDiskIO */; };
+		AD9B5DC4149E1C1B09FE8D10 /* BSDDeviceNames.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CD075B0C20C5E1B3BB018F0 /* BSDDeviceNames.swift */; };
 		B7B0C2A5219E6799897814A2 /* FileBrowserView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46C282C21C963EE0A2EEB372 /* FileBrowserView.swift */; };
+		B7E6047D99128C345AFFBD97 /* PrivilegedDiskQueries.swift in Sources */ = {isa = PBXBuildFile; fileRef = 207452AAAA5C899682CD4D98 /* PrivilegedDiskQueries.swift */; };
+		C7C0D2892751F06B6080B61C /* HelperApprovalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 181533C1F6458A10898E049A /* HelperApprovalView.swift */; };
 		D86AD77E4FE679401396EFA9 /* DeviceListViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E40E27E6E6443F51724D8027 /* DeviceListViewModelTests.swift */; };
+		DA2FFB71E137E4CF2BA82727 /* PrivilegedOpenProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C0D0F9FA3E8E62AA8B12EE1 /* PrivilegedOpenProtocol.swift */; };
 		DB4FF45FD4E869D4490DA392 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 98C64227FE351987F85FA819 /* ContentView.swift */; };
 		EF65AF81B3862EDF22A9CEF2 /* ResultsViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EDF6E74F57E1D6B66721A701 /* ResultsViewModelTests.swift */; };
+		FE47C27DA6E7769F4E910112 /* SalvageHelper in Embed Dependencies */ = {isa = PBXBuildFile; fileRef = F56855E06D1FF7725085AF55 /* SalvageHelper */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
+		0128513772C0AE360819ADA9 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = EFB21184E4FF626D50CD9310 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 2775E33C14E8415F835FB1F7;
+			remoteInfo = SalvageHelper;
+		};
 		8B00A3D688CBE81A81441719 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = EFB21184E4FF626D50CD9310 /* Project object */;
@@ -48,17 +62,47 @@
 		};
 /* End PBXContainerItemProxy section */
 
+/* Begin PBXCopyFilesBuildPhase section */
+		9AE7193EEF770B6D57E63809 /* CopyFiles */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = Contents/Library/LaunchDaemons;
+			dstSubfolderSpec = 1;
+			files = (
+				85C2877FBB0C3485CEFD1B16 /* dev.hsmith.Salvage.Helper.plist in CopyFiles */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		9EE0F32D91846475B1438A6A /* Embed Dependencies */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 6;
+			files = (
+				FE47C27DA6E7769F4E910112 /* SalvageHelper in Embed Dependencies */,
+			);
+			name = "Embed Dependencies";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
 		033C52D0FB3387397999220A /* SourceSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SourceSession.swift; sourceTree = "<group>"; };
 		0A4FDEF94C4B425FCAF71692 /* SalvageCore */ = {isa = PBXFileReference; lastKnownFileType = folder; name = SalvageCore; path = SalvageCore; sourceTree = SOURCE_ROOT; };
+		0CD075B0C20C5E1B3BB018F0 /* BSDDeviceNames.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BSDDeviceNames.swift; sourceTree = "<group>"; };
 		13AB8B7E7A20544CD69D8CBF /* PreviewLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewLoader.swift; sourceTree = "<group>"; };
+		181533C1F6458A10898E049A /* HelperApprovalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HelperApprovalView.swift; sourceTree = "<group>"; };
 		200C8811715FB24AA7CA8091 /* DeviceListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceListView.swift; sourceTree = "<group>"; };
+		207452AAAA5C899682CD4D98 /* PrivilegedDiskQueries.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivilegedDiskQueries.swift; sourceTree = "<group>"; };
 		32F1F12AAAACFF6920FA4E1E /* ResultsDashboardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResultsDashboardView.swift; sourceTree = "<group>"; };
+		3709825BAFDE3BFED067D1F2 /* dev.hsmith.Salvage.Helper.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = dev.hsmith.Salvage.Helper.plist; sourceTree = "<group>"; };
 		3A78CB2252556649B9DABE08 /* UpdateChecker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateChecker.swift; sourceTree = "<group>"; };
 		3B552735CFF0ADC1F523CD01 /* ResultsViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResultsViewModel.swift; sourceTree = "<group>"; };
 		3F82CDD0036874C3DF40E624 /* RecoveryCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecoveryCoordinatorTests.swift; sourceTree = "<group>"; };
+		40F847D0B32D43697B452ADB /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		46C282C21C963EE0A2EEB372 /* FileBrowserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileBrowserView.swift; sourceTree = "<group>"; };
 		5482A784FE2B89690AB6EF74 /* PreviewLoaderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewLoaderTests.swift; sourceTree = "<group>"; };
+		5C0D0F9FA3E8E62AA8B12EE1 /* PrivilegedOpenProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivilegedOpenProtocol.swift; sourceTree = "<group>"; };
 		71F3E757E68865FD5D2FA447 /* TrustPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrustPanelView.swift; sourceTree = "<group>"; };
 		7D688D515CDA1F3D3D907DEB /* ScanViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScanViewModelTests.swift; sourceTree = "<group>"; };
 		808421B06766C5A9FFA274ED /* RecoverySheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecoverySheet.swift; sourceTree = "<group>"; };
@@ -77,6 +121,7 @@
 		E40E27E6E6443F51724D8027 /* DeviceListViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceListViewModelTests.swift; sourceTree = "<group>"; };
 		EDF6E74F57E1D6B66721A701 /* ResultsViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResultsViewModelTests.swift; sourceTree = "<group>"; };
 		F4CD440ACD4B335303928637 /* ScanViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScanViewModel.swift; sourceTree = "<group>"; };
+		F56855E06D1FF7725085AF55 /* SalvageHelper */ = {isa = PBXFileReference; includeInIndex = 0; path = SalvageHelper; sourceTree = BUILT_PRODUCTS_DIR; };
 		F798DD8A6F1B8EF9E72517BA /* UpdateCheckerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateCheckerTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -106,6 +151,7 @@
 			isa = PBXGroup;
 			children = (
 				C5742DFC4C322D2335F60B77 /* Salvage.app */,
+				F56855E06D1FF7725085AF55 /* SalvageHelper */,
 				C9D545C7519DEC1E75E987A4 /* SalvageTests.xctest */,
 			);
 			name = Products;
@@ -122,6 +168,24 @@
 				F798DD8A6F1B8EF9E72517BA /* UpdateCheckerTests.swift */,
 			);
 			path = SalvageTests;
+			sourceTree = "<group>";
+		};
+		3E35A3CF4AFE8A7E8BEEC401 /* HelperShared */ = {
+			isa = PBXGroup;
+			children = (
+				0CD075B0C20C5E1B3BB018F0 /* BSDDeviceNames.swift */,
+				207452AAAA5C899682CD4D98 /* PrivilegedDiskQueries.swift */,
+				5C0D0F9FA3E8E62AA8B12EE1 /* PrivilegedOpenProtocol.swift */,
+			);
+			path = HelperShared;
+			sourceTree = "<group>";
+		};
+		426D8A3F24B2C7E0827807AC /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				F1342E739403352EE5EB51BB /* SalvageDiskIO */,
+			);
+			path = Sources;
 			sourceTree = "<group>";
 		};
 		4A25100FE60C8BACF5AFAF64 /* Packages */ = {
@@ -141,6 +205,7 @@
 				200C8811715FB24AA7CA8091 /* DeviceListView.swift */,
 				46C282C21C963EE0A2EEB372 /* FileBrowserView.swift */,
 				8E17D8A77B7537474A88104D /* FilePreviewView.swift */,
+				181533C1F6458A10898E049A /* HelperApprovalView.swift */,
 				808421B06766C5A9FFA274ED /* RecoverySheet.swift */,
 				32F1F12AAAACFF6920FA4E1E /* ResultsDashboardView.swift */,
 				B06FDFC018E70AED252E2AD4 /* ScanProgressView.swift */,
@@ -154,9 +219,28 @@
 			children = (
 				4A25100FE60C8BACF5AFAF64 /* Packages */,
 				DDBD479E58709F374F9C1534 /* Salvage */,
+				7C0F10F848B40E96ADBBCD94 /* SalvageDiskIO */,
+				78BFC852B6865DB9BD841658 /* SalvageHelper */,
 				26CB72D99079BD3AAC9885D4 /* SalvageTests */,
 				1131315FC99C3164855C4DA6 /* Products */,
 			);
+			sourceTree = "<group>";
+		};
+		78BFC852B6865DB9BD841658 /* SalvageHelper */ = {
+			isa = PBXGroup;
+			children = (
+				3709825BAFDE3BFED067D1F2 /* dev.hsmith.Salvage.Helper.plist */,
+				40F847D0B32D43697B452ADB /* main.swift */,
+			);
+			path = SalvageHelper;
+			sourceTree = "<group>";
+		};
+		7C0F10F848B40E96ADBBCD94 /* SalvageDiskIO */ = {
+			isa = PBXGroup;
+			children = (
+				426D8A3F24B2C7E0827807AC /* Sources */,
+			);
+			path = SalvageDiskIO;
 			sourceTree = "<group>";
 		};
 		AA1DB46DFFE8660E1C28D1DA /* ViewModels */ = {
@@ -193,6 +277,14 @@
 			path = Salvage;
 			sourceTree = "<group>";
 		};
+		F1342E739403352EE5EB51BB /* SalvageDiskIO */ = {
+			isa = PBXGroup;
+			children = (
+				3E35A3CF4AFE8A7E8BEEC401 /* HelperShared */,
+			);
+			path = SalvageDiskIO;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -217,16 +309,36 @@
 			productReference = C9D545C7519DEC1E75E987A4 /* SalvageTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
+		2775E33C14E8415F835FB1F7 /* SalvageHelper */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AB2DDFC098D934D593206542 /* Build configuration list for PBXNativeTarget "SalvageHelper" */;
+			buildPhases = (
+				E8EB60430D62CA7417D9BC45 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = SalvageHelper;
+			packageProductDependencies = (
+			);
+			productName = SalvageHelper;
+			productReference = F56855E06D1FF7725085AF55 /* SalvageHelper */;
+			productType = "com.apple.product-type.tool";
+		};
 		DC87EDB713ADF6AFFF51162E /* Salvage */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = A98F0435E080784CC9EA5B5C /* Build configuration list for PBXNativeTarget "Salvage" */;
 			buildPhases = (
 				4880B3F6663380198770BD94 /* Sources */,
+				9AE7193EEF770B6D57E63809 /* CopyFiles */,
 				83B2A3489C888A82F8D87AE5 /* Frameworks */,
+				9EE0F32D91846475B1438A6A /* Embed Dependencies */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				5B978E9FDD35412232DBB7CB /* PBXTargetDependency */,
 			);
 			name = Salvage;
 			packageProductDependencies = (
@@ -246,6 +358,9 @@
 				BuildIndependentTargetsInParallel = YES;
 				LastUpgradeCheck = 1430;
 				TargetAttributes = {
+					2775E33C14E8415F835FB1F7 = {
+						ProvisioningStyle = Automatic;
+					};
 					DC87EDB713ADF6AFFF51162E = {
 						ProvisioningStyle = Automatic;
 					};
@@ -270,6 +385,7 @@
 			projectRoot = "";
 			targets = (
 				DC87EDB713ADF6AFFF51162E /* Salvage */,
+				2775E33C14E8415F835FB1F7 /* SalvageHelper */,
 				157BA7DD7D7CEC8AB92F0240 /* SalvageTests */,
 			);
 		};
@@ -286,6 +402,7 @@
 				4E4930C119561323B128C398 /* DeviceListViewModel.swift in Sources */,
 				B7B0C2A5219E6799897814A2 /* FileBrowserView.swift in Sources */,
 				7258392A62CEBE52A5E50D56 /* FilePreviewView.swift in Sources */,
+				C7C0D2892751F06B6080B61C /* HelperApprovalView.swift in Sources */,
 				29BABD96F117CF581C32C536 /* PreviewLoader.swift in Sources */,
 				531815604B039A4847467A94 /* RecoveryCoordinator.swift in Sources */,
 				1E8AF016B1A0E95B494EAAED /* RecoverySheet.swift in Sources */,
@@ -315,9 +432,25 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		E8EB60430D62CA7417D9BC45 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AD9B5DC4149E1C1B09FE8D10 /* BSDDeviceNames.swift in Sources */,
+				B7E6047D99128C345AFFBD97 /* PrivilegedDiskQueries.swift in Sources */,
+				DA2FFB71E137E4CF2BA82727 /* PrivilegedOpenProtocol.swift in Sources */,
+				074A456E4F66C3ABB0932402 /* main.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
+		5B978E9FDD35412232DBB7CB /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 2775E33C14E8415F835FB1F7 /* SalvageHelper */;
+			targetProxy = 0128513772C0AE360819ADA9 /* PBXContainerItemProxy */;
+		};
 		8C5F96444842AECBA24E13BA /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
 			target = DC87EDB713ADF6AFFF51162E /* Salvage */;
@@ -493,6 +626,30 @@
 			};
 			name = Debug;
 		};
+		A8AEB09F6CD2E113616E4D8E /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CREATE_INFOPLIST_SECTION_IN_BINARY = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.hsmith.Salvage.Helper;
+				PRODUCT_NAME = SalvageHelper;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
 		D590919D20E71714327096EF /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -511,6 +668,30 @@
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Salvage.app/Contents/MacOS/Salvage";
 			};
 			name = Debug;
+		};
+		E315D5C48711442EA6CAE332 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CREATE_INFOPLIST_SECTION_IN_BINARY = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.hsmith.Salvage.Helper;
+				PRODUCT_NAME = SalvageHelper;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
 		};
 		EED70DC5477B0C053FA907CB /* Release */ = {
 			isa = XCBuildConfiguration;
@@ -548,6 +729,15 @@
 			buildConfigurations = (
 				81829BFF502C99A5D4404FBD /* Debug */,
 				523737E606AC90304BCE10C1 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		AB2DDFC098D934D593206542 /* Build configuration list for PBXNativeTarget "SalvageHelper" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A8AEB09F6CD2E113616E4D8E /* Debug */,
+				E315D5C48711442EA6CAE332 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;

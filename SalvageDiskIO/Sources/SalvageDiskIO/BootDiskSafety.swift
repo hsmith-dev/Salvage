@@ -23,26 +23,8 @@ enum BootDiskResolutionError: Error, CustomStringConvertible {
     }
 }
 
-/// Returns the whole-disk BSD name (e.g. "disk3") hosting whatever "/" is currently mounted
-/// from, by asking the kernel directly (`statfs`). On an APFS system this is the synthesized
-/// *container* disk, not the physical disk backing it -- see `physicalWholeDisks`.
-func bootWholeDiskBSDName() -> String? {
-    var stat = statfs()
-    guard statfs("/", &stat) == 0 else { return nil }
-    let mntFromTuple = stat.f_mntfromname
-    let capacity = MemoryLayout.size(ofValue: mntFromTuple)
-    let mntFrom = withUnsafePointer(to: mntFromTuple) { ptr -> String in
-        ptr.withMemoryRebound(to: CChar.self, capacity: capacity) { chars -> String in
-            // Bounded decode: stop at the first NUL within the buffer's own fixed capacity,
-            // rather than relying on `String(cString:)` to find one on its own -- a buffer that
-            // somehow lacked a NUL terminator in range would otherwise read past it.
-            let buffer = UnsafeBufferPointer(start: chars, count: capacity)
-            let length = buffer.firstIndex(of: 0) ?? capacity
-            return String(decoding: buffer[0..<length].map { UInt8(bitPattern: $0) }, as: UTF8.self)
-        }
-    }
-    return wholeDiskBSDName(fromDevicePath: mntFrom)
-}
+// `bootWholeDiskBSDName()` moved to HelperShared/PrivilegedDiskQueries.swift (Story 1.12) so the
+// privileged helper, which must never spawn `diskutil`, can share the statfs logic.
 
 /// Pure interpretation of `diskutil info -plist <bsdName>`'s already-decoded output. Kept
 /// separate from the process-spawning I/O in `diskUtilInfoPlist` so it has direct unit coverage
