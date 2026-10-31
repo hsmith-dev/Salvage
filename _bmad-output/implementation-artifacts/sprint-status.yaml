@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 10-31-2026 09:25
-last_updated: 10-31-2026 15:40
+last_updated: 10-31-2026 16:35
 project: Salvage
 project_key: NOKEY
 tracking_system: file-system
@@ -42,12 +42,12 @@ development_status:
   1-4-scan-a-fat32-exfat-device-with-live-progress: review
   1-5-pause-resume-and-cancel-a-scan: review
   1-6-recover-deleted-files-via-intact-metadata: review
-  1-7-browse-results-by-file-type: backlog
-  1-8-see-and-trust-the-recovery-confidence-indicator: backlog
-  1-9-preview-a-file-before-recovering-it: backlog
-  1-10-recover-selected-files-to-a-safe-destination: backlog
+  1-7-browse-results-by-file-type: in-progress
+  1-8-see-and-trust-the-recovery-confidence-indicator: in-progress
+  1-9-preview-a-file-before-recovering-it: in-progress
+  1-10-recover-selected-files-to-a-safe-destination: in-progress
   1-11-verify-the-app-s-privacy-guarantees-yourself: review
-  1-12-read-physical-drives-via-a-read-only-privileged-helper: backlog
+  1-12-read-physical-drives-via-a-read-only-privileged-helper: in-progress
   epic-1-retrospective: optional
 
   epic-2: backlog
