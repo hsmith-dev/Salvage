@@ -49,33 +49,44 @@ struct ResultsDashboardView: View {
                         }
                     }
                 }
-                if model.hasRecoverableFiles {
+                // Read once per body: each accessor is a cached lookup, not a rescan of the rows.
+                let totals = model.aggregates(includingSystemFiles: model.showSystemFiles)
+                let emptyState = model.emptyState(for: scan.state)
+                if let empty = emptyState {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(empty.message)
+                        if empty == .onlySystemFiles {
+                            Toggle("Show system files", isOn: $model.showSystemFiles).toggleStyle(.checkbox)
+                        }
+                    }
+                } else {
                     VStack(alignment: .leading, spacing: 12) {
                         Text("By type").font(.headline)
                         LazyVGrid(columns: [GridItem(.adaptive(minimum: 200, maximum: 280), spacing: 16)],
                                   alignment: .leading, spacing: 16) {
-                            ForEach(model.buckets) { bucket in tile(bucket) }
+                            ForEach(totals.buckets) { bucket in tile(bucket) }
                         }
-                        Text("\(filesText(model.recoverableCount)) · \(bytes(model.recoverableBytes)) in total")
+                        Text("\(filesText(totals.recoverableCount)) · \(bytes(totals.recoverableBytes)) in total")
                             .font(.subheadline).foregroundStyle(.secondary)
                         Button("Browse all files") { onOpen(nil) }
                     }
-                } else {
-                    Text("No recoverable files found on this device.")
                 }
-                if model.unrecoverableCount > 0 {
+                if totals.unrecoverableCount > 0 {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Can't be recovered").font(.headline)
-                        Text("\(filesText(model.unrecoverableCount)) were found, but Salvage couldn't locate their contents on the device. They aren't counted above.")
+                        Text("\(filesText(totals.unrecoverableCount)) were found, but Salvage couldn't locate their contents on the device. They aren't counted above.")
                             .foregroundStyle(.secondary)
                         Button("View these files") { onOpen(nil) }
                     }
                 }
-                VStack(alignment: .leading, spacing: 4) {
-                    Toggle("Show system files", isOn: $model.showSystemFiles).toggleStyle(.checkbox)
-                    if model.hiddenSystemFileCount > 0 {
-                        Text("\(filesText(model.hiddenSystemFileCount)) of macOS housekeeping (such as ._ and .DS_Store) hidden.")
-                            .font(.caption).foregroundStyle(.secondary)
+                // The only-system-files state carries its own toggle; don't show a second one.
+                if emptyState != .onlySystemFiles {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Toggle("Show system files", isOn: $model.showSystemFiles).toggleStyle(.checkbox)
+                        if model.hiddenSystemFileCount > 0 {
+                            Text("\(filesText(model.hiddenSystemFileCount)) of macOS housekeeping (such as ._ and .DS_Store) hidden.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                     }
                 }
                 Text("Files listed here have been indexed from intact metadata. No files have been copied or recovered.")
@@ -114,7 +125,7 @@ struct ResultsDashboardView: View {
         }
     }
 
-    private func filesText(_ count: Int) -> String { "\(count.formatted()) \(count == 1 ? "file" : "files")" }
+    private func filesText(_ count: Int) -> String { ResultsViewModel.filesText(count) }
     private func bytes(_ count: Int64) -> String { ByteCountFormatter.string(fromByteCount: count, countStyle: .file) }
 
     static func symbol(for category: FileCategory) -> String {

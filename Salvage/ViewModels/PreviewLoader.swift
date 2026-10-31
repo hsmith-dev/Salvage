@@ -43,7 +43,7 @@ enum PreviewFormat: Sendable, Equatable {
 
     /// Magic bytes first; the file extension only when the header is not recognised.
     static func detect(header: Data, name: String) -> PreviewFormat {
-        let bytes = [UInt8](header.prefix(16))
+        let bytes = [UInt8](header.prefix(32))
         func starts(_ magic: [UInt8], at offset: Int = 0) -> Bool {
             bytes.count >= offset + magic.count && Array(bytes[offset..<offset + magic.count]) == magic
         }
@@ -52,7 +52,7 @@ enum PreviewFormat: Sendable, Equatable {
             || starts([0xFF, 0xD8, 0xFF])                                                  // JPEG
             || starts(Array("GIF87a".utf8)) || starts(Array("GIF89a".utf8))
             || starts([0x49, 0x49, 0x2A, 0x00]) || starts([0x4D, 0x4D, 0x00, 0x2A])        // TIFF
-            || starts([0x42, 0x4D])                                                        // BMP
+            || isPlausibleBMP(bytes)                                                       // BMP
             || (starts(Array("RIFF".utf8)) && starts(Array("WEBP".utf8), at: 8))
             || (starts(Array("ftyp".utf8), at: 4)
                 && ["heic", "heix", "hevc", "mif1", "msf1", "avif"].contains { starts(Array($0.utf8), at: 8) }) {
@@ -63,6 +63,24 @@ enum PreviewFormat: Sendable, Equatable {
         if imageExtensions.contains(ext) { return .image }
         if textExtensions.contains(ext) { return .text }
         return .unknown
+    }
+}
+
+extension PreviewFormat {
+    /// "BM" alone is too weak (a CSV can start "BMI,"), so the BITMAPFILEHEADER and the size of
+    /// the DIB header after it must be sane: a known DIB header size, a pixel-data offset past
+    /// both headers, and a file-size field (when set) that is not smaller than that offset.
+    static func isPlausibleBMP(_ bytes: [UInt8]) -> Bool {
+        guard bytes.count >= 18, bytes[0] == 0x42, bytes[1] == 0x4D else { return false }
+        func le32(_ offset: Int) -> UInt32 {
+            (0..<4).reduce(UInt32(0)) { $0 | UInt32(bytes[offset + $1]) << (8 * UInt32($1)) }
+        }
+        let fileSize = le32(2), pixelOffset = le32(10), dibSize = le32(14)
+        let knownDIBSizes: Set<UInt32> = [12, 16, 40, 52, 56, 64, 108, 124]
+        guard knownDIBSizes.contains(dibSize) else { return false }
+        guard pixelOffset >= 14 + dibSize else { return false }
+        // Some writers leave the size field 0; otherwise it must hold the headers.
+        return fileSize == 0 || fileSize >= pixelOffset
     }
 }
 
@@ -102,7 +120,7 @@ struct PreviewLoader: Sendable {
     static let rawBytesCap: Int64 = 4 * 1024
     static let maxImageDimension = 2048
     /// Refuse to decode images whose declared size would need an outsized decode buffer.
-    static let maxImagePixels = 400_000_000
+    static let maxImagePixels = 100_000_000
 
     private let readPrefix: PrefixReader?
 
@@ -169,6 +187,9 @@ struct PreviewLoader: Sendable {
                 let data: Data
                 if file.sizeBytes <= Self.rawBytesCap {
                     data = header
+                } else if Self.decodeText(header, truncated: true) == nil {
+                    // The 4 KiB header is already binary; don't pull 1 MiB to find that out again.
+                    return .unavailable(.unsupportedFormat, rawBytes: raw)
                 } else {
                     guard let more = try await read(Self.textCap) else { return .unavailable(.deviceUnreadable, rawBytes: raw) }
                     data = more
@@ -192,17 +213,14 @@ struct PreviewLoader: Sendable {
         let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
         guard let source = CGImageSourceCreateWithData(data as CFData, sourceOptions),
               CGImageSourceGetCount(source) > 0 else { return .failure(.unsupportedFormat) }
-        if let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-           let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
-           let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue {
-            let (pixels, overflow) = width.multipliedReportingOverflow(by: height)
-            guard width > 0, height > 0 else { return .failure(.unsupportedFormat) }
-            guard !overflow, pixels <= maxImagePixels else { return .failure(.tooLarge) }
-        }
+        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] ?? [:]
+        if let refusal = checkDeclaredSize(properties) { return .failure(refusal) }
+        // A thumbnail at most `maxImageDimension` on its long side, built straight from the
+        // source (never from a full-size decode first) and not cached.
         let thumbnailOptions = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceShouldCacheImmediately: false,
             kCGImageSourceThumbnailMaxPixelSize: maxImageDimension,
         ] as CFDictionary
         guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions) else {
@@ -211,14 +229,29 @@ struct PreviewLoader: Sendable {
         return .success(image)
     }
 
-    /// UTF-16 needs a byte-order mark; UTF-8 must decode cleanly (allowing a sequence cut off by
-    /// the read cap) and contain no NULs or other non-whitespace control bytes.
+    /// Checks the declared pixel size before any decode. An image that doesn't declare both
+    /// dimensions is refused (its decode cost can't be bounded); so is one over `maxImagePixels`.
+    static func checkDeclaredSize(_ properties: [CFString: Any]) -> PreviewUnavailableReason? {
+        guard let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+              let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue else {
+            return .unsupportedFormat
+        }
+        guard width > 0, height > 0 else { return .unsupportedFormat }
+        let (pixels, overflow) = width.multipliedReportingOverflow(by: height)
+        guard !overflow, pixels <= maxImagePixels else { return .tooLarge }
+        return nil
+    }
+
+    /// UTF-16 needs a byte-order mark and more than 95% printable code units; UTF-8 must decode
+    /// cleanly (allowing a sequence cut off by the read cap) and contain no NULs or other
+    /// non-whitespace control bytes.
     static func decodeText(_ data: Data, truncated: Bool) -> String? {
         let bytes = [UInt8](data.prefix(2))
         if bytes == [0xFF, 0xFE] || bytes == [0xFE, 0xFF] {
             var body = data
             if truncated, body.count % 2 == 1 { body = body.dropLast() }
-            guard let text = String(data: body, encoding: .utf16), !text.isEmpty else { return nil }
+            guard isMostlyPrintableUTF16(body, littleEndian: bytes == [0xFF, 0xFE], truncated: truncated),
+                  let text = String(data: body, encoding: .utf16), !text.isEmpty else { return nil }
             return text.contains("\u{0}") ? nil : text
         }
         var body = data
@@ -234,6 +267,50 @@ struct PreviewLoader: Sendable {
         let allowed: Set<UInt8> = [0x09, 0x0A, 0x0D, 0x0C]
         guard !body.contains(where: { ($0 < 0x20 && !allowed.contains($0)) || $0 == 0x7F }) else { return nil }
         return text
+    }
+
+    /// Random bytes after a BOM still decode as UTF-16, mostly as BMP characters, so require that
+    /// more than 95% of the code units (after the BOM) are printable: assigned, not private-use,
+    /// not a lone surrogate, and not a control character other than tab, LF, CR or FF.
+    static func isMostlyPrintableUTF16(_ data: Data, littleEndian: Bool, truncated: Bool) -> Bool {
+        let bytes = [UInt8](data.dropFirst(2))
+        var units: [UInt16] = []
+        units.reserveCapacity(bytes.count / 2)
+        var index = 0
+        while index + 1 < bytes.count {
+            let a = UInt16(bytes[index]), b = UInt16(bytes[index + 1])
+            units.append(littleEndian ? a | b << 8 : a << 8 | b)
+            index += 2
+        }
+        guard !units.isEmpty else { return false }
+        let whitespace: Set<UInt32> = [0x09, 0x0A, 0x0D, 0x0C]
+        var printable = 0
+        var i = 0
+        while i < units.count {
+            let unit = units[i]
+            if UTF16.isLeadSurrogate(unit) {
+                if i + 1 < units.count, UTF16.isTrailSurrogate(units[i + 1]) {
+                    let value = 0x10000 + (UInt32(unit - 0xD800) << 10) + UInt32(units[i + 1] - 0xDC00)
+                    if let scalar = Unicode.Scalar(value), isPrintable(scalar, whitespace) { printable += 2 }
+                    i += 2
+                    continue
+                }
+                // A pair split by the read cap at the very end is not evidence of binary.
+                if truncated, i == units.count - 1 { printable += 1 }
+            } else if let scalar = Unicode.Scalar(unit), isPrintable(scalar, whitespace) {
+                printable += 1
+            }
+            i += 1
+        }
+        return printable * 100 > units.count * 95
+    }
+
+    private static func isPrintable(_ scalar: Unicode.Scalar, _ whitespace: Set<UInt32>) -> Bool {
+        switch scalar.properties.generalCategory {
+        case .control: return whitespace.contains(scalar.value)
+        case .unassigned, .privateUse, .surrogate: return false
+        default: return true
+        }
     }
 
     /// Classic 16-bytes-per-line hex dump: offset, hex bytes, printable ASCII.
