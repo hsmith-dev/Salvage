@@ -80,12 +80,12 @@ context:
 
 ## Tasks & Acceptance
 
-- [ ] Superblock, feature gating, CRC32C and group descriptors.
-- [ ] Inode reading, extent trees and block maps.
-- [ ] Directory walking (linear, htree-tolerant) and path building.
-- [ ] Best-effort deleted-dirent recovery.
-- [ ] Set `isImplemented = true` and update the routing tests.
-- [ ] Synthetic-image tests covering the matrix.
+- [x] Superblock, feature gating, CRC32C and group descriptors.
+- [x] Inode reading, extent trees and block maps.
+- [x] Directory walking (linear, htree-tolerant) and path building.
+- [x] Best-effort deleted-dirent recovery.
+- [x] Set `isImplemented = true` and update the routing tests.
+- [x] Synthetic-image tests covering the matrix.
 
 **Acceptance criteria:**
 - Given an ext2/3/4 device with deleted-but-not-overwritten files, those files appear with their original filename, path and timestamp.
@@ -97,3 +97,18 @@ context:
 - `swift test --package-path SalvageCore`
 - `./scripts/check-core-boundary.sh`
 - `xcodebuild -project Salvage.xcodeproj -scheme Salvage -configuration Debug -destination 'platform=macOS' CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO build`
+
+## Implementation Notes
+
+- **Journal / `needs_recovery`:** the journal is never replayed. A volume with the `needs_recovery` (RECOVER, 0x4) incompat bit is scanned read-only from on-disk metadata as it stands, so changes still only in the journal are not visible. It is not reported as an error (covered by `needsRecoveryIsScannedReadOnly`).
+- **Feature gating:** supported incompat bits are `filetype`, `needs_recovery`, `extents`, `64bit`, `flex_bg` and `large_dir`. `meta_bg` is not implemented, so it is refused with `unsupportedFilesystem`. `huge_file`, `dir_nlink` and `extra_isize` are RO_COMPAT bits on disk (the spec lists them under incompat), so they are accepted along with every other RO_COMPAT bit. `csum_seed` (0x2000) and `mmp` (0x100) are not in the supported set and are refused, as the spec requires. Superblock revisions above 1 are refused.
+- **CRC32C:** ext4 stores the raw CRC32C register (seed `~0`, no final inversion) over superblock bytes 0..<1020. `crc32c()` is the standard (inverted) form and is checked against the `123456789` vector; the superblock compares `crc32cUpdate(~0, …)`. Group descriptor and inode checksums are not verified (optional per spec).
+- **Uninit groups:** when `gdt_csum` or `metadata_csum` is set, a group flagged `INODE_UNINIT` or `BLOCK_UNINIT` has a bitmap that can't be trusted. Deleted candidates that need such a bitmap are skipped (under-recovery).
+- **`recordOffset`:** volume-relative inode byte offset, per this spec and the `SourceMetadata` doc comment. (FATVolume currently stores a device-absolute offset; not changed here because that file is out of scope.)
+- **`contiguous`:** true when the file's mapped blocks merge into one logical+physical run, covering both a single extent and a single block-map run. An empty file (no blocks) counts as contiguous.
+- **Deleted-file rules:** candidates are collected during the live walk and evaluated after it. That way an inode referenced by any live entry (renames, hard links, reuse) is never emitted as deleted. A candidate is emitted only if all of these hold: its dirent `file_type` is regular (or 0 without `filetype`); its name is valid UTF-8; it is a regular-mode inode with `i_dtime != 0` or `i_links_count == 0`; its size is > 0; it is free in the inode bitmap; its extent tree or block map validates; its mapping covers every logical block up to its size (sparse deleted files are skipped); and every data and tree/indirect block is free in the block bitmap. Any `malformed` result while evaluating a candidate skips it. Other errors (I/O, cancellation) still propagate.
+- **Htree:** gap mining is skipped inside the dx_root's `..` entry and inside dx_node blocks (an inode-0 entry spanning the block), so index bytes are never treated as deleted entries.
+- **Live names that aren't UTF-8:** Linux names are arbitrary bytes. Rather than fail the scan or replace bytes silently, non-UTF-8 live names render with ASCII kept and other bytes escaped as `\xNN`. `rawRecord` keeps the original dirent bytes.
+- **Live-metadata checks (fail-closed):** a directory whose size is not a positive multiple of the block size, holes or uninitialized extents in a directory, a live entry pointing at a mode-0 inode, a revisited directory inode (cycle or hard-linked directory), nesting deeper than 2048, and an extent inode on a volume without `extents` all throw `malformed`.
+- **Bounds:** the extent depth is ≤ 5, with an exact depth decrease per level. Every file's mapped plus metadata blocks are capped at the volume's block count. Block-map and extent-tree nodes use visited sets. There are at most 2^22 groups and at most 1,000,000 deleted candidates per scan. Bitmap blocks use a small capped cache, and inode reads reuse a one-block cache.
+- **Branch baseline:** this worktree was created at `efbcc71` and fast-forwarded to `main` (`96f165f`, which contains this spec and the `c1b21a3` baseline) before implementation.
