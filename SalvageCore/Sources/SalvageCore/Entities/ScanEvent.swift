@@ -58,7 +58,7 @@ public struct SourceMetadata: Sendable, Equatable {
     public enum Filesystem: String, Sendable { case fat32, exfat, ntfs, ext }
     public let filesystem: Filesystem
     public let volumeOffset: Int64
-    /// Volume-relative byte offset of the metadata record: FAT/exFAT directory entry, NTFS MFT
+    /// Device-absolute byte offset of the metadata record: FAT/exFAT directory entry, NTFS MFT
     /// record, or ext inode.
     public let recordOffset: Int64
     /// Format-specific allocation anchor: FAT/exFAT first cluster, NTFS MFT record number, or

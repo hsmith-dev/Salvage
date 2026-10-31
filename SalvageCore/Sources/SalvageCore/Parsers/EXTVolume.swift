@@ -405,7 +405,8 @@ actor EXTVolume {
               map: EXTMapping, deleted: Bool) throws -> RecoveredFile {
         RecoveredFile(name: name, path: path, sizeBytes: try signed(inode.size), modified: inode.modified,
                       isDeleted: deleted,
-                      sourceMetadata: SourceMetadata(filesystem: .ext, volumeOffset: extent.offset, recordOffset: offset,
+                      sourceMetadata: SourceMetadata(filesystem: .ext, volumeOffset: extent.offset,
+                                                     recordOffset: try checkedAdd(extent.offset, offset),
                                                      allocationStart: UInt64(number),
                                                      contiguous: map.runs.count <= 1, rawRecord: raw))
     }

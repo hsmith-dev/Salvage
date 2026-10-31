@@ -346,6 +346,7 @@ struct EXTVolumeTests {
         let found = files(events)
         #expect(found.map(\.path) == ["/hello.txt", "/docs/big.bin"])
         #expect(found.allSatisfy { $0.sourceMetadata.volumeOffset == 512 })
+        #expect(found.first?.sourceMetadata.recordOffset == Int64(512 + ext2Image().inodeOffset(12)))
         #expect(events.contains(.progress(bytesScanned: Int64(volume.count), totalBytes: Int64(volume.count))))
     }
 

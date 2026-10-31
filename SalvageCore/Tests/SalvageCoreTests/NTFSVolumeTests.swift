@@ -371,7 +371,7 @@ struct NTFSVolumeTests {
         #expect(partitioned.contains(.progress(bytesScanned: Int64(volume.count), totalBytes: Int64(volume.count))))
         let found = files(partitioned)
         #expect(found.count == 6 && found.allSatisfy { $0.sourceMetadata.volumeOffset == 512 })
-        #expect(found.first?.sourceMetadata.recordOffset == Int64(Data.recordOffset(17)))
+        #expect(found.first?.sourceMetadata.recordOffset == Int64(512 + Data.recordOffset(17)))
     }
 
     @Test func fixupDetectsEveryStrideAndAppliesToIndexBuffers() {

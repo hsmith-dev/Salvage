@@ -193,7 +193,8 @@ actor NTFSVolume {
         try await emit(RecoveredFile(
             name: name.name, path: parent + "/" + name.name, sizeBytes: data.size,
             modified: record.modified, isDeleted: !record.inUse,
-            sourceMetadata: SourceMetadata(filesystem: .ntfs, volumeOffset: extent.offset, recordOffset: offset,
+            sourceMetadata: SourceMetadata(filesystem: .ntfs, volumeOffset: extent.offset,
+                                           recordOffset: try checkedAdd(extent.offset, offset),
                                            allocationStart: number,
                                            contiguous: data.runs.count == 1 && data.runs[0].lcn != nil,
                                            rawRecord: fixed)))
