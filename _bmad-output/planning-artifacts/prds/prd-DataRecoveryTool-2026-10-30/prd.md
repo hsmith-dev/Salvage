@@ -33,7 +33,7 @@ macOS is the deliberate starting point, not the ceiling. Once the recovery engin
 ### 2.2 Non-Users (v1)
 
 - Enterprise/forensic investigators needing chain-of-custody, legal-hold, or court-admissible reporting (R-Studio's and dedicated forensic tools' territory).
-- Windows- or Linux-only users — v1 is macOS-only (see §5 Non-Goals; Linux/Windows is an explicit v2+ direction, not a v1 commitment).
+- Users who need Salvage to run on Windows or Linux themselves — v1 is macOS-only as a platform (a Windows/Linux port is an explicit v2+ direction, §1 Vision). This is separate from filesystem support: Salvage running on a Mac reads NTFS- and EXT-formatted drives from day one (FR-5) — what's out of scope is the app running on another OS, not which drives it can read.
 - Users needing RAID array reconstruction or NAS/network-volume recovery.
 - Users recovering data directly from iOS/mobile devices (Disk Drill supports this; out of scope here).
 
@@ -112,15 +112,15 @@ System recovers deleted-but-not-yet-overwritten files by reading intact filesyst
 - Files recovered this way are flagged High recovery confidence (FR-12).
 
 #### FR-5: Filesystem support
-System supports APFS, HFS+, FAT32, and exFAT as scan and recovery targets.
+System supports APFS, HFS+, FAT32, exFAT, NTFS, and EXT2/3/4 as scan and recovery targets — covering drives formatted by macOS, Windows, or Linux, regardless of which operating system is running Salvage itself (v1 remains macOS-only as a platform; see §2.2 Non-Users).
 
 **Consequences (testable):**
-- A scan against a volume or lost partition using one of the four supported filesystems completes and surfaces results.
+- A scan against a volume or lost partition using one of the six supported filesystems completes and surfaces results.
 - A scan against an unsupported filesystem flags it as unsupported to the user rather than silently producing empty or incorrect results.
 
-**Out of Scope:** NTFS, EXT2/3/4, ReFS, UFS (R-Studio's broader list) — not needed for the primary macOS-native use case; revisit only if Windows/Linux support (§1 Vision) materializes.
+**Out of Scope:** ReFS, UFS (R-Studio's broader list) — not requested; revisit only if real demand materializes.
 
-**Note:** APFS's on-disk format is proprietary and undocumented by Apple for third-party parsing — this is the single largest engineering risk in this FR set, not a routine integration. See Open Question 9.
+**Note:** APFS's on-disk format is proprietary and undocumented by Apple for third-party parsing — this remains the single largest engineering risk in this FR set, not a routine integration. See Open Question 9. NTFS and EXT2/3/4, by contrast, are well-documented via long-standing community reference work and carry risk comparable to FAT32/exFAT, not APFS — see Architecture AD-2.
 
 #### FR-6: FileVault volume support
 System detects FileVault-encrypted APFS volumes and prompts the user for their password or recovery key to unlock the volume before metadata-based recovery or carving runs against it.
@@ -264,7 +264,7 @@ App includes a plain-language, in-app explanation of exactly what it reads from 
 
 ### 6.1 In Scope
 - Scanning any block-device storage type macOS can mount or recognize (FR-1).
-- APFS, HFS+, FAT32, exFAT filesystem support, including FileVault-encrypted APFS volumes (FR-4–FR-6).
+- APFS, HFS+, FAT32, exFAT, NTFS, and EXT2/3/4 filesystem support, including FileVault-encrypted APFS volumes (FR-4–FR-6).
 - Signature-based file carving as a fallback when metadata is unavailable (FR-7–FR-8).
 - Lost-partition detection and reconstruction (FR-9–FR-10).
 - Full scan-results UI: type-bucketed dashboard, lost-partitions panel, file browser with preview and recovery-confidence indicators, selective/bulk recovery to a chosen destination (FR-11–FR-16).
@@ -280,7 +280,7 @@ App includes a plain-language, in-app explanation of exactly what it reads from 
 *No telemetry (FR-18) means these cannot be measured via instrumentation — all primary metrics rely on community-reported, qualitative signals by design. This is a direct, intentional trade-off against the privacy positioning, not an oversight.*
 
 **Primary**
-- **SM-1**: Community-reported successful recovery outcomes across each supported filesystem (APFS, HFS+, FAT32, exFAT), with at least one validated lost-partition-reconstruction report per filesystem — tracked via GitHub issues/discussions. Validates FR-4–FR-10.
+- **SM-1**: Community-reported successful recovery outcomes across each supported filesystem (APFS, HFS+, FAT32, exFAT, NTFS, EXT2/3/4), with at least one validated lost-partition-reconstruction report per filesystem — tracked via GitHub issues/discussions. Validates FR-4–FR-10.
 - **SM-2**: Adoption signals — GitHub stars, release download counts, inbound mentions in relevant communities. Validates overall product-market signal for the open-source positioning.
 
 **Secondary**

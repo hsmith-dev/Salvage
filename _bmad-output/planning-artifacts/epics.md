@@ -21,7 +21,7 @@ FR-1: User can select any mounted or recognized block-device storage device (int
 FR-2: System displays live scan progress (percent, elapsed/remaining time, files found) and streams results incrementally.
 FR-3: User can pause, resume, or cancel an in-progress scan without losing results already found.
 FR-4: System recovers deleted-but-not-yet-overwritten files by reading intact filesystem metadata, preserving original filename, path, and timestamps.
-FR-5: System supports APFS, HFS+, FAT32, and exFAT as scan and recovery targets.
+FR-5: System supports APFS, HFS+, FAT32, exFAT, NTFS, and EXT2/3/4 as scan and recovery targets.
 FR-6: System detects FileVault-encrypted APFS volumes and prompts for a password/recovery key to unlock before recovery runs.
 FR-7: When filesystem metadata is unavailable, system scans raw unallocated bytes for known file-format signatures and reconstructs files without relying on metadata.
 FR-8: Reconstructed files are named deterministically and grouped under a "Reconstructed" folder by detected file type.
@@ -74,7 +74,7 @@ FR-1: Epic 1 - Device selection (block-device agnostic, boot volume excluded)
 FR-2: Epic 1 - Live scan progress
 FR-3: Epic 1 - Scan pause/resume/cancel
 FR-4: Epic 1 - Metadata-based undelete
-FR-5: Epic 1 (FAT32/exFAT) + Epic 2 (APFS/HFS+) - Filesystem support
+FR-5: Epic 1 (FAT32/exFAT) + Epic 2 (APFS/HFS+) + Epic 4 (NTFS/EXT2/3/4) - Filesystem support
 FR-6: Epic 2 - FileVault volume support
 FR-7: Epic 3 - Signature-based carving
 FR-8: Epic 3 - Reconstructed file naming/organization
@@ -105,6 +105,10 @@ A user can scan and recover from APFS- or HFS+-formatted drives — internal (no
 ### Epic 3: Recover from Severely Damaged or Unmountable Media
 A user whose drive won't mount at all, or is too corrupted for normal undelete, can still get files back: signature-based carving reconstructs files from raw bytes when filesystem metadata is gone, and lost-partition detection finds and recovers from a filesystem signature hiding in unallocated space — the "nothing else worked" safety net, using the declarative, community-extensible signature format (AD-6) and graduated confidence evidence (AD-7). This epic reuses Epic 1's results browser, confidence indicator, and recovery flow almost entirely; the work here is concentrated in `SalvageCore`, not new UI surfaces.
 **FRs covered:** FR-7, FR-8, FR-9, FR-10
+
+### Epic 4: Recover from Windows- and Linux-Formatted Drives
+A user can scan and recover from NTFS- (Windows) or EXT2/3/4- (Linux) formatted drives using the same results browser and recovery flow established in Epic 1 — a drive formatted by someone else's computer is just as recoverable as a Mac-native one. Unlike Epic 2's APFS work, these formats are well-documented via mature community reference work, with confirmed MIT/Apache-licensed reference implementations available (Architecture AD-2) — comparable engineering risk to Epic 1's FAT32/exFAT, not Epic 2's APFS risk. Independent of Epic 2 and Epic 3; can be built before, after, or alongside either.
+**FRs covered:** FR-5 (NTFS, EXT2/3/4)
 
 ## Epic 1: Recover Files from Everyday Removable Media, Transparently and Safely
 
@@ -477,3 +481,47 @@ So that my files come back even though the partition itself was gone.
 **Given** the app's available actions
 **When** reviewed
 **Then** there is no action anywhere that writes a reconstructed partition table back to the source disk
+
+## Epic 4: Recover from Windows- and Linux-Formatted Drives
+
+A user can scan and recover from NTFS- (Windows) or EXT2/3/4- (Linux) formatted drives using the same results browser and recovery flow established in Epic 1. Unlike Epic 2's APFS work, these formats are well-documented via mature community reference work, with confirmed MIT/Apache-licensed reference implementations available (Architecture AD-2) — comparable engineering risk to Epic 1's FAT32/exFAT, not Epic 2's APFS risk. Independent of Epic 2 and Epic 3.
+
+### Story 4.1: Scan and Recover Deleted Files from an NTFS Drive
+
+As a user,
+I want to scan an NTFS-formatted drive and recover deleted files using the same results browser and recovery flow I already know,
+So that drives from a Windows PC are just as recoverable as my Mac's own drives.
+
+**Acceptance Criteria:**
+
+**Given** an NTFS device with deleted-but-not-overwritten files
+**When** I scan it
+**Then** those files appear in results with original filename, path, and timestamp
+
+**Given** an NTFS device
+**When** selected
+**Then** it appears in the same unified device list as every other supported filesystem
+
+**Given** a scan against a corrupted or unsupported NTFS structure
+**When** encountered
+**Then** the app reports it as such rather than silently producing wrong results
+
+### Story 4.2: Scan and Recover Deleted Files from an EXT2/3/4 Drive
+
+As a user,
+I want to scan an EXT2, EXT3, or EXT4-formatted drive and recover deleted files the same way,
+So that Linux-formatted drives are covered too.
+
+**Acceptance Criteria:**
+
+**Given** an EXT2/3/4 device with deleted-but-not-overwritten files
+**When** I scan it
+**Then** those files appear in results with original filename, path, and timestamp
+
+**Given** an EXT2/3/4 device
+**When** selected
+**Then** it's scanned through the same unified flow as other filesystems
+
+**Given** an ext4 device with journal/extent-tree complexity
+**When** scanned
+**Then** recovery still succeeds for the common case; edge cases needing deeper journal replay are acceptable to under-recover rather than risk incorrect results

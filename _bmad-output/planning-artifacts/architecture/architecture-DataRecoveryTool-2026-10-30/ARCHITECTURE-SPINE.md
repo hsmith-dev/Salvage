@@ -7,7 +7,7 @@ paradigm: 'Hexagonal / Ports-and-Adapters'
 scope: 'Salvage v1 -- whole-system architecture spine for the native macOS data-recovery app'
 status: final
 created: '2026-10-30'
-updated: '2026-10-30'
+updated: '2026-10-31'
 binds: ['FR-1','FR-2','FR-3','FR-4','FR-5','FR-6','FR-7','FR-8','FR-9','FR-10','FR-11','FR-12','FR-13','FR-14','FR-15','FR-16','FR-17','FR-18','FR-19']
 sources: ['_bmad-output/planning-artifacts/prds/prd-DataRecoveryTool-2026-10-30/prd.md', '_bmad-output/planning-artifacts/briefs/brief-DataRecoveryTool-2026-10-30/brief.md']
 companions: []
@@ -44,7 +44,7 @@ graph TD
 
 - **Binds:** FR-4, FR-5, FR-9, FR-10
 - **Prevents:** license contamination of the MIT codebase; a hard runtime dependency on installing a FUSE kernel extension (macFUSE) for an end-user consumer app.
-- **Rule:** APFS parsing in `SalvageCore` is implemented as original Swift code, informed by Apple's public 2018 APFS Reference and independent testing. Never link, vendor, or shell out to GPL/LGPL parser code (apfs-fuse, libfsapfs, Sleuth Kit) in the shipped product. HFS+/FAT32/exFAT carry no equivalent risk — their formats are properly documented (Apple TN1150; Microsoft FAT/exFAT specs) — so this rule binds APFS specifically; `Parsers/` as a whole may use original code throughout, or a suitable MIT-compatible third-party dependency for the non-APFS formats if one emerges — implementer's call for those three. This is the single biggest engineering risk in the project (PRD Open Question 9); a timeboxed spike against a read-only, unencrypted volume is recommended before committing further.
+- **Rule:** APFS parsing in `SalvageCore` is implemented as original Swift code, informed by Apple's public 2018 APFS Reference and independent testing. Never link, vendor, or shell out to GPL/LGPL parser code (apfs-fuse, libfsapfs, Sleuth Kit) in the shipped product. HFS+/FAT32/exFAT/NTFS/EXT2/3/4 carry no equivalent risk — their formats are properly documented via official specs (Apple TN1150; Microsoft FAT/exFAT specs) or mature, long-standing community reference work (the Linux-NTFS project's documentation for NTFS; the Linux kernel's ext4 documentation for EXT2/3/4) — so this rule binds APFS specifically; `Parsers/` as a whole may use original code throughout, or a suitable MIT-compatible third-party dependency for the non-APFS formats if one emerges — confirmed candidates exist for NTFS (the `ntfs` Rust crate, dual Apache-2.0/MIT, read-only) and EXT2/3/4 (the `ext4-view` Rust crate, same dual license), unlike APFS where no such option exists. Implementer's call for all five non-APFS formats. This is the single biggest engineering risk in the project (PRD Open Question 9); a timeboxed spike against a read-only, unencrypted volume is recommended before committing further.
 
 ### AD-3 — FileVault unlock never mounts the source
 
@@ -130,7 +130,7 @@ Salvage/
   SalvageCore/                   # Swift Package -- zero AppKit/SwiftUI/DiskArbitration/IOKit imports (AD-9)
     Sources/SalvageCore/
       Entities/                  # BlockDevice, ScanSession, RecoveredFile, LostPartitionCandidate, RecoveryConfidence
-      Parsers/                   # APFS (AD-2), HFS+, FAT32, exFAT
+      Parsers/                   # APFS (AD-2), HFS+, FAT32, exFAT, NTFS, EXT2/3/4 (all non-APFS: AD-2's low-risk bucket)
       Carving/                   # generic engine + Signatures/*.json (AD-6)
       Confidence/                # AD-7 scoring function
       Ports/                     # BlockReader protocol (AD-4, AD-8)
