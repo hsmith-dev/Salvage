@@ -24,7 +24,8 @@ struct ContentView: View {
                 Text("Select a device to start scanning.").foregroundStyle(.secondary)
             } else { ScanProgressView(model: scan) }
         }
-        .onDisappear { scan.cancel() }
+        // Closing the window stops the scan but keeps its checkpoint; only Cancel scan discards it.
+        .onDisappear { scan.stopForTeardown() }
         .toolbar {
             Button("What Salvage reads and writes", systemImage: "info.circle") { showsTrust = true }
         }

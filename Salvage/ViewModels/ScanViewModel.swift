@@ -16,8 +16,12 @@ final class ScanViewModel {
     /// `resumable`: an interrupted scan of the selected device left a checkpoint; Resume or Start over.
     enum State: Equatable { case idle, preparing, running, paused, resumable, completed, cancelled, failed(ScanError) }
     typealias Runner = @Sendable (ScanRun, AsyncStream<ScanEvent>.Continuation) async throws -> Void
-    private struct FileKey: Hashable { let volumeOffset: Int64; let recordOffset: Int64 }
-    /// Checkpoints arrive per sweep unit; disk writes are throttled to this interval (and on pause).
+    /// ext hard links share one inode (one record offset) under several paths, so the path is part of the key.
+    private struct FileKey: Hashable { let volumeOffset: Int64; let recordOffset: Int64; let path: String }
+    /// Why a run was stopped before it ended on its own.
+    private enum StopReason { case user, teardown }
+    /// Checkpoints arrive per sweep unit; disk writes are throttled to this interval, except while
+    /// paused or tearing down, when every checkpoint is written at once.
     static let checkpointSaveInterval: TimeInterval = 1
 
     private(set) var state: State = .idle
@@ -30,7 +34,13 @@ final class ScanViewModel {
     private(set) var isActive = false
     /// The checkpoint found for `device` while `state == .resumable`.
     private(set) var pendingCheckpoint: ScanCheckpoint?
+    /// True once the core has actually resumed from the checkpoint: the run's first progress event
+    /// reports bytes already covered. A checkpoint the core rejected starts from zero and leaves this false.
     private(set) var resumedFromCheckpoint = false
+    /// A run that ended in failure kept its checkpoint, so retrying offers to resume.
+    private(set) var canRetryFromCheckpoint = false
+    /// The newest checkpoint received from the running scan (exposed for tests).
+    private(set) var latestCheckpoint: ScanCheckpoint?
     private var task: Task<Void, Never>?
     private var gate: ScanPauseGate?
     private var scanningStartedAt: Date?
@@ -38,8 +48,9 @@ final class ScanViewModel {
     private var pausedAt: Date?
     private var pausedTotal: TimeInterval = 0
     private var seenFiles: Set<FileKey> = []
-    private var latestCheckpoint: ScanCheckpoint?
     private var lastCheckpointSave: Date?
+    private var requestedResume = false
+    private var stopReason: StopReason?
     private let runner: Runner
     private let now: () -> Date
     private let checkpointStore: ScanCheckpointStore?
@@ -87,19 +98,34 @@ final class ScanViewModel {
         gate.resume()
     }
 
-    /// Terminal. Also ends a paused scan; discoveries so far stay visible.
-    func cancel() { task?.cancel() }
+    /// User cancel. Terminal; also ends a paused scan. Discoveries so far stay visible and the
+    /// checkpoint is deleted.
+    func cancel() {
+        guard let task else { return }
+        stopReason = .user
+        task.cancel()
+    }
+
+    /// Window teardown. Cancels the scan's Task like `cancel()`, but writes the latest checkpoint
+    /// first and keeps it, so the interrupted scan can be resumed later.
+    func stopForTeardown() {
+        guard let task else { return }
+        if stopReason == nil { stopReason = .teardown }
+        persistLatestCheckpoint()
+        task.cancel()
+    }
 
     private func reset(for device: BlockDevice) {
         self.device = device; files = []; seenFiles = []; bytesScanned = 0; totalBytes = 0
         startedAt = nil; scanningStartedAt = nil; endedAt = nil; baselineBytes = 0
         pausedAt = nil; pausedTotal = 0; latestCheckpoint = nil; lastCheckpointSave = nil
-        pendingCheckpoint = nil; resumedFromCheckpoint = false
+        pendingCheckpoint = nil; resumedFromCheckpoint = false; canRetryFromCheckpoint = false
+        requestedResume = false; stopReason = nil
     }
 
     private func begin(_ device: BlockDevice, from checkpoint: ScanCheckpoint?) {
         reset(for: device)
-        resumedFromCheckpoint = checkpoint != nil
+        requestedResume = checkpoint != nil
         startedAt = now(); state = .preparing; isActive = true
         let gate = ScanPauseGate()
         self.gate = gate
@@ -124,14 +150,17 @@ final class ScanViewModel {
                     case .progress(let bytes, let total):
                         if scanningStartedAt == nil {
                             scanningStartedAt = now()
-                            // A resumed scan starts at the checkpoint; only bytes read now measure the rate.
+                            // The core's first progress counts only bytes a checkpoint covered, so a
+                            // nonzero value means it accepted the resume point. Only bytes read now
+                            // measure the rate.
+                            resumedFromCheckpoint = requestedResume && bytes > 0
                             baselineBytes = resumedFromCheckpoint ? bytes : 0
                         }
                         if state == .preparing { state = .running }
                         bytesScanned = bytes; totalBytes = total
                     case .found(let file):
                         let key = FileKey(volumeOffset: file.sourceMetadata.volumeOffset,
-                                          recordOffset: file.sourceMetadata.recordOffset)
+                                          recordOffset: file.sourceMetadata.recordOffset, path: file.path)
                         if seenFiles.insert(key).inserted { files.append(file) }
                     case .error(let error): state = .failed(error)
                     case .completed: completed = true
@@ -149,8 +178,20 @@ final class ScanViewModel {
             else if Task.isCancelled { state = .cancelled }
             else if completed { state = .completed }
             else { state = .failed(.io("The scan ended before completion.")) }
-            // Only an interrupted run (quit or crash mid-scan) leaves a checkpoint behind.
-            checkpointStore?.remove(for: device)
+            // Completion and a user cancel discard the checkpoint. A failure keeps it so the user can
+            // retry (e.g. a resume whose preparation failed), and a teardown keeps it for later.
+            let keep: Bool
+            switch state {
+            case .completed: keep = false
+            case .cancelled: keep = stopReason == .teardown
+            default: keep = true
+            }
+            if keep {
+                if let latestCheckpoint { save(latestCheckpoint, for: device) }
+                if case .failed = state { canRetryFromCheckpoint = latestCheckpoint != nil || checkpoint != nil }
+            } else {
+                checkpointStore?.remove(for: device)
+            }
             self.gate = nil
             task = nil
         }
@@ -159,14 +200,21 @@ final class ScanViewModel {
     private func record(_ checkpoint: ScanCheckpoint) {
         guard isActive else { return }
         latestCheckpoint = checkpoint
-        let current = now()
-        if let lastCheckpointSave, current.timeIntervalSince(lastCheckpointSave) < Self.checkpointSaveInterval { return }
+        // The core yields its last checkpoint just before parking at the gate, so a checkpoint that
+        // arrives while paused or tearing down is the resume point and is written immediately.
+        let urgent = state == .paused || stopReason == .teardown
+        if !urgent, let lastCheckpointSave, now().timeIntervalSince(lastCheckpointSave) < Self.checkpointSaveInterval { return }
         persistLatestCheckpoint()
     }
 
     private func persistLatestCheckpoint() {
-        guard isActive, let device, let latestCheckpoint, let checkpointStore else { return }
-        checkpointStore.save(latestCheckpoint, for: device)
+        guard isActive, let device, let latestCheckpoint else { return }
+        save(latestCheckpoint, for: device)
+    }
+
+    private func save(_ checkpoint: ScanCheckpoint, for device: BlockDevice) {
+        guard let checkpointStore else { return }
+        checkpointStore.save(checkpoint, for: device)
         lastCheckpointSave = now()
     }
 

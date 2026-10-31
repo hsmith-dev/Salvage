@@ -31,7 +31,8 @@ struct ScanProgressView: View {
             }
             if case .failed(let error) = model.state {
                 Text(error.description).textSelection(.enabled)
-                if error == .permissionDenied, !model.isActive, let device = model.device {
+                if error == .permissionDenied || model.canRetryFromCheckpoint, !model.isActive, let device = model.device {
+                    // With a kept checkpoint, retrying offers Resume again rather than starting from zero.
                     Button("Retry scan") { model.start(device) }
                 }
             }
@@ -53,6 +54,7 @@ struct ScanProgressView: View {
                 Text("Scan paused. Salvage is not reading the device. Resume continues from the same point.")
                     .font(.subheadline).foregroundStyle(.secondary)
             } else if model.resumedFromCheckpoint, model.isActive {
+                // Set only once the core's first progress shows it accepted the checkpoint.
                 Text("Resumed from where the previous scan stopped.")
                     .font(.subheadline).foregroundStyle(.secondary)
             }
