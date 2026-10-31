@@ -2,7 +2,7 @@
 title: 'Pause, Resume, and Cancel a Scan'
 type: 'feature'
 created: '2026-10-31'
-status: 'in-review'
+status: 'done'
 baseline_commit: 'c1b21a3'
 route: 'dispatch'
 review_loop_iteration: 0

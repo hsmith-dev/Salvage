@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 10-31-2026 09:25
-last_updated: 10-31-2026 15:05
+last_updated: 10-31-2026 15:40
 project: Salvage
 project_key: NOKEY
 tracking_system: file-system
@@ -40,8 +40,8 @@ development_status:
   1-2-full-disk-access-raw-device-access-spike: review
   1-3-select-and-list-scan-target-devices: review
   1-4-scan-a-fat32-exfat-device-with-live-progress: review
-  1-5-pause-resume-and-cancel-a-scan: in-progress
-  1-6-recover-deleted-files-via-intact-metadata: in-progress
+  1-5-pause-resume-and-cancel-a-scan: review
+  1-6-recover-deleted-files-via-intact-metadata: review
   1-7-browse-results-by-file-type: backlog
   1-8-see-and-trust-the-recovery-confidence-indicator: backlog
   1-9-preview-a-file-before-recovering-it: backlog
@@ -64,6 +64,6 @@ development_status:
   epic-3-retrospective: optional
 
   epic-4: in-progress
-  4-1-scan-and-recover-deleted-files-from-an-ntfs-drive: in-progress
-  4-2-scan-and-recover-deleted-files-from-an-ext2-3-4-drive: in-progress
+  4-1-scan-and-recover-deleted-files-from-an-ntfs-drive: review
+  4-2-scan-and-recover-deleted-files-from-an-ext2-3-4-drive: review
   epic-4-retrospective: optional

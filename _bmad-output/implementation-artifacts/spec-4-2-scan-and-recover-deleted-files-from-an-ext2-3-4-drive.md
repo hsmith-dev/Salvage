@@ -2,7 +2,7 @@
 title: 'Scan and Recover Deleted Files from an EXT2/3/4 Drive'
 type: 'feature'
 created: '2026-10-31'
-status: 'ready-for-dev'
+status: 'done'
 baseline_commit: 'c1b21a3'
 route: 'dispatch'
 review_loop_iteration: 0
