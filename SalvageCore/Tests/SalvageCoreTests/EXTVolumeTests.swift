@@ -136,7 +136,7 @@ func ext2Image() -> EXTImage {
     return image
 }
 
-func files(_ events: [ScanEvent]) -> [RecoveredFile] {
+private func files(_ events: [ScanEvent]) -> [RecoveredFile] {
     events.compactMap { if case .found(let file) = $0 { file } else { nil } }
 }
 
