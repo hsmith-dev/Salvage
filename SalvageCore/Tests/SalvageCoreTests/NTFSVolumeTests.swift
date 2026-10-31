@@ -55,7 +55,7 @@ private func resident(_ type: UInt32, _ value: Data, name: String = "") -> Data 
 }
 
 private func nonResident(_ type: UInt32, runs: Data, clusters: Int, size: Int, allocated: Int? = nil,
-                         name: String = "", flags: Int = 0) -> Data {
+                         initialized: Int? = nil, name: String = "", flags: Int = 0) -> Data {
     let nameData = attributeName(name)
     let runsOffset = align8(0x40 + nameData.count)
     var a = Data(count: align8(runsOffset + runs.count))
@@ -63,16 +63,19 @@ private func nonResident(_ type: UInt32, runs: Data, clusters: Int, size: Int, a
     a.put(9, UInt64(name.utf16.count), 1); a.put(10, 0x40, 2); a.put(12, UInt64(flags), 2)
     a.replaceSubrange(0x40..<0x40 + nameData.count, with: nameData)
     a.put(0x10, 0, 8); a.put(0x18, UInt64(bitPattern: Int64(clusters - 1)), 8); a.put(0x20, UInt64(runsOffset), 2)
-    a.put(0x28, UInt64(allocated ?? clusters * sector), 8); a.put(0x30, UInt64(size), 8); a.put(0x38, UInt64(size), 8)
+    a.put(0x28, UInt64(allocated ?? clusters * sector), 8); a.put(0x30, UInt64(size), 8)
+    a.put(0x38, UInt64(initialized ?? size), 8)
     a.replaceSubrange(runsOffset..<runsOffset + runs.count, with: runs)
     return a
 }
 
-private func nonResident(_ type: UInt32, _ runs: [Run], size: Int, allocated: Int? = nil, flags: Int = 0) -> Data {
+private func nonResident(_ type: UInt32, _ runs: [Run], size: Int, allocated: Int? = nil, initialized: Int? = nil,
+                         flags: Int = 0) -> Data {
     let clusters = runs.reduce(0) { total, run in
         switch run { case .at(_, let length), .sparse(let length): total + length }
     }
-    return nonResident(type, runs: runList(runs), clusters: clusters, size: size, allocated: allocated, flags: flags)
+    return nonResident(type, runs: runList(runs), clusters: clusters, size: size, allocated: allocated,
+                       initialized: initialized, flags: flags)
 }
 
 private func standardInformation(_ modified: UInt64 = modifiedFiletime) -> Data {
@@ -121,15 +124,28 @@ private struct NTFSImage {
     var mftRuns: [(lcn: Int, length: Int)] = [(16, 64)]
     var recordCount = 32
     var records: [Int: Data] = [:]
-    /// Clusters marked allocated in `$Bitmap` beyond the system area.
+    /// Clusters marked allocated in `$Bitmap` beyond the system area (0..<91, the MFT and `$Bitmap`).
     var used: Set<Int> = [150, 151, 170]
+    /// The boot sector's total sectors (one sector per cluster); the image holds one more sector.
+    var clusterCount = 255
+    /// Where a non-resident `$Bitmap` (record 6, unless a test supplies its own) lives.
+    var bitmapRuns: [(lcn: Int, length: Int)] = [(90, 1)]
+    var residentBitmap = false
+    /// `$Bitmap`'s initialized size when smaller than its real size. Bits past it are still set in the image.
+    var bitmapInitialized: Int?
 
-    static func standard() -> NTFSImage {
+    /// Just the root directory and `$Bitmap`.
+    static func bare() -> NTFSImage {
         var image = NTFSImage()
+        image.used = []
         image.records[5] = record(sequence: 5, flags: 3, [standardInformation(), fileName(".", parent: 5, sequence: 5, namespace: 3),
                                                          resident(0x90, Data(count: 16), name: "$I30")])
-        image.records[6] = record(sequence: 6, flags: 1, [fileName("$Bitmap", parent: 5, sequence: 5, namespace: 3),
-                                                         nonResident(0x80, [.at(90, 1)], size: 32)])
+        return image
+    }
+
+    static func standard() -> NTFSImage {
+        var image = bare()
+        image.used = [150, 151, 170]
         image.records[16] = directory("Documents")
         image.records[17] = file("hello.txt", data: resident(0x80, Data("hello".utf8)))
         image.records[18] = file("report.txt", parent: 16, data: nonResident(0x80, [.at(150, 2)], size: 700))
@@ -152,14 +168,22 @@ private struct NTFSImage {
     }
 
     func build() -> Data {
-        var image = Data(count: 256 * sector)
+        var image = Data(count: (clusterCount + 1) * sector)
         image.text(3, "NTFS    "); image.put(11, UInt64(sector), 2); image.put(13, 1, 1)
-        image.put(0x28, 255, 8); image.put(0x30, UInt64(mftRuns[0].lcn), 8); image.put(0x38, 2, 8)
+        image.put(0x28, UInt64(clusterCount), 8); image.put(0x30, UInt64(mftRuns[0].lcn), 8); image.put(0x38, 2, 8)
         image.put(0x40, 0xf6, 1); image.put(0x44, 0xf4, 1); image.put(510, 0xaa55, 2)
+        var bitmap = Data(count: (clusterCount + 7) / 8)
+        var marked = Set(0..<91).union(used)
+        for run in mftRuns + (residentBitmap ? [] : bitmapRuns) { marked.formUnion(run.lcn..<run.lcn + run.length) }
+        for cluster in marked where cluster < clusterCount { bitmap[cluster / 8] |= UInt8(1) << (cluster % 8) }
         var all = records
-        all[0] = record(sequence: 1, flags: 1, [
+        all[0] = all[0] ?? record(sequence: 1, flags: 1, [
             standardInformation(), fileName("$MFT", parent: 5, sequence: 5, namespace: 3),
             nonResident(0x80, mftRuns.map { .at($0.lcn, $0.length) }, size: recordCount * recordSize)])
+        all[6] = all[6] ?? record(sequence: 6, flags: 1, [
+            fileName("$Bitmap", parent: 5, sequence: 5, namespace: 3),
+            residentBitmap ? resident(0x80, bitmap)
+                : nonResident(0x80, bitmapRuns.map { .at($0.lcn, $0.length) }, size: bitmap.count, initialized: bitmapInitialized)])
         for (number, bytes) in all {
             for index in 0..<recordSize {
                 let mftByte = number * recordSize + index
@@ -171,8 +195,16 @@ private struct NTFSImage {
                 image[located! * sector + mftByte % sector] = bytes[index]
             }
         }
-        let bitmap = 90 * sector
-        for cluster in Array(0..<91) + used { image[bitmap + cluster / 8] |= UInt8(1) << (cluster % 8) }
+        if !residentBitmap {
+            for (index, byte) in bitmap.enumerated() {
+                var cluster = index / sector, located: Int?
+                for run in bitmapRuns {
+                    if cluster < run.length { located = run.lcn + cluster; break }
+                    cluster -= run.length
+                }
+                image[located! * sector + index % sector] = byte
+            }
+        }
         return image
     }
 }
@@ -183,6 +215,37 @@ private func files(_ events: [ScanEvent]) -> [RecoveredFile] {
 private func isMalformed(_ events: [ScanEvent]) -> Bool {
     events.contains { if case .error(.malformed) = $0 { true } else { false } } && !events.contains(.completed)
 }
+/// Drives `NTFSVolume` directly (no discovery or session) so tests can read its work counters.
+private actor Collected {
+    var files: [RecoveredFile] = []
+    func add(_ file: RecoveredFile) { files.append(file) }
+}
+private func scanVolume(_ image: Data, budget: Int64? = nil) async -> (files: [RecoveredFile], error: ScanError?, checks: Int) {
+    let collected = Collected()
+    let volume = NTFSVolume(reader: ImageReader(data: image), extent: VolumeExtent(offset: 0, length: Int64(image.count), format: .ntfs),
+                            emit: { await collected.add($0) })
+    if let budget { await volume.limitDeletedChecks(to: budget) }
+    var failure: ScanError?
+    do { try await volume.scan() } catch { failure = error as? ScanError ?? .malformed("\(error)") }
+    return (await collected.files, failure, await volume.bitmapChecks)
+}
+/// A volume of 73,728 clusters: past 64K, with an 18-page `$Bitmap` split across two runs.
+private func largeImage() -> NTFSImage {
+    var image = NTFSImage.bare()
+    image.clusterCount = 72 * 1024
+    image.bitmapRuns = [(500, 10), (600, 8)]
+    return image
+}
+private func deletedFile(_ name: String, _ runs: [Run], size: Int? = nil) -> Data {
+    let clusters = runs.reduce(0) { total, run in
+        switch run { case .at(_, let length), .sparse(let length): total + length }
+    }
+    return file(name, sequence: 2, deleted: true, data: nonResident(0x80, runs, size: size ?? clusters * sector))
+}
+private func geometry(_ image: Data) throws -> NTFSGeometry {
+    try NTFSGeometry(boot: image.prefix(512), volumeLength: Int64(image.count))
+}
+
 private extension Data {
     /// Location of MFT record `number` in an image with the default contiguous MFT at cluster 16.
     static func recordOffset(_ number: Int) -> Int { 16 * sector + number * recordSize }
@@ -385,5 +448,259 @@ struct NTFSVolumeTests {
         #expect(!applyNTFSFixup(&torn))
         var miscounted = buffer; miscounted.put(6, 4, 2)
         #expect(!applyNTFSFixup(&miscounted))
+    }
+
+    // MARK: - Review patches
+
+    /// P1: a last VCN of Int64.max used to trap on `lastVCN + 1`. One at the cluster count is out of range too.
+    @Test(arguments: [Int64.max, 255, -2])
+    func outOfRangeLastVCNIsSkippedWhenDeletedAndMalformedWhenLive(_ lastVCN: Int64) async {
+        func crafted(_ lcn: Int) -> Data {
+            var a = nonResident(0x80, [.at(lcn, 1)], size: 100); a.put(0x18, UInt64(bitPattern: lastVCN), 8); return a
+        }
+        var deleted = NTFSImage.standard()
+        deleted.records[19] = file("deleted.txt", parent: 16, sequence: 2, deleted: true, data: crafted(160))
+        let events = await scan(deleted.build())
+        #expect(events.last == .completed)
+        #expect(files(events).count == 5 && !files(events).contains { $0.name == "deleted.txt" })
+        var live = NTFSImage.standard()
+        live.records[18] = file("report.txt", parent: 16, data: crafted(150))
+        #expect(isMalformed(await scan(live.build())))
+    }
+
+    /// P2: free bits are tested a 64-bit word at a time, so a 60,000-cluster run costs ~940 lookups, not 60,000.
+    @Test func deletedClusterCheckTestsWholeWordsOfTheBitmap() async {
+        var image = largeImage()
+        image.records[16] = deletedFile("huge.bin", [.at(1024, 60000)])
+        image.records[17] = deletedFile("unaligned.bin", [.at(62001, 77)])
+        image.records[18] = deletedFile("tail-used.bin", [.at(64000, 5000)])
+        image.used = [68999]
+        let result = await scanVolume(image.build())
+        #expect(result.error == nil)
+        #expect(result.files.map(\.name) == ["huge.bin", "unaligned.bin"])
+        #expect(result.checks < 1100)
+    }
+
+    /// P2/P3: many deleted records claiming most of the volume finish without walking the bitmap.
+    @Test func manyHugeDeletedRecordsFinishWithinBoundedWork() async {
+        var image = largeImage()
+        image.mftRuns = [(16, 400)]; image.recordCount = 200
+        image.bitmapRuns = [(450, 18)]
+        for number in 16..<200 { image.records[number] = deletedFile("huge\(number).bin", [.at(1000, 70000)]) }
+        let result = await scanVolume(image.build())
+        #expect(result.error == nil && result.files.isEmpty && result.checks == 0)
+    }
+
+    /// P2: once a candidate doesn't fit the remaining budget, every later deleted candidate is skipped.
+    @Test func deletedCandidatesStopOnceTheCheckBudgetIsSpent() async {
+        var image = NTFSImage.standard()
+        image.records[27] = deletedFile("small.bin", [.at(200, 1)])
+        let unlimited = await scanVolume(image.build())
+        #expect(unlimited.files.contains { $0.name == "small.bin" } && unlimited.files.contains { $0.name == "old.txt" })
+        // deleted.txt (1) and overwritten.txt (1) fit in 3; old.txt (3) doesn't, so small.bin (1) is skipped too.
+        let limited = await scanVolume(image.build(), budget: 3)
+        #expect(limited.error == nil)
+        #expect(limited.files.filter(\.isDeleted).map(\.name) == ["deleted.txt", "reused.txt"])
+        #expect(limited.files.filter { !$0.isDeleted }.count == 3)
+    }
+
+    /// P3: two deleted files sharing a cluster can't both own it, so neither is emitted.
+    @Test func overlappingDeletedFilesAreBothSkipped() async {
+        var image = NTFSImage.standard()
+        image.records[27] = deletedFile("a.bin", [.at(200, 3)])
+        image.records[28] = deletedFile("b.bin", [.at(210, 1), .at(202, 2)])
+        image.records[29] = deletedFile("c.bin", [.at(205, 1)])
+        let events = await scan(image.build())
+        #expect(events.last == .completed)
+        let names = files(events).map(\.name)
+        #expect(!names.contains("a.bin") && !names.contains("b.bin"))
+        #expect(names.contains("c.bin") && names.contains("deleted.txt") && names.contains("old.txt"))
+    }
+
+    /// P4: "." and ".." are never names. A ".." directory isn't indexed, so its child is orphaned.
+    @Test func dotNamesCannotEscapeTheirPath() async {
+        var image = NTFSImage.standard()
+        image.records[27] = directory("..")
+        image.records[28] = file("x.txt", parent: 27, data: resident(0x80, Data("x".utf8)))
+        image.records[29] = file(".", data: resident(0x80, Data("d".utf8)))
+        image.records[30] = file("..", sequence: 2, deleted: true, data: resident(0x80, Data("d".utf8)))
+        let events = await scan(image.build())
+        #expect(events.last == .completed)
+        let found = files(events)
+        #expect(found.contains { $0.path == "/Orphaned Files/x.txt" && !$0.isDeleted })
+        #expect(!found.contains { $0.path.contains("/..") || $0.name == "." || $0.name == ".." })
+        #expect(found.count == 7)
+    }
+
+    /// P5: `$Bitmap` bytes past the initialized size read as zero, whatever stale bits sit there.
+    @Test func bitmapBitsPastInitializedSizeReadAsFree() async {
+        var image = NTFSImage.standard()
+        image.bitmapInitialized = 16
+        image.used.insert(100)
+        image.records[27] = deletedFile("early.bin", [.at(100, 1)])
+        let found = files(await scan(image.build()))
+        // Cluster 170 is in byte 21, past the 16 initialized bytes; cluster 100 (byte 12) is still used.
+        #expect(found.contains { $0.path == "/overwritten.txt" && $0.isDeleted })
+        #expect(!found.contains { $0.name == "early.bin" })
+    }
+
+    /// P6: NTFS skips sequence 0, so a parent freed at 0xFFFF holds 1.
+    @Test func parentSequenceWrapsPastZero() async {
+        let name = NTFSFileName(parent: 5, parentSequence: 5, namespace: 1, name: "d")
+        #expect(NTFSVolume.Directory(sequence: 1, inUse: false, name: name).matches(0xffff))
+        #expect(!NTFSVolume.Directory(sequence: 0, inUse: false, name: name).matches(0xffff))
+        #expect(!NTFSVolume.Directory(sequence: 1, inUse: true, name: name).matches(0xffff))
+        var image = NTFSImage.standard()
+        image.records[25] = directory("OldDir", sequence: 1, deleted: true)
+        image.records[26] = file("old.txt", parent: 25, parentSequence: 0xffff, sequence: 2, deleted: true,
+                                 data: nonResident(0x80, [.at(180, 1), .at(185, 2)], size: 1200))
+        #expect(files(await scan(image.build())).contains { $0.path == "/OldDir/old.txt" })
+    }
+
+    /// P8a: a user record whose two halves sit in different MFT runs is reassembled and fixed up.
+    @Test func userRecordStraddlingMFTRunsIsEmittedIntact() async {
+        var image = NTFSImage.standard()
+        // 35 clusters then 29: record 17 (hello.txt) occupies the first run's last cluster and the second's first.
+        image.mftRuns = [(16, 35), (100, 29)]
+        let events = await scan(image.build())
+        #expect(events.last == .completed && files(events).count == 6)
+        let hello = files(events).first { $0.name == "hello.txt" }
+        var expected = image.records[17]!
+        #expect(applyNTFSFixup(&expected))
+        #expect(hello?.path == "/hello.txt" && hello?.sizeBytes == 5)
+        #expect(hello?.sourceMetadata.recordOffset == Int64((16 + 34) * sector))
+        #expect(hello?.sourceMetadata.rawRecord == expected)
+    }
+
+    /// P8b: run lists step backwards with negative LCN deltas; a delta below cluster 0 is damage.
+    @Test func negativeLCNDeltasDecode() async throws {
+        let g = try geometry(NTFSImage.standard().build())
+        let runs = try NTFSRecord.decodeRuns(runList([.at(200, 2), .at(100, 3), .sparse(2), .at(50, 1)]), from: 0, clusters: 8, geometry: g)
+        #expect(runs == [NTFSRun(lcn: 200, length: 2), NTFSRun(lcn: 100, length: 3), NTFSRun(lcn: nil, length: 2),
+                         NTFSRun(lcn: 50, length: 1)])
+        #expect(throws: ScanError.self) {
+            try NTFSRecord.decodeRuns(Data([0x11, 0x01, 0x0a, 0x11, 0x01, 0xec, 0x00]), from: 0, clusters: 2, geometry: g)
+        }
+        var image = NTFSImage.standard()
+        image.records[27] = file("back.bin", data: nonResident(0x80, [.at(220, 2), .at(195, 1)], size: 1500))
+        image.used.formUnion([220, 221, 195])
+        image.records[28] = deletedFile("backdel.bin", [.at(240, 1), .at(230, 2)])
+        let found = files(await scan(image.build()))
+        #expect(found.contains { $0.path == "/back.bin" && $0.sizeBytes == 1500 && !$0.sourceMetadata.contiguous })
+        #expect(found.contains { $0.path == "/backdel.bin" && $0.isDeleted })
+    }
+
+    /// P8c: pages are found across `$Bitmap` runs, past 64K clusters, revisiting earlier pages.
+    @Test func bitmapPagesAcrossFragmentsAndPast64KClusters() async {
+        var image = largeImage()
+        image.used = [4100, 41101, 70003]
+        image.records[16] = deletedFile("page1.bin", [.at(5000, 3)])
+        image.records[17] = deletedFile("page16.bin", [.at(66000, 100)])
+        image.records[18] = deletedFile("page17-used.bin", [.at(70000, 5)])
+        image.records[19] = deletedFile("page10.bin", [.at(40960, 64)])
+        image.records[20] = deletedFile("page10-used.bin", [.at(41100, 2)])
+        image.records[21] = deletedFile("page1-used.bin", [.at(4096, 8)])
+        let result = await scanVolume(image.build())
+        #expect(result.error == nil)
+        #expect(result.files.map(\.name) == ["page1.bin", "page16.bin", "page10.bin"])
+    }
+
+    @Test func residentBitmapIsHonoured() async {
+        var image = NTFSImage.standard()
+        image.residentBitmap = true
+        let events = await scan(image.build())
+        #expect(events.last == .completed)
+        #expect(files(events).count == 6 && !files(events).contains { $0.name == "overwritten.txt" })
+        image.used.remove(170)
+        #expect(files(await scan(image.build())).contains { $0.name == "overwritten.txt" })
+    }
+
+    /// P8d: invalid `$DATA` sizes and run headers.
+    @Test(arguments: ["zero-length run", "offset nibble above 8", "length nibble above 8", "initialized > real", "real > allocated"])
+    func malformedDataSizesAreSkippedWhenDeletedAndFatalWhenLive(_ damage: String) async {
+        func data(_ lcn: UInt8) -> Data {
+            switch damage {
+            case "zero-length run": return nonResident(0x80, runs: Data([0x11, 0x00, lcn, 0x00]), clusters: 1, size: 100)
+            case "offset nibble above 8":
+                return nonResident(0x80, runs: Data([0x91, 0x01, lcn] + [UInt8](repeating: 0, count: 8) + [0]), clusters: 1, size: 100)
+            case "length nibble above 8":
+                return nonResident(0x80, runs: Data([0x19] + [0x01] + [UInt8](repeating: 0, count: 8) + [lcn, 0]), clusters: 1, size: 100)
+            case "initialized > real": return nonResident(0x80, [.at(Int(lcn), 1)], size: 100, initialized: 101)
+            default: return nonResident(0x80, [.at(Int(lcn), 1)], size: 513, initialized: 100)
+            }
+        }
+        var deleted = NTFSImage.standard()
+        deleted.records[19] = file("deleted.txt", parent: 16, sequence: 2, deleted: true, data: data(160))
+        let events = await scan(deleted.build())
+        #expect(events.last == .completed && files(events).count == 5)
+        var live = NTFSImage.standard()
+        live.records[18] = file("report.txt", parent: 16, data: data(150))
+        #expect(isMalformed(await scan(live.build())))
+    }
+
+    /// P8e: a hard-linked file is emitted once, under its first Win32 name, never duplicated per link.
+    @Test func hardLinksAreEmittedOnceUnderTheFirstWin32Name() async {
+        var image = NTFSImage.standard()
+        image.records[27] = record(sequence: 1, flags: 1, [
+            standardInformation(), fileName("first.txt", parent: 5, sequence: 5),
+            fileName("second.txt", parent: 16, sequence: 1), resident(0x80, Data("h".utf8))])
+        image.records[28] = record(sequence: 1, flags: 1, [
+            standardInformation(), fileName("inner.txt", parent: 16, sequence: 1),
+            fileName("outer.txt", parent: 5, sequence: 5), resident(0x80, Data("i".utf8))])
+        let found = files(await scan(image.build()))
+        #expect(found.filter { $0.sourceMetadata.allocationStart == 27 }.map(\.path) == ["/first.txt"])
+        #expect(found.filter { $0.sourceMetadata.allocationStart == 28 }.map(\.path) == ["/Documents/inner.txt"])
+    }
+
+    /// P8f: an `$MFT` whose `$DATA` continues through an attribute list is reported as unsupported.
+    @Test func mftNeedingAnAttributeListIsUnsupported() async {
+        var image = NTFSImage.standard()
+        image.records[0] = record(sequence: 1, flags: 1, [
+            standardInformation(), resident(0x20, Data(count: 32)), fileName("$MFT", parent: 5, sequence: 5, namespace: 3),
+            nonResident(0x80, [.at(16, 64)], size: 32 * recordSize, allocated: 128 * sector)])
+        let events = await scan(image.build())
+        #expect(events.contains(.error(.unsupportedFilesystem)) && files(events).isEmpty)
+    }
+
+    /// P8g: the root and `$Bitmap` are needed before anything can be emitted.
+    @Test(arguments: ["root fixup", "bitmap fixup", "bitmap missing"])
+    func damageToRootOrBitmapRecordFailsImmediately(_ damage: String) async {
+        var image = NTFSImage.standard().build()
+        switch damage {
+        case "root fixup": image[Data.recordOffset(5) + 1022] ^= 0xff
+        case "bitmap fixup": image[Data.recordOffset(6) + 510] ^= 0xff
+        default: image.text(Data.recordOffset(6), "BAAD")
+        }
+        let events = await scan(image)
+        #expect(isMalformed(events) && files(events).isEmpty)
+    }
+
+    /// P8h: live files whose parent is missing or reused go under /Orphaned Files, keeping the intact part.
+    @Test func liveFileWithBrokenParentChainIsOrphaned() async {
+        var image = NTFSImage.standard()
+        image.records[27] = file("a.txt", parent: 29, data: resident(0x80, Data("a".utf8)))
+        image.records[28] = file("b.txt", parent: 16, parentSequence: 7, data: resident(0x80, Data("b".utf8)))
+        image.records[30] = directory("Sub", parent: 29)
+        image.records[31] = file("c.txt", parent: 30, data: resident(0x80, Data("c".utf8)))
+        let events = await scan(image.build())
+        #expect(events.last == .completed)
+        let orphans = files(events).filter { $0.path.hasPrefix("/Orphaned Files/") }
+        #expect(orphans.map(\.path) == ["/Orphaned Files/reused.txt", "/Orphaned Files/a.txt", "/Orphaned Files/b.txt",
+                                        "/Orphaned Files/Sub/c.txt"])
+        #expect(orphans.filter { !$0.isDeleted }.count == 3)
+    }
+
+    /// P8i: the image has 256 sectors but the boot sector declares 255 clusters, so cluster 255 is outside.
+    @Test func runPastClusterCountButInsideVolumeBytesIsRejected() async {
+        var live = NTFSImage.standard()
+        live.records[18] = file("report.txt", parent: 16, data: nonResident(0x80, [.at(255, 1)], size: 100))
+        let built = live.build()
+        #expect(built.count == 256 * sector)
+        #expect(isMalformed(await scan(built)))
+        var deleted = NTFSImage.standard()
+        deleted.records[19] = file("deleted.txt", parent: 16, sequence: 2, deleted: true,
+                                   data: nonResident(0x80, [.at(254, 2)], size: 100))
+        let events = await scan(deleted.build())
+        #expect(events.last == .completed && !files(events).contains { $0.name == "deleted.txt" })
     }
 }

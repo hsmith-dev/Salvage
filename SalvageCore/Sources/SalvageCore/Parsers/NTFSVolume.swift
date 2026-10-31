@@ -17,11 +17,19 @@ actor NTFSVolume {
         let name: NTFSFileName
 
         /// A deleted directory's sequence number was incremented when it was freed, so a child
-        /// deleted with it still holds the previous value.
+        /// deleted with it still holds the previous value. NTFS never uses sequence 0, so the value
+        /// after 0xFFFF is 1.
         func matches(_ reference: UInt16) -> Bool {
-            sequence == reference || (!inUse && sequence == reference &+ 1)
+            sequence == reference || (!inUse && sequence == (reference == 0xffff ? 1 : reference &+ 1))
         }
     }
+
+    /// One placed run of a deleted candidate's unnamed `$DATA`, collected in pass 1.
+    struct DeletedRun { let start: Int64; let end: Int64; let record: UInt64 }
+
+    /// Bounds the runs collected for the deleted-file overlap check. Candidates whose runs don't fit
+    /// can't be checked, so they are skipped rather than risk emitting another file's contents.
+    static let maxDeletedRuns = 1 << 20
 
     let reader: any BlockReader
     let extent: VolumeExtent
@@ -35,6 +43,20 @@ actor NTFSVolume {
     var bitmap: NTFSDataStream?
     var bitmapPageIndex: Int64 = -1
     var bitmapPage = Data()
+    /// Deleted candidates (by record number) whose runs were all collected, and those among them
+    /// whose runs overlap another deleted candidate's.
+    var deletedRuns: [DeletedRun] = []
+    var collectedDeleted: Set<UInt64> = []
+    var overlappingDeleted: Set<UInt64> = []
+    /// Remaining `$Bitmap` bits the deleted-file check may still examine on this volume. Once a
+    /// candidate doesn't fit, it drops to zero and every later deleted candidate is skipped.
+    var deletedCheckBudget: Int64 = 0
+    var deletedCheckBudgetOverride: Int64?
+    /// `$Bitmap` lookups made by the deleted-file check (one per bit, byte or 64-bit word tested).
+    var bitmapChecks = 0
+
+    /// Test seam: replaces the default per-volume budget of `4 × clusterCount + 1_000_000` bits.
+    func limitDeletedChecks(to bits: Int64) { deletedCheckBudgetOverride = bits }
 
     init(reader: any BlockReader, extent: VolumeExtent, emit: @escaping @Sendable (RecoveredFile) async throws -> Void) {
         self.reader = reader; self.extent = extent; self.emit = emit
@@ -57,6 +79,8 @@ actor NTFSVolume {
         try await forEachRecord { number, _, raw in try self.index(number, raw, g) }
         guard directories[Self.rootRecord]?.inUse == true else { throw ScanError.malformed("NTFS root directory is missing.") }
         guard bitmap != nil else { throw ScanError.malformed("NTFS $Bitmap is missing.") }
+        markOverlappingDeletedRuns()
+        deletedCheckBudget = try deletedCheckBudgetOverride ?? checkedAdd(checkedMultiply(4, g.clusterCount), 1_000_000)
         try await forEachRecord { number, offset, raw in try await self.emitFile(number, offset, raw, g) }
     }
 
@@ -94,7 +118,7 @@ actor NTFSVolume {
         guard let g = geometry else { return }
         let needed = try checkedMultiply(recordCount, g.recordBytes)
         var buffer = Data(), streamed: Int64 = 0, number: UInt64 = 0
-        var recordStarts: [Int64] = []
+        var recordStarts: [Int64] = [], startCursor = 0
         for run in mftRuns {
             guard let lcn = run.lcn else { throw ScanError.malformed("Sparse NTFS $MFT run.") }
             let start = try checkedMultiply(lcn, g.clusterBytes)
@@ -113,10 +137,12 @@ actor NTFSVolume {
                 var cursor = 0
                 while buffer.count - cursor >= Int(g.recordBytes) {
                     let record = buffer.subdata(in: cursor..<cursor + Int(g.recordBytes))
-                    try await body(number, recordStarts.removeFirst(), record)
-                    number += 1; cursor += Int(g.recordBytes)
+                    try await body(number, recordStarts[startCursor], record)
+                    number += 1; cursor += Int(g.recordBytes); startCursor += 1
                 }
                 buffer = buffer.subdata(in: cursor..<buffer.count)
+                // Drop consumed starts once per chunk, leaving at most the one straddling record.
+                recordStarts.removeFirst(startCursor); startCursor = 0
             }
         }
         guard streamed == needed else { throw ScanError.malformed("NTFS $MFT runs are shorter than its size.") }
@@ -156,13 +182,41 @@ actor NTFSVolume {
                 bitmap = data
                 return
             }
-            if number == Self.rootRecord, !(record.inUse && record.isDirectory) {
-                throw ScanError.malformed("NTFS root directory is invalid.")
+            if number == Self.rootRecord {
+                guard record.inUse, record.isDirectory, record.fileNameAttributes > 0 else {
+                    throw ScanError.malformed("NTFS root directory is invalid.")
+                }
+                // The root's own name is "."; it never appears in a path, so it isn't needed.
+                let name = NTFSFileName(parent: Self.rootRecord, parentSequence: record.sequence, namespace: 3, name: "")
+                directories[number] = Directory(sequence: record.sequence, inUse: true, name: name)
+                return
             }
             if record.isDirectory, let name = record.bestName {
                 directories[number] = Directory(sequence: record.sequence, inUse: record.inUse, name: name)
             }
+            if !system, !record.inUse, !record.isDirectory, let data = record.data { collectDeletedRuns(number, data) }
         }
+    }
+
+    func collectDeletedRuns(_ number: UInt64, _ data: NTFSDataStream) {
+        let placed = data.runs.compactMap { run in run.lcn.map { DeletedRun(start: $0, end: $0 + run.length, record: number) } }
+        guard !placed.isEmpty, placed.count <= Self.maxDeletedRuns - deletedRuns.count else { return }
+        deletedRuns += placed
+        collectedDeleted.insert(number)
+    }
+
+    /// Marks every deleted candidate whose runs overlap a different candidate's. Runs inside one
+    /// attribute never overlap, so a sweep over runs sorted by start, tracking the run that reaches
+    /// furthest, finds every cross-record overlap.
+    func markOverlappingDeletedRuns() {
+        var furthest: DeletedRun?
+        for run in deletedRuns.sorted(by: { $0.start < $1.start }) {
+            if let reach = furthest, run.start < reach.end, run.record != reach.record {
+                overlappingDeleted.insert(run.record); overlappingDeleted.insert(reach.record)
+            }
+            if furthest.map({ run.end > $0.end }) ?? true { furthest = run }
+        }
+        deletedRuns = []
     }
 
     // MARK: - Pass 2
@@ -181,15 +235,7 @@ actor NTFSVolume {
         guard let data = record.data else { return }
         guard let parent = try directoryPath(name.parent, name.parentSequence) else { return }
         if parent.isEmpty, name.name.hasPrefix("$") { return }
-        if !record.inUse {
-            for run in data.runs {
-                guard let lcn = run.lcn else { continue }
-                for cluster in lcn..<lcn + run.length {
-                    // Clusters reused since deletion mean the data has probably been overwritten.
-                    if try await clusterInUse(cluster, g) { return }
-                }
-            }
-        }
+        if !record.inUse, !(try await deletedClustersAreFree(number, data, g)) { return }
         try await emit(RecoveredFile(
             name: name.name, path: parent + "/" + name.name, sizeBytes: data.size,
             modified: record.modified, isDeleted: !record.inUse,
@@ -228,28 +274,78 @@ actor NTFSVolume {
 
     // MARK: - $Bitmap
 
-    func clusterInUse(_ cluster: Int64, _ g: NTFSGeometry) async throws -> Bool {
-        guard let bitmap else { throw ScanError.malformed("NTFS $Bitmap is missing.") }
-        let byte = cluster / 8, bit = UInt8(1) << (cluster % 8)
-        if let resident = bitmap.residentValue {
-            guard byte < Int64(resident.count) else { throw ScanError.malformed("NTFS $Bitmap is too small.") }
-            return resident[Int(byte)] & bit != 0
+    /// Whether a deleted file's clusters can still hold its data: no other deleted candidate claims
+    /// them, the volume's check budget isn't spent, and `$Bitmap` marks every one free. Clusters
+    /// reused since deletion mean the data has probably been overwritten.
+    func deletedClustersAreFree(_ number: UInt64, _ data: NTFSDataStream, _ g: NTFSGeometry) async throws -> Bool {
+        let placed = data.runs.compactMap { run in run.lcn.map { (lcn: $0, length: run.length) } }
+        guard !placed.isEmpty else { return true }
+        guard collectedDeleted.contains(number), !overlappingDeleted.contains(number) else { return false }
+        // Runs of one attribute are disjoint and inside the volume, so this can't exceed clusterCount.
+        let clusters = try placed.reduce(Int64(0)) { try checkedAdd($0, $1.length) }
+        guard clusters <= deletedCheckBudget else { deletedCheckBudget = 0; return false }
+        deletedCheckBudget -= clusters
+        for run in placed {
+            try Task.checkCancellation()
+            if try await anyClusterUsed(run.lcn, run.length, g) { return false }
         }
-        let pageBytes = min(g.clusterBytes, 64 * 1024)
-        let page = byte / pageBytes
-        if page != bitmapPageIndex {
-            let pageStart = page * pageBytes
-            var vcn = pageStart / g.clusterBytes
-            var location: Int64?
-            for run in bitmap.runs {
-                if vcn < run.length { location = run.lcn.map { $0 + vcn }; break }
-                vcn -= run.length
+        return true
+    }
+
+    /// Tests clusters `lcn..<lcn + length`, a 64-bit word or a byte at a time where aligned, so a
+    /// fully free word or byte costs one lookup.
+    func anyClusterUsed(_ lcn: Int64, _ length: Int64, _ g: NTFSGeometry) async throws -> Bool {
+        var cluster = lcn
+        let end = try checkedAdd(lcn, length)
+        while cluster < end {
+            let remaining = end - cluster
+            bitmapChecks += 1
+            if cluster % 64 == 0, remaining >= 64 {
+                // A word starting on an 8-byte boundary never crosses a (power-of-two) page.
+                if try await bitmapBytes(cluster / 8, 8, g) != 0 { return true }
+                cluster += 64
+            } else if cluster % 8 == 0, remaining >= 8 {
+                if try await bitmapBytes(cluster / 8, 1, g) != 0 { return true }
+                cluster += 8
+            } else {
+                if try await bitmapBytes(cluster / 8, 1, g) & (1 << UInt64(cluster % 8)) != 0 { return true }
+                cluster += 1
             }
-            guard let lcn = location else { throw ScanError.malformed("NTFS $Bitmap doesn't cover the volume.") }
-            let offset = try checkedAdd(checkedMultiply(lcn, g.clusterBytes), pageStart % g.clusterBytes)
-            bitmapPage = try await read(offset, Int(pageBytes))
-            bitmapPageIndex = page
         }
-        return bitmapPage[Int(byte % pageBytes)] & bit != 0
+        return false
+    }
+
+    /// `count` (1...8) consecutive `$Bitmap` bytes from one page, little-endian. Bytes beyond the
+    /// stream's initialized size read as zero (free), as NTFS defines.
+    func bitmapBytes(_ byte: Int64, _ count: Int, _ g: NTFSGeometry) async throws -> UInt64 {
+        guard let bitmap else { throw ScanError.malformed("NTFS $Bitmap is missing.") }
+        guard byte >= 0, Int64(count) <= bitmap.size - byte else { throw ScanError.malformed("NTFS $Bitmap is too small.") }
+        guard byte < bitmap.initialized else { return 0 }
+        let page: Data, pageStart: Int64
+        if let resident = bitmap.residentValue {
+            page = resident; pageStart = 0
+        } else {
+            let pageBytes = min(g.clusterBytes, 64 * 1024)
+            let index = byte / pageBytes
+            pageStart = index * pageBytes
+            if index != bitmapPageIndex {
+                var vcn = pageStart / g.clusterBytes
+                var location: Int64?
+                for run in bitmap.runs {
+                    if vcn < run.length { location = run.lcn.map { $0 + vcn }; break }
+                    vcn -= run.length
+                }
+                guard let lcn = location else { throw ScanError.malformed("NTFS $Bitmap doesn't cover the volume.") }
+                let offset = try checkedAdd(checkedMultiply(lcn, g.clusterBytes), pageStart % g.clusterBytes)
+                bitmapPage = try await read(offset, Int(pageBytes))
+                bitmapPageIndex = index
+            }
+            page = bitmapPage
+        }
+        var value: UInt64 = 0
+        for i in 0..<count where byte + Int64(i) < bitmap.initialized {
+            value |= UInt64(page[Int(byte - pageStart) + i]) << UInt64(i * 8)
+        }
+        return value
     }
 }
