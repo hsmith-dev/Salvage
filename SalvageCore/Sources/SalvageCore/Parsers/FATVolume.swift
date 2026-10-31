@@ -22,9 +22,19 @@ actor FATVolume {
     var bitmapLength: Int64 = 0
     var bitmapPageOffset: Int64 = -1
     var bitmapPage = Data()
+    /// Zone for timestamps recorded in local time (all FAT32 ones, exFAT ones without a valid offset).
+    let localTimeZone: TimeZone
+    /// FAT/bitmap lookups still allowed for deleted-entry free-cluster checks on this volume. Deleted
+    /// metadata is attacker- or garbage-controlled, so its total work is bounded; live scanning isn't.
+    var deletedLookupBudget: Int64 = 0
+    /// Deleted files that passed their own checks, held back until overlaps can be resolved.
+    var deletedCandidates: [DeletedCandidate] = []
+    /// Bounds the memory held by `deletedCandidates`; later deleted entries are skipped.
+    static let maxDeletedCandidates = 250_000
 
-    init(reader: any BlockReader, extent: VolumeExtent, emit: @escaping @Sendable (RecoveredFile) async throws -> Void) {
-        self.reader = reader; self.extent = extent; self.emit = emit
+    init(reader: any BlockReader, extent: VolumeExtent, localTimeZone: TimeZone = .current,
+         emit: @escaping @Sendable (RecoveredFile) async throws -> Void) {
+        self.reader = reader; self.extent = extent; self.localTimeZone = localTimeZone; self.emit = emit
     }
     func read(_ offset: Int64, _ count: Int) async throws -> Data {
         try Task.checkCancellation()
@@ -46,6 +56,7 @@ actor FATVolume {
             throw ScanError.malformed("Allocation geometry exceeds partition.")
         }
         try validCluster(root)
+        deletedLookupBudget = 4 * clusterCount + 1_000_000
         if exfat { try await loadBitmap() }
         var pending: [(UInt32, String, Int64?, Bool)] = [(root, "", nil, false)]
         while let (cluster, path, length, contiguous) = pending.popLast() {
@@ -54,6 +65,12 @@ actor FATVolume {
             let children = try await directory(cluster, path: path, length: length, contiguous: contiguous)
             pending.append(contentsOf: children)
         }
+        // Deleted files are emitted only after the live traversal, once overlaps are known.
+        for file in Self.withoutOverlaps(deletedCandidates) {
+            try Task.checkCancellation()
+            try await emit(file)
+        }
+        deletedCandidates = []
     }
     func validateExfatBoot() async throws {
         let boot = try await read(0, Int(sector * 12))
@@ -282,7 +299,8 @@ actor FATVolume {
                             if type & 0x80 == 0 && type != 0x05 {
                                 deletedSet.append(entry)
                                 if deletedSet.count == Int(deletedSet[0][1]) + 1 {
-                                    try await deletedExfatEntry(deletedSet, at: deletedOffset, path: path)
+                                    let set = deletedSet, at = deletedOffset
+                                    try await deletedCandidate { try await self.deletedExfatFile(set, at: at, path: path) }
                                     deletedSet = []
                                 }
                                 continue
@@ -316,7 +334,7 @@ actor FATVolume {
                                 continue
                             }
                             let slots = deletedLfn; deletedLfn = []
-                            try await deletedFatEntry(entry, long: slots, at: location, path: path)
+                            try await deletedCandidate { try await self.deletedFatFile(entry, long: slots, at: location, path: path) }
                             continue
                         }
                         deletedLfn = []
@@ -341,7 +359,7 @@ actor FATVolume {
                         } else {
                             try await validateFile(cluster, length: size, contiguous: false, owner: "file:\(location)")
                             try await emit(RecoveredFile(name: name, path: fullPath, sizeBytes: size,
-                                modified: Self.fatTimestamp(entry),
+                                modified: Self.fatTimestamp(entry, localZone: localTimeZone),
                                 sourceMetadata: SourceMetadata(filesystem: .fat32, volumeOffset: extent.offset,
                                     recordOffset: location, allocationStart: UInt64(cluster), contiguous: false,
                                     rawRecord: lfn.reduce(Data(), +) + entry)))
@@ -436,8 +454,8 @@ actor FATVolume {
         let primary = entries[0]
         return ExfatSet(name: name, sizeBytes: size, validBytes: valid, cluster: UInt32(try stream.number(20, 4)),
                         contiguous: stream[1] & 2 != 0, isDirectory: try primary.number(4, 2) & 0x10 != 0,
-                        modified: Self.exfatTimestamp(UInt32(try primary.number(12, 4)),
-                                                      tenMs: primary[21], utcOffset: primary[23]))
+                        modified: Self.exfatTimestamp(UInt32(try primary.number(12, 4)), tenMs: primary[21],
+                                                      utcOffset: primary[23], localZone: localTimeZone))
     }
     func exfatEntry(_ entries: [Data], at location: Int64, path: String) async throws -> (UInt32, String, Int64?, Bool)? {
         let raw = entries.reduce(Data(), +)
@@ -460,111 +478,192 @@ actor FATVolume {
     //
     // Deleted metadata is expected to be partly stale. Each entry is validated on its own and
     // skipped (never thrown) when implausible. Deleted entries never claim() clusters, so they
-    // can't raise cross-links against live files or cause live files to be rejected.
+    // can't raise cross-links against live files or cause live files to be rejected. Their total
+    // free-cluster work is bounded by `deletedLookupBudget`, and they are emitted only after the
+    // live traversal, so that deleted files whose assumed runs overlap can all be dropped.
+
+    struct DeletedCandidate {
+        let file: RecoveredFile
+        /// Assumed contiguous run as [first, first + count) cluster numbers; count is 0 for empty files.
+        let first: Int64, count: Int64
+    }
+
+    /// Runs one deleted-entry check and holds back a file that passes. Any failure other than
+    /// cancellation, including an I/O error in a free-cluster lookup, skips only this candidate.
+    func deletedCandidate(_ check: () async throws -> DeletedCandidate?) async throws {
+        guard deletedLookupBudget > 0, deletedCandidates.count < Self.maxDeletedCandidates else { return }
+        do {
+            if let candidate = try await check() { deletedCandidates.append(candidate) }
+        } catch {
+            if error is CancellationError || Task.isCancelled { throw error }
+        }
+    }
+    /// Drops every candidate whose run overlaps another candidate's run: one of them would be
+    /// recovered with the other's data, and a wrong file is worse than a missing one. Survivors
+    /// keep their discovery order.
+    static func withoutOverlaps(_ candidates: [DeletedCandidate]) -> [RecoveredFile] {
+        let order = candidates.indices.filter { candidates[$0].count > 0 }.sorted { candidates[$0].first < candidates[$1].first }
+        var dropped = Set<Int>(), group: [Int] = [], groupEnd: Int64 = 0
+        func flush() { if group.count > 1 { dropped.formUnion(group) } }
+        for index in order {
+            let candidate = candidates[index]
+            if !group.isEmpty && candidate.first < groupEnd {
+                group.append(index); groupEnd = max(groupEnd, candidate.first + candidate.count)
+            } else {
+                flush(); group = [index]; groupEnd = candidate.first + candidate.count
+            }
+        }
+        flush()
+        return candidates.indices.filter { !dropped.contains($0) }.map { candidates[$0].file }
+    }
 
     /// True when `required` clusters starting at `first` lie inside the heap and are all free in
-    /// the active FAT (FAT32) or the active allocation bitmap (exFAT).
+    /// the active FAT (FAT32) or the active allocation bitmap (exFAT). Each lookup spends one unit
+    /// of `deletedLookupBudget`; once it runs out the run is treated as not free.
     func freeRun(from first: UInt32, required: Int64) async throws -> Bool {
         guard (try? validCluster(first)) != nil, required > 0,
               required <= clusterCount - (Int64(first) - 2) else { return false }
         for offset in 0..<required {
             if offset % 4096 == 0 { try Task.checkCancellation() }
+            guard deletedLookupBudget > 0 else { return false }
+            deletedLookupBudget -= 1
             let cluster = first + UInt32(offset)
             let free = exfat ? !(try await allocatedInBitmap(cluster)) : try await fatEntry(cluster) == 0
             guard free else { return false }
         }
         return true
     }
-    func deletedFatEntry(_ entry: Data, long: [Data], at location: Int64, path: String) async throws {
+    func deletedFatFile(_ entry: Data, long: [Data], at location: Int64, path: String) async throws -> DeletedCandidate? {
         // Volume labels and deleted directories are not reported; directories aren't descended into.
-        guard entry[11] & 0x18 == 0 else { return }
+        guard entry[11] & 0x18 == 0 else { return nil }
         var used: [Data] = []
         var name = recoverDeletedLongName(entry, slots: long, used: &used)
         if name == nil {
             var short = entry; short[0] = UInt8(ascii: "_")
             name = shortName(short); used = []
         }
-        guard let name, (try? validName(name)) != nil else { return }
+        guard let name, (try? validName(name)) != nil else { return nil }
         let cluster = UInt32(try entry.number(20, 2)) << 16 | UInt32(try entry.number(26, 2))
         let size = try signed(entry.number(28, 4))
         // Deletion zeroes the chain, so assume a contiguous run from the first cluster.
-        if size > 0 {
-            guard try await freeRun(from: cluster, required: (size - 1) / clusterBytes + 1) else { return }
+        let required = size > 0 ? (size - 1) / clusterBytes + 1 : 0
+        if required > 0 {
+            guard try await freeRun(from: cluster, required: required) else { return nil }
         }
-        try await emit(RecoveredFile(name: name, path: path + "/" + name, sizeBytes: size,
-            modified: Self.fatTimestamp(entry), isDeleted: true,
+        let file = RecoveredFile(name: name, path: path + "/" + name, sizeBytes: size,
+            modified: Self.fatTimestamp(entry, localZone: localTimeZone), isDeleted: true,
             sourceMetadata: SourceMetadata(filesystem: .fat32, volumeOffset: extent.offset,
                 recordOffset: location, allocationStart: UInt64(cluster), contiguous: true,
-                rawRecord: used.reduce(Data(), +) + entry)))
+                rawRecord: used.reduce(Data(), +) + entry))
+        return DeletedCandidate(file: file, first: Int64(cluster), count: required)
     }
-    /// Rebuilds a deleted long name. Ordinals are overwritten with 0xE5, so the run is identified by
-    /// position (the slots immediately preceding the short entry) and a shared checksum.
+    /// Rebuilds a deleted long name, or returns nil so the caller falls back to the short name.
     ///
-    /// The short name's first byte is lost too, and the checksum is a bijection in that byte, so
-    /// "some byte matches" proves nothing. Instead the byte is derived from the recovered long name
-    /// the way short names are generated (its first character uppercased, or `_` for one that is
-    /// not valid in 8.3), and the checksum must match with one of those candidates.
+    /// Ordinals and the last-slot flag are overwritten with 0xE5, so the run is identified only by
+    /// position (contiguous slots ending immediately before the short entry) and a shared checksum.
+    /// Walking back from the slot nearest the short entry, every slot but the highest must be full
+    /// name characters; the first slot holding a 0x0000 terminator (with 0xFFFF padding after it)
+    /// is the highest and ends the walk. Each prefix of that walk that ends on a full slot or on
+    /// the terminator slot is a structurally complete candidate. A candidate is accepted only if:
+    /// - its extension agrees with the short entry's 8.3 extension, which rejects a run whose
+    ///   leading slot was reused (a truncated name) and most splices with a stale slot; and
+    /// - the checksum matches with the short name's lost first byte derived from the long name the
+    ///   way short names are generated (its first character uppercased, or `_` for one that is not
+    ///   valid in 8.3). The checksum is a bijection in that byte, so "some byte matches" proves nothing.
+    /// The longest accepted candidate wins. When the short entry has an extension and more than one
+    /// candidate is accepted, a stale same-checksum slot can't be told apart from the real one, so
+    /// the short name is used instead.
     func recoverDeletedLongName(_ entry: Data, slots: [Data], used: inout [Data]) -> String? {
-        guard let last = slots.last else { return nil }
-        let checksum = last[13]
-        var run = Array(slots.reversed().prefix { $0[13] == checksum }.reversed())
-        // The on-disk first slot of a run holds the name terminator; drop stale slots before it.
-        if let start = run.lastIndex(where: { slot in Self.lfnOffsets.contains { (try? slot.number($0, 2)) == 0 } }) {
-            run = Array(run[start...])
+        guard let checksum = slots.last?[13] else { return nil }
+        var candidates: [[Data]] = [], run: [Data] = []
+        for slot in slots.reversed() {
+            guard run.count < 20, slot.count == 32, slot[11] == 0x0f, slot[12] == 0, slot[26] == 0, slot[27] == 0,
+                  slot[13] == checksum else { break }
+            let units = Self.lfnOffsets.map { UInt16(slot[$0]) | UInt16(slot[$0 + 1]) << 8 }
+            if let end = units.firstIndex(of: 0) {
+                // The terminator marks the highest slot: nothing earlier can belong to this name.
+                if end > 0, units[(end + 1)...].allSatisfy({ $0 == 0xffff }) {
+                    run.insert(slot, at: 0); candidates.append(run)
+                }
+                break
+            }
+            // A slot below the highest is all name characters; padding without a terminator is inconsistent.
+            guard !units.contains(0xffff) else { break }
+            run.insert(slot, at: 0); candidates.append(run)
         }
-        guard let name = lfnName(run) else { return nil }
-        var candidates: [UInt8] = [UInt8(ascii: "_")]
-        if let first = name.unicodeScalars.first(where: { $0 != "." && $0 != " " }), first.isASCII {
-            let byte = UInt8(first.value)
-            candidates.append((0x61...0x7a).contains(byte) ? byte - 0x20 : byte)
-        }
+        let shortExtension = (String(bytes: entry[8..<11], encoding: String.Encoding(rawValue: 0x80000400)) ?? "")
+            .trimmingCharacters(in: .whitespaces)
         let tail = entry.dropFirst().prefix(10)
-        let matches = candidates.contains { first in
-            var sum: UInt8 = first
-            for byte in tail { sum = ((sum & 1) << 7) &+ (sum >> 1) &+ byte }
-            return sum == checksum
+        let accepted = candidates.compactMap { run -> ([Data], String)? in
+            guard let name = lfnName(run), Self.extensionAgrees(name, shortExtension: shortExtension) else { return nil }
+            var firstBytes: [UInt8] = [UInt8(ascii: "_")]
+            if let first = name.unicodeScalars.first(where: { $0 != "." && $0 != " " }), first.isASCII {
+                let byte = UInt8(first.value)
+                firstBytes.append((0x61...0x7a).contains(byte) ? byte - 0x20 : byte)
+            }
+            let matches = firstBytes.contains { first in
+                var sum: UInt8 = first
+                for byte in tail { sum = ((sum & 1) << 7) &+ (sum >> 1) &+ byte }
+                return sum == checksum
+            }
+            return matches ? (run, name) : nil
         }
-        guard matches else { return nil }
+        guard let (run, name) = accepted.last, shortExtension.isEmpty || accepted.count == 1 else { return nil }
         used = run
         return name
     }
-    func deletedExfatEntry(_ entries: [Data], at location: Int64, path: String) async throws {
+    /// Whether a long name's extension could have produced the short entry's 8.3 extension: equal
+    /// ignoring case and spaces, or longer than 3 characters and starting with it (8.3 truncation).
+    /// Leading dots don't start an extension. With no short extension, the long name must have none.
+    static func extensionAgrees(_ long: String, shortExtension: String) -> Bool {
+        let body = long.drop { $0 == "." }
+        let ext = body.lastIndex(of: ".").map { String(body[body.index(after: $0)...]) }?
+            .replacingOccurrences(of: " ", with: "").uppercased()
+        let short = shortExtension.uppercased()
+        guard !short.isEmpty else { return ext?.isEmpty ?? true }
+        guard let ext else { return false }
+        return ext == short || (ext.count > 3 && ext.hasPrefix(short))
+    }
+    func deletedExfatFile(_ entries: [Data], at location: Int64, path: String) async throws -> DeletedCandidate? {
         // The set checksum covers the in-use bits, so validate with them restored.
         let restored = entries.map { entry -> Data in var copy = entry; copy[copy.startIndex] |= 0x80; return copy }
-        guard let set = try? parseExfatSet(restored), !set.isDirectory else { return }
-        if set.sizeBytes > 0 {
-            let required = (set.sizeBytes - 1) / clusterBytes + 1
+        guard let set = try? parseExfatSet(restored), !set.isDirectory else { return nil }
+        let required = set.sizeBytes > 0 ? (set.sizeBytes - 1) / clusterBytes + 1 : 0
+        if required > 0 {
             // A FAT-chained (possibly fragmented) deleted file can't be followed reliably.
-            guard set.contiguous || required == 1 else { return }
-            guard try await freeRun(from: set.cluster, required: required) else { return }
+            guard set.contiguous || required == 1 else { return nil }
+            guard try await freeRun(from: set.cluster, required: required) else { return nil }
         }
-        try await emit(RecoveredFile(name: set.name, path: path + "/" + set.name, sizeBytes: set.sizeBytes,
+        let file = RecoveredFile(name: set.name, path: path + "/" + set.name, sizeBytes: set.sizeBytes,
             modified: set.modified, isDeleted: true,
             sourceMetadata: SourceMetadata(filesystem: .exfat, volumeOffset: extent.offset,
                 recordOffset: location, allocationStart: UInt64(set.cluster), contiguous: true,
-                rawRecord: entries.reduce(Data(), +))))
+                rawRecord: entries.reduce(Data(), +)))
+        return DeletedCandidate(file: file, first: Int64(set.cluster), count: required)
     }
 
     // MARK: Timestamps
 
-    /// FAT32 write date/time (offsets 24 and 22): local time, 2-second resolution.
-    static func fatTimestamp(_ entry: Data) -> Date? {
+    /// FAT32 write date/time (offsets 24 and 22): local time in `localZone`, 2-second resolution.
+    static func fatTimestamp(_ entry: Data, localZone: TimeZone = .current) -> Date? {
         guard let time = try? entry.number(22, 2), let date = try? entry.number(24, 2) else { return nil }
-        return timestamp(date: Int(date), time: Int(time), centiseconds: 0, utcOffsetMinutes: nil)
+        return timestamp(date: Int(date), time: Int(time), centiseconds: 0, utcOffsetMinutes: nil, localZone: localZone)
     }
     /// exFAT last-modified timestamp with its 10 ms increment, in the recorded UTC offset when that
-    /// offset is valid and in local time otherwise.
-    static func exfatTimestamp(_ stamp: UInt32, tenMs: UInt8, utcOffset: UInt8) -> Date? {
+    /// offset is valid and in `localZone` otherwise.
+    static func exfatTimestamp(_ stamp: UInt32, tenMs: UInt8, utcOffset: UInt8, localZone: TimeZone = .current) -> Date? {
         guard tenMs <= 199 else { return nil }
         var offset: Int?
         if utcOffset & 0x80 != 0 {
             let raw = Int(utcOffset & 0x7f), quarters = raw >= 64 ? raw - 128 : raw
             if (-48...56).contains(quarters) { offset = quarters * 15 }
         }
-        return timestamp(date: Int(stamp >> 16), time: Int(stamp & 0xffff), centiseconds: Int(tenMs), utcOffsetMinutes: offset)
+        return timestamp(date: Int(stamp >> 16), time: Int(stamp & 0xffff), centiseconds: Int(tenMs),
+                         utcOffsetMinutes: offset, localZone: localZone)
     }
     /// DOS date/time fields; any out-of-range component yields nil rather than a normalized date.
-    static func timestamp(date: Int, time: Int, centiseconds: Int, utcOffsetMinutes: Int?) -> Date? {
+    static func timestamp(date: Int, time: Int, centiseconds: Int, utcOffsetMinutes: Int?,
+                          localZone: TimeZone = .current) -> Date? {
         let day = date & 31, month = (date >> 5) & 15, year = 1980 + (date >> 9)
         let second = (time & 31) * 2, minute = (time >> 5) & 63, hour = time >> 11
         let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
@@ -576,7 +675,7 @@ actor FATVolume {
             guard let zone = TimeZone(secondsFromGMT: utcOffsetMinutes * 60) else { return nil }
             calendar.timeZone = zone
         } else {
-            calendar.timeZone = .current
+            calendar.timeZone = localZone
         }
         let components = DateComponents(year: year, month: month, day: day, hour: hour, minute: minute, second: second)
         return calendar.date(from: components)?.addingTimeInterval(Double(centiseconds) / 100)
