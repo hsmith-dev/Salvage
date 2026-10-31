@@ -317,7 +317,8 @@ actor EXTVolume {
                     let map = try await liveMapping(node, number: child.inode)
                     try await emit(file(name: child.name, path: path + "/" + child.name, inode: node,
                                         number: child.inode, offset: offset, raw: data + child.raw,
-                                        contiguous: map.runs.count <= 1, deleted: false))
+                                        contiguous: map.runs.count <= 1, deleted: false,
+                                        content: content(node, map: map)))
                 }
             }
         }
@@ -438,7 +439,7 @@ actor EXTVolume {
         guard !geometry.needsRecovery else { candidates = []; return }
         deletedWorkRemaining = limits.deletedWorkBudget ?? (4 * geometry.blocksCount + 1_000_000)
         candidates.sort { $0.inode < $1.inode }
-        var accepted: [EXTDeletedCandidate] = [], contiguous: [Bool] = []
+        var accepted: [EXTDeletedCandidate] = [], contiguous: [Bool] = [], contents: [FileContent] = []
         var claims: [EXTClaim] = []
         var start = 0
         evaluation: while start < candidates.count {
@@ -454,7 +455,7 @@ actor EXTVolume {
                 guard let found = try await evaluate(first) else { continue }
                 guard claims.count + found.claims.count <= limits.maxClaimedRanges else { break evaluation }
                 claims.append(contentsOf: found.claims.map { EXTClaim(start: $0.0, end: $0.1, owner: accepted.count) })
-                accepted.append(first); contiguous.append(found.contiguous)
+                accepted.append(first); contiguous.append(found.contiguous); contents.append(found.content)
             } catch ScanError.malformed(_) {
                 // An implausible deleted candidate is skipped and never aborts the scan.
                 continue
@@ -472,7 +473,7 @@ actor EXTVolume {
             let node = try EXTInode(data, inodeSize: geometry.inodeSize)
             try await emit(file(name: candidate.name, path: path(of: candidate.directory) + "/" + candidate.name,
                                 inode: node, number: candidate.inode, offset: offset, raw: data + candidate.raw,
-                                contiguous: contiguous[index], deleted: true))
+                                contiguous: contiguous[index], deleted: true, content: contents[index]))
         }
     }
 
@@ -488,7 +489,8 @@ actor EXTVolume {
     static func mappingSlack(_ needed: UInt64) -> UInt64 { 16 + needed / 16 }
 
     /// Validates one deleted candidate. Returns the physical ranges it claims, or nil to skip it.
-    func evaluate(_ candidate: EXTDeletedCandidate) async throws -> (claims: [(UInt64, UInt64)], contiguous: Bool)? {
+    func evaluate(_ candidate: EXTDeletedCandidate) async throws
+        -> (claims: [(UInt64, UInt64)], contiguous: Bool, content: FileContent)? {
         // The inode must be free, and a deleted regular file with nonzero size.
         try spend(1)
         guard try await inodeInUse(candidate.inode) == false else { return nil }
@@ -533,7 +535,7 @@ actor EXTVolume {
             }
             claims.append((run.physical, run.physical + run.count))
         }
-        return (claims, map.runs.count <= 1)
+        return (claims, map.runs.count <= 1, content(node, map: map))
     }
 
     /// Marks every owner that has a range overlapping any other range (its own included).
@@ -550,13 +552,59 @@ actor EXTVolume {
     }
 
     func file(name: String, path: String, inode: EXTInode, number: UInt32, offset: Int64, raw: Data,
-              contiguous: Bool, deleted: Bool) throws -> RecoveredFile {
+              contiguous: Bool, deleted: Bool, content: FileContent) throws -> RecoveredFile {
         RecoveredFile(name: name, path: path, sizeBytes: try signed(inode.size), modified: inode.modified,
                       isDeleted: deleted,
                       sourceMetadata: SourceMetadata(filesystem: .ext, volumeOffset: extent.offset,
                                                      recordOffset: try checkedAdd(extent.offset, offset),
                                                      allocationStart: UInt64(number),
-                                                     contiguous: contiguous, rawRecord: raw))
+                                                     contiguous: contiguous, rawRecord: raw),
+                      content: content)
+    }
+
+    /// Device-absolute runs for a validated mapping, in file order and clipped to the blocks the
+    /// size needs. Unmapped logical blocks, uninitialized extents and a missing tail are holes.
+    /// An encrypted inode's blocks are ciphertext, so its contents are left unmapped.
+    func content(_ inode: EXTInode, map: EXTMapping) -> FileContent {
+        guard inode.flags & EXTInode.encryptFlag == 0 else { return .unmapped }
+        return (try? Self.runs(map, size: inode.size, blockSize: geometry.blockSize, base: extent.offset)) ?? .unmapped
+    }
+
+    static func runs(_ map: EXTMapping, size: UInt64, blockSize: Int64, base: Int64) throws -> FileContent {
+        guard size > 0 else { return .runs([]) }
+        let bytes = UInt64(blockSize)
+        let needed = (size - 1) / bytes + 1
+        var runs: [DataRun] = []
+        func append(_ offset: Int64?, _ length: Int64) {
+            if let last = runs.last {
+                let adjacent = switch (last.deviceOffset, offset) {
+                case (nil, nil): true
+                case let (a?, b?): a + last.length == b
+                default: false
+                }
+                if adjacent {
+                    runs[runs.count - 1] = DataRun(deviceOffset: last.deviceOffset, length: last.length + length)
+                    return
+                }
+            }
+            runs.append(DataRun(deviceOffset: offset, length: length))
+        }
+        var next: UInt64 = 0
+        for run in map.runs {
+            if run.logical >= needed { break }
+            // Mappings are built in strictly increasing logical order; anything else is not trusted.
+            guard run.logical >= next else { throw ScanError.malformed("Mapping out of order.") }
+            if run.logical > next { append(nil, try checkedMultiply(signed(run.logical - next), blockSize)) }
+            let count = min(run.count, needed - run.logical)
+            let length = try checkedMultiply(signed(count), blockSize)
+            let offset = run.initialized ? try checkedAdd(base, checkedMultiply(signed(run.physical), blockSize)) : nil
+            append(offset, length)
+            next = run.logical + count
+        }
+        if next < needed {
+            append(nil, try signed(size) - checkedMultiply(signed(next), blockSize))
+        }
+        return .runs(runs)
     }
 }
 

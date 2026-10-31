@@ -58,3 +58,16 @@ This work is split across three agents, one per section below. Each agent edits 
 
 - `swift test --package-path SalvageCore`
 - `./scripts/check-core-boundary.sh`
+
+## Implementation Notes
+
+### EXT: Section C (EXT2/3/4)
+
+- EXT: Runs are built from the same `EXTMapping` the parser already validated (live: `liveMapping`, so hard links still map once; deleted: the mapping `evaluate` checked against the free bitmaps, carried to emission rather than re-mapped). No second mapping pass, no new trust.
+- EXT: Runs are clipped to the blocks `sizeBytes` needs (`ceil(size / blockSize)`). Preallocated or stale blocks past EOF are never part of the content; the last run may still exceed `sizeBytes` by less than one block, which `FileContentReader` truncates.
+- EXT: Unmapped logical blocks (zero block-map pointers, extent gaps) and uninitialized extents become `deviceOffset: nil` holes. A mapping that ends before the size needs gets a trailing hole sized exactly to `sizeBytes`, so the runs always cover the file.
+- EXT: Coalescing merges physically adjacent data runs and consecutive holes. A data run next to an uninitialized extent stays separate even when the blocks are physically adjacent, because the uninitialized one must read as zeros.
+- EXT: Size-0 files are `.runs([])`, even when the inode still names blocks.
+- EXT: Judgment call: an inode with `EXT4_ENCRYPT_FL` (0x800) is `.unmapped`. The superblock `encrypt` feature is already refused and deleted candidates with the flag are already skipped, but a hostile live inode could still carry it; its blocks would be ciphertext, so mapping them would hand preview/recovery the wrong bytes.
+- EXT: Building the runs uses checked arithmetic; any overflow (not reachable after geometry validation) yields `.unmapped` instead of aborting the scan. A mapping whose runs are not in strictly increasing logical order (also not reachable) does the same.
+- EXT: Inline data is unchanged: it is still refused as malformed in `mapping`.
