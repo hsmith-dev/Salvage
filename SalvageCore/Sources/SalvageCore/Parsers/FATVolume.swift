@@ -306,8 +306,8 @@ actor FATVolume {
                             try await validateFile(cluster, length: size, contiguous: false, owner: "file:\(location)")
                             try await emit(RecoveredFile(name: name, path: fullPath, sizeBytes: size,
                                 sourceMetadata: SourceMetadata(filesystem: .fat32, volumeOffset: extent.offset,
-                                    directoryEntryOffset: location, firstCluster: cluster, contiguous: false,
-                                    directoryEntries: lfn.reduce(Data(), +) + entry)))
+                                    recordOffset: location, allocationStart: UInt64(cluster), contiguous: false,
+                                    rawRecord: lfn.reduce(Data(), +) + entry)))
                         }
                     }
                 }
@@ -393,7 +393,7 @@ actor FATVolume {
         try await validateFile(cluster, length: size, contiguous: contiguous, owner: "file:\(location)")
         try await emit(RecoveredFile(name: name, path: fullPath, sizeBytes: size,
              sourceMetadata: SourceMetadata(filesystem: .exfat, volumeOffset: extent.offset,
-                directoryEntryOffset: location, firstCluster: cluster, contiguous: contiguous, directoryEntries: raw)))
+                recordOffset: location, allocationStart: UInt64(cluster), contiguous: contiguous, rawRecord: raw)))
         return nil
     }
 }

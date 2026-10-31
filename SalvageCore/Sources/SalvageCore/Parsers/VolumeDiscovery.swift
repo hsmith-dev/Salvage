@@ -24,7 +24,7 @@ func signed(_ value: UInt64) throws -> Int64 {
     return Int64(value)
 }
 
-struct VolumeExtent: Sendable { let offset: Int64; let length: Int64 }
+struct VolumeExtent: Sendable { let offset: Int64; let length: Int64; var format: VolumeFormat = .fat }
 
 struct VolumeDiscovery {
     let reader: any BlockReader
@@ -47,7 +47,10 @@ struct VolumeDiscovery {
             throw ScanError.malformed("Only devices with 512-byte logical sectors are supported in this version.")
         }
         let boot = try await read(0, 512)
-        if isSupported(boot) { return [VolumeExtent(offset: 0, length: reader.sizeBytes)] }
+        if let format = try await format(at: 0, length: reader.sizeBytes) {
+            guard format.isScannable else { throw ScanError.unsupportedFilesystem }
+            return [VolumeExtent(offset: 0, length: reader.sizeBytes, format: format)]
+        }
         guard try boot.number(510, 2) == 0xaa55 else { throw ScanError.unsupportedFilesystem }
         var extents: [VolumeExtent] = []
         var protective = false
@@ -73,13 +76,24 @@ struct VolumeDiscovery {
         }
         var supported: [VolumeExtent] = []
         for extent in sorted {
-            let boot = try await read(extent.offset, 512)
-            if isSupported(boot) { supported.append(extent) }
+            if let format = try await format(at: extent.offset, length: extent.length), format.isScannable {
+                supported.append(VolumeExtent(offset: extent.offset, length: extent.length, format: format))
+            }
         }
         guard !supported.isEmpty else { throw ScanError.unsupportedFilesystem }
         return supported
     }
-    func isSupported(_ data: Data) -> Bool {
+    /// Identifies a volume by its on-disk signature; the format's own parser validates the rest.
+    func format(at offset: Int64, length: Int64) async throws -> VolumeFormat? {
+        let boot = try await read(offset, 512)
+        if isFAT(boot) { return .fat }
+        if String(decoding: boot[3..<11], as: UTF8.self) == "NTFS    " { return .ntfs }
+        // ext superblock: 1024 bytes into the volume, magic 0xEF53 at superblock offset 56.
+        guard length >= 2048 else { return nil }
+        let superblock = try await read(checkedAdd(offset, 1024), 512)
+        return try superblock.number(56, 2) == 0xef53 ? .ext : nil
+    }
+    func isFAT(_ data: Data) -> Bool {
         guard data.count >= 90 else { return false }
         if String(decoding: data[3..<11], as: UTF8.self) == "EXFAT   " { return true }
         // The FAT label is informational. Identify a FAT32 BPB from its structure; geometry

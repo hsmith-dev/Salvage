@@ -9,7 +9,7 @@ struct ScanViewModelTests {
     @Test func streamsDiscoveriesAndRetainsThemOnError() async {
         let file = RecoveredFile(name: "a.txt", path: "/a.txt", sizeBytes: 1,
                                  sourceMetadata: SourceMetadata(filesystem: .fat32, volumeOffset: 0,
-                                    directoryEntryOffset: 512, firstCluster: 2, contiguous: false, directoryEntries: Data()))
+                                    recordOffset: 512, allocationStart: 2, contiguous: false, rawRecord: Data()))
         let model = ScanViewModel { _, events in
             try await events.send(.progress(bytesScanned: 100, totalBytes: 1024))
             try await events.send(.found(file))
@@ -76,7 +76,7 @@ struct ScanViewModelTests {
         func file(_ volume: Int64) -> RecoveredFile {
             RecoveredFile(name: "same.txt", path: "/same.txt", sizeBytes: 1,
                 sourceMetadata: SourceMetadata(filesystem: .fat32, volumeOffset: volume,
-                    directoryEntryOffset: volume + 512, firstCluster: 2, contiguous: false, directoryEntries: Data()))
+                    recordOffset: volume + 512, allocationStart: 2, contiguous: false, rawRecord: Data()))
         }
         #expect(ScanViewModel.volumeLabels(for: [file(512)]).isEmpty)
         #expect(ScanViewModel.volumeLabels(for: [file(1024), file(512)]) == [512: "Volume 1", 1024: "Volume 2"])

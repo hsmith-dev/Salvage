@@ -27,9 +27,9 @@ public struct ScanSession: Sendable, Identifiable {
             let measured = MeasuredReader(base: reader, extents: extents, total: total, emit: emit, interval: progressInterval, now: now)
             try await emit(.progress(bytesScanned: 0, totalBytes: total))
             for extent in extents {
-                try await FATVolume(reader: measured, extent: extent, emit: { file in
+                try await scanVolume(extent, reader: measured, emit: { file in
                     try await emit(.found(file))
-                }).scan()
+                })
             }
             // Finish a bounded, read-only pass over supported volumes. Progress measures unique
             // source bytes actually read, including metadata; unsupported partitions are skipped.

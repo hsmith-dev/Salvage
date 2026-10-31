@@ -41,27 +41,37 @@ public struct RecoveredFile: Identifiable, Sendable, Equatable {
     public let name: String
     public let path: String
     public let sizeBytes: Int64
+    /// Last-modified time from source metadata; nil when the format or entry doesn't provide one.
+    public let modified: Date?
+    /// True when the source metadata marks the entry deleted (not a live file).
+    public let isDeleted: Bool
     public let sourceMetadata: SourceMetadata
-    public init(id: UUID = UUID(), name: String, path: String, sizeBytes: Int64, sourceMetadata: SourceMetadata) {
+    public init(id: UUID = UUID(), name: String, path: String, sizeBytes: Int64,
+                modified: Date? = nil, isDeleted: Bool = false, sourceMetadata: SourceMetadata) {
         self.id = id; self.name = name; self.path = path; self.sizeBytes = sizeBytes
+        self.modified = modified; self.isDeleted = isDeleted
         self.sourceMetadata = sourceMetadata
     }
 }
 
 public struct SourceMetadata: Sendable, Equatable {
-    public enum Filesystem: String, Sendable { case fat32, exfat }
+    public enum Filesystem: String, Sendable { case fat32, exfat, ntfs, ext }
     public let filesystem: Filesystem
     public let volumeOffset: Int64
-    public let directoryEntryOffset: Int64
-    public let firstCluster: UInt32
+    /// Volume-relative byte offset of the metadata record: FAT/exFAT directory entry, NTFS MFT
+    /// record, or ext inode.
+    public let recordOffset: Int64
+    /// Format-specific allocation anchor: FAT/exFAT first cluster, NTFS MFT record number, or
+    /// ext inode number.
+    public let allocationStart: UInt64
     public let contiguous: Bool
-    /// Original entry bytes preserve timestamps and format-specific fields for later recovery.
-    public let directoryEntries: Data
-    public init(filesystem: Filesystem, volumeOffset: Int64, directoryEntryOffset: Int64,
-                firstCluster: UInt32, contiguous: Bool, directoryEntries: Data) {
+    /// Original record bytes preserve timestamps and format-specific fields for later recovery.
+    public let rawRecord: Data
+    public init(filesystem: Filesystem, volumeOffset: Int64, recordOffset: Int64,
+                allocationStart: UInt64, contiguous: Bool, rawRecord: Data) {
         self.filesystem = filesystem; self.volumeOffset = volumeOffset
-        self.directoryEntryOffset = directoryEntryOffset; self.firstCluster = firstCluster
-        self.contiguous = contiguous; self.directoryEntries = directoryEntries
+        self.recordOffset = recordOffset; self.allocationStart = allocationStart
+        self.contiguous = contiguous; self.rawRecord = rawRecord
     }
 }
 
