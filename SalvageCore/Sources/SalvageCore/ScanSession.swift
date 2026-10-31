@@ -17,15 +17,31 @@ public struct ScanSession: Sendable, Identifiable {
 
     /// The consumer owns a task and passes its continuation to `run`; cancellation therefore
     /// reaches every parser read directly, without an unstructured producer outliving cleanup.
-    public func run(events: AsyncStream<ScanEvent>.Continuation) async {
+    ///
+    /// `pauseGate` suspends the scan between units of work without cancelling it (AD-11).
+    /// `checkpoints` receives a resume point after each sweep unit; use `bufferingNewest(1)`.
+    /// `resumingFrom` re-runs metadata traversal (rebuilding discoveries) but skips sweep bytes the
+    /// checkpoint already covered, counting them as scanned. A checkpoint that does not fit this
+    /// device's volumes is ignored and the scan starts from zero.
+    public func run(events: AsyncStream<ScanEvent>.Continuation, pauseGate: ScanPauseGate? = nil,
+                    checkpoints: AsyncStream<ScanCheckpoint>.Continuation? = nil,
+                    resumingFrom checkpoint: ScanCheckpoint? = nil) async {
         let emit: @Sendable (ScanEvent) async throws -> Void = { try await events.send($0) }
         do {
             try Task.checkCancellation()
             let extents = try await VolumeDiscovery(reader: reader).discover()
             var total: Int64 = 0
             for extent in extents { total = try checkedAdd(total, extent.length) }
-            let measured = MeasuredReader(base: reader, extents: extents, total: total, emit: emit, interval: progressInterval, now: now)
-            try await emit(.progress(bytesScanned: 0, totalBytes: total))
+            let measured = MeasuredReader(base: reader, extents: extents, total: total, emit: emit,
+                                          interval: progressInterval, now: now, gate: pauseGate)
+            let start = checkpoint.flatMap { Self.sweepStart($0, extents: extents, total: total, deviceSize: reader.sizeBytes) }
+            if let start {
+                for (index, extent) in extents.enumerated() where index <= start.volume {
+                    let covered = index < start.volume ? extent.length : start.offset
+                    if covered > 0 { await measured.cover(extent.offset..<(extent.offset + covered)) }
+                }
+            }
+            try await emit(.progress(bytesScanned: await measured.measured, totalBytes: total))
             for extent in extents {
                 try await scanVolume(extent, reader: measured, emit: { file in
                     try await emit(.found(file))
@@ -33,13 +49,18 @@ public struct ScanSession: Sendable, Identifiable {
             }
             // Finish a bounded, read-only pass over supported volumes. Progress measures unique
             // source bytes actually read, including metadata; unsupported partitions are skipped.
-            for extent in extents {
-                var offset: Int64 = 0
+            for (index, extent) in extents.enumerated() {
+                guard index >= (start?.volume ?? 0) else { continue }
+                var offset: Int64 = index == start?.volume ? start?.offset ?? 0 : 0
                 while offset < extent.length {
                     try Task.checkCancellation()
+                    try await pauseGate?.wait()
                     let count = Int(min(1024 * 1024, extent.length - offset))
                     _ = try await measured.read(at: checkedAdd(extent.offset, offset), count: count)
                     offset += Int64(count)
+                    checkpoints?.yield(ScanCheckpoint(deviceSizeBytes: reader.sizeBytes, totalBytes: total,
+                                                      sweepVolumeIndex: index, sweepOffset: offset,
+                                                      bytesScanned: await measured.measured))
                 }
             }
             try Task.checkCancellation()
@@ -49,7 +70,17 @@ public struct ScanSession: Sendable, Identifiable {
         } catch {
             if !Task.isCancelled { try? await emit(.error((error as? ScanError) ?? .io(error.localizedDescription))) }
         }
+        checkpoints?.finish()
         events.finish()
+    }
+
+    /// The sweep position a checkpoint resumes from, or nil when it does not fit this device's layout.
+    static func sweepStart(_ checkpoint: ScanCheckpoint, extents: [VolumeExtent], total: Int64,
+                           deviceSize: Int64) -> (volume: Int, offset: Int64)? {
+        guard checkpoint.isWellFormed, checkpoint.deviceSizeBytes == deviceSize, checkpoint.totalBytes == total,
+              extents.indices.contains(checkpoint.sweepVolumeIndex),
+              checkpoint.sweepOffset <= extents[checkpoint.sweepVolumeIndex].length else { return nil }
+        return (checkpoint.sweepVolumeIndex, checkpoint.sweepOffset)
     }
 }
 
@@ -65,13 +96,17 @@ actor MeasuredReader: BlockReader {
     var ranges: [Range<Int64>] = []
     var lastEmission: Duration
     var measured: Int64 = 0
+    let gate: ScanPauseGate?
     init(base: any BlockReader, extents: [VolumeExtent], total: Int64,
          emit: @escaping @Sendable (ScanEvent) async throws -> Void,
-         interval: Duration, now: @escaping @Sendable () -> Duration) {
+         interval: Duration, now: @escaping @Sendable () -> Duration, gate: ScanPauseGate? = nil) {
         self.base = base; self.sizeBytes = base.sizeBytes; self.extents = extents
         self.total = total; self.emit = emit; self.interval = interval; self.now = now; self.lastEmission = now()
+        self.gate = gate
     }
     func read(at offset: Int64, count: Int) async throws -> Data {
+        // Parsers read only through here, so no source read is issued while paused.
+        try await gate?.wait()
         try Task.checkCancellation()
         let end = try checkedAdd(offset, Int64(count))
         guard extents.contains(where: { offset >= $0.offset && end <= $0.offset + $0.length }) else {

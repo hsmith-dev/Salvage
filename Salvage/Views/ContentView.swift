@@ -5,10 +5,13 @@ import SwiftUI
 /// The composition root is the only place connecting a platform reader to the Core engine.
 struct ContentView: View {
     @State private var scan: ScanViewModel
-    init() { _scan = State(initialValue: ScanViewModel(runner: Self.runScan)) }
-    nonisolated private static func runScan(device: BlockDevice, events: AsyncStream<ScanEvent>.Continuation) async throws {
-        let reader = try await RawBlockReader.prepare(device: device)
-        await ScanSession(reader: reader).run(events: events)
+    init() {
+        _scan = State(initialValue: ScanViewModel(runner: Self.runScan, checkpointStore: .applicationSupport()))
+    }
+    nonisolated private static func runScan(run: ScanRun, events: AsyncStream<ScanEvent>.Continuation) async throws {
+        let reader = try await RawBlockReader.prepare(device: run.device)
+        await ScanSession(reader: reader).run(events: events, pauseGate: run.pauseGate,
+                                              checkpoints: run.checkpoints, resumingFrom: run.resumeFrom)
         await reader.close()
     }
     @State private var showsTrust = false

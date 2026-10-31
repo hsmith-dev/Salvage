@@ -2,7 +2,7 @@
 title: 'Pause, Resume, and Cancel a Scan'
 type: 'feature'
 created: '2026-10-31'
-status: 'ready-for-dev'
+status: 'in-review'
 baseline_commit: 'c1b21a3'
 route: 'dispatch'
 review_loop_iteration: 0
@@ -70,9 +70,9 @@ context:
 
 ## Tasks & Acceptance
 
-- [ ] Core pause gate plus tests: no reads while paused (use a counting reader); resume continues; cancel while paused ends promptly without `.completed`.
-- [ ] Checkpoints plus tests: they advance monotonically; resuming from a mid-sweep checkpoint reaches `.completed` with correct totals and the same discoveries.
-- [ ] App state, persistence and UI plus tests: pause/resume states, ETA excludes paused time, stale checkpoints are discarded, de-duplication works, and the checkpoint is deleted on completion and on cancel.
+- [x] Core pause gate plus tests: no reads while paused (use a counting reader); resume continues; cancel while paused ends promptly without `.completed`.
+- [x] Checkpoints plus tests: they advance monotonically; resuming from a mid-sweep checkpoint reaches `.completed` with correct totals and the same discoveries.
+- [x] App state, persistence and UI plus tests: pause/resume states, ETA excludes paused time, stale checkpoints are discarded, de-duplication works, and the checkpoint is deleted on completion and on cancel.
 
 **Acceptance criteria:**
 - Given an active scan, when the user taps Pause, the scan suspends without cancelling and continues from the same point on Resume.
@@ -86,3 +86,17 @@ context:
 - `./scripts/check-core-boundary.sh`
 - `xcodebuild -project Salvage.xcodeproj -scheme Salvage -configuration Debug -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO -only-testing:SalvageTests test`
 - `xcodebuild -project Salvage.xcodeproj -scheme Salvage -configuration Debug -destination 'platform=macOS' CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO build`
+
+## Implementation Notes
+
+- **Gate is a lock-backed `Sendable` class, not a Swift `actor`.** `ScanPauseGate` (new file `SalvageCore/Sources/SalvageCore/ScanPauseGate.swift`, kept out of `ScanSession.swift` to keep that shared file's diff small) holds its state under an `NSLock`. That makes `pause()`/`resume()` synchronous from the main actor, so rapid Pause/Resume can't reorder across actor hops. It also lets the cancellation handler release a parked waiter without spawning an unstructured `Task` (AD-5). The behavior matches AD-11's "actor-held resumable gate": the same Task suspends and continues, and cancellation wakes a waiter immediately.
+- **API shape.** `ScanSession.run(events:pauseGate:checkpoints:resumingFrom:)` takes all three new parameters as optional, so existing callers are unchanged. The core finishes the checkpoint continuation, and consumers should use `bufferingNewest(1)`. A checkpoint is emitted after every 1 MiB sweep chunk. Metadata traversal emits none, because it is always re-run on resume.
+- **Core re-validates the checkpoint.** Even after the app's checks, `ScanSession` ignores a checkpoint (and scans from zero) unless its version, device size and total bytes match, the volume index exists, and the offset fits that volume.
+- **Device binding.** `ScanCheckpoint` carries `version` and `deviceSizeBytes`. The app's JSON record wraps it with a `formatVersion` and the `mediaIdentity`. A checkpoint is discarded on any mismatch, decode failure or unknown version. Devices without a `mediaIdentity` are never checkpointed. `mediaIdentity` is the IORegistry entry ID, so a checkpoint survives an app relaunch while the device stays attached, but not a re-plug or reboot. That follows "an attached device with the same identity".
+- **"Offer Resume" UX.** Choosing a device that has a valid checkpoint moves the model to a new `.resumable` state instead of starting. `ScanProgressView` then shows "Resume scan" (the default action) and "Start over". This needed no change to `DeviceListView` or to `ContentView`'s other code.
+- **Write throttling.** Checkpoints are persisted at most once per second, plus immediately on Pause, to avoid a disk write per MiB. A crash can lose up to about 1 s of sweep progress.
+- **Checkpoint deletion.** The checkpoint is deleted on every terminal outcome: completed, cancelled and failed. Only a quit or crash mid-scan leaves one behind. The existing `ContentView.onDisappear { scan.cancel() }` (which this story may not edit) means closing the window mid-scan counts as a cancel and discards the checkpoint. On Cmd-Q the process exits before that async cleanup runs, so the checkpoint survives.
+- **Time accounting.** Paused time is excluded from both the displayed elapsed time and the ETA. A resumed scan measures its rate from bytes read since resuming, because the checkpoint's bytes count as scanned but took no time in this run. While paused, Remaining shows "Paused".
+- **De-duplication key.** The key is `(volumeOffset, directoryEntryOffset)`, which is the current `SourceMetadata` record offset.
+- **Project file.** `Salvage.xcodeproj` was regenerated with `xcodegen generate` so it picks up `ScanCheckpointStore.swift`. The project diff is 4 lines.
+- **Not verified.** Real-device pause and resume is unverified, still pending Story 1.2's FDA-granted hardware check. All tests use synthetic images or injected runners.

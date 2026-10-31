@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		0062F4592C4C75593540D448 /* ScanProgressView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B06FDFC018E70AED252E2AD4 /* ScanProgressView.swift */; };
 		13470E4C7A849C2924C5A455 /* SalvageDiskIO in Frameworks */ = {isa = PBXBuildFile; productRef = CA3B2287E3126452573584A3 /* SalvageDiskIO */; };
+		141EC4A99902299F276C46AF /* ScanCheckpointStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A823EAB151C49C3DEBC69CF6 /* ScanCheckpointStore.swift */; };
 		4E4930C119561323B128C398 /* DeviceListViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99D08CCB19B88001DA0D7837 /* DeviceListViewModel.swift */; };
 		52354930675517AFF3E449A9 /* UpdateCheckerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F798DD8A6F1B8EF9E72517BA /* UpdateCheckerTests.swift */; };
 		59D8A403E40711D298D4493F /* ScanViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D688D515CDA1F3D3D907DEB /* ScanViewModelTests.swift */; };
@@ -44,6 +45,7 @@
 		98C64227FE351987F85FA819 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		99D08CCB19B88001DA0D7837 /* DeviceListViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceListViewModel.swift; sourceTree = "<group>"; };
 		A242CDC4F6EB012427768849 /* UpdateCommands.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateCommands.swift; sourceTree = "<group>"; };
+		A823EAB151C49C3DEBC69CF6 /* ScanCheckpointStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScanCheckpointStore.swift; sourceTree = "<group>"; };
 		B06FDFC018E70AED252E2AD4 /* ScanProgressView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScanProgressView.swift; sourceTree = "<group>"; };
 		B0933542F4F7159EED639D23 /* SalvageDiskIO */ = {isa = PBXFileReference; lastKnownFileType = folder; name = SalvageDiskIO; path = SalvageDiskIO; sourceTree = SOURCE_ROOT; };
 		B1DE755CB1D6209CEB18BBAE /* SalvageApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SalvageApp.swift; sourceTree = "<group>"; };
@@ -129,6 +131,7 @@
 			isa = PBXGroup;
 			children = (
 				99D08CCB19B88001DA0D7837 /* DeviceListViewModel.swift */,
+				A823EAB151C49C3DEBC69CF6 /* ScanCheckpointStore.swift */,
 				F4CD440ACD4B335303928637 /* ScanViewModel.swift */,
 			);
 			path = ViewModels;
@@ -245,6 +248,7 @@
 				82973B300A3833E3A4CAE166 /* DeviceListView.swift in Sources */,
 				4E4930C119561323B128C398 /* DeviceListViewModel.swift in Sources */,
 				83D05F08C8BEEF5CD38636E0 /* SalvageApp.swift in Sources */,
+				141EC4A99902299F276C46AF /* ScanCheckpointStore.swift in Sources */,
 				0062F4592C4C75593540D448 /* ScanProgressView.swift in Sources */,
 				6BEE060426D0E80E24AF664C /* ScanViewModel.swift in Sources */,
 				680844754611EBBCB5945B3F /* TrustPanelView.swift in Sources */,
