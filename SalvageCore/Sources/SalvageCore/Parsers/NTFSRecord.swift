@@ -99,6 +99,11 @@ struct NTFSDataStream {
     let initialized: Int64
     let runs: [NTFSRun]
     let residentValue: Data?
+    /// The attribute header's flags (compression mask 0x00FF, encrypted 0x4000, sparse 0x8000).
+    var attributeFlags: UInt16 = 0
+
+    /// Compressed or encrypted bytes on disk aren't the file's bytes, so they can't be mapped as-is.
+    var isCompressedOrEncrypted: Bool { attributeFlags & 0x40ff != 0 }
 }
 
 struct NTFSFileName {
@@ -179,15 +184,19 @@ struct NTFSRecord {
                 fileNames += 1
                 if let name = try Self.fileName(Self.residentValue(a, nonResident)) { names.append(name) }
             case 0x80 where nameLength == 0:
+                let attributeFlags = UInt16(try a.number(0x0c, 2))
                 if nonResident {
                     let startVCN = try a.number(0x10, 8)
                     guard startVCN == 0 else { dataInExtensions = true; break }
                     guard data == nil else { throw ScanError.malformed("Duplicate NTFS $DATA.") }
-                    if let stream = try Self.nonResidentStream(a, geometry: g) { data = stream } else { dataInExtensions = true }
+                    if var stream = try Self.nonResidentStream(a, geometry: g) {
+                        stream.attributeFlags = attributeFlags; data = stream
+                    } else { dataInExtensions = true }
                 } else {
                     guard data == nil else { throw ScanError.malformed("Duplicate NTFS $DATA.") }
                     let value = try Self.residentValue(a, false)
-                    data = NTFSDataStream(size: Int64(value.count), initialized: Int64(value.count), runs: [], residentValue: value)
+                    data = NTFSDataStream(size: Int64(value.count), initialized: Int64(value.count), runs: [], residentValue: value,
+                                          attributeFlags: attributeFlags)
                 }
             case 0x90:
                 indexRoot = true

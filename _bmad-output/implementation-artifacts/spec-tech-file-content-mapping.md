@@ -58,3 +58,11 @@ This work is split across three agents, one per section below. Each agent edits 
 
 - `swift test --package-path SalvageCore`
 - `./scripts/check-core-boundary.sh`
+
+## Implementation Notes
+
+- NTFS: Runs are truncated at the stream's initialized size, so a fully initialized file's runs sum to exactly `sizeBytes` (not the cluster-rounded allocation). When initialized < real size, a single trailing hole of `size - initialized` follows; stale bytes in allocated-but-uninitialized clusters are never read.
+- NTFS: "Compressed" is tested with the full compression mask (0x00FF), not only 0x0001, plus encrypted (0x4000). Sparse-only streams (0x8000) are mapped, with sparse runs as holes.
+- NTFS: Any record carrying `$ATTRIBUTE_LIST` is `.unmapped`, even when its unnamed `$DATA` is complete in the base record (files whose `$DATA` continues in extension records were already skipped).
+- NTFS: Resident `$DATA` is `.resident(value)` for live and deleted files alike; a size-0 resident stream is `.resident(Data())`, a size-0 non-resident stream is `.runs([])`.
+- NTFS: Attribute flags are read only for the unnamed `$DATA` and carried on `NTFSDataStream.attributeFlags` (defaulted, so other constructions are unchanged). Coalescing (adjacent placed runs and consecutive holes) is a private static helper in `NTFSVolume`.
