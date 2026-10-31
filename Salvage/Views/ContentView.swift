@@ -12,7 +12,7 @@ struct ContentView: View {
         let reader = try await RawBlockReader.prepare(device: run.device)
         await ScanSession(reader: reader).run(events: events, pauseGate: run.pauseGate,
                                               checkpoints: run.checkpoints, resumingFrom: run.resumeFrom)
-        await reader.close()
+        await run.keepSource(SourceSession(device: run.device, reader: reader, close: { await reader.close() }))
     }
     @State private var showsTrust = false
     var body: some View {

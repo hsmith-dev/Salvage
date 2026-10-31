@@ -557,3 +557,35 @@ private actor AttemptProbe {
     var count = 0
     func next() -> Int { count += 1; return count }
 }
+
+@MainActor @Suite("Source session lifecycle")
+struct SourceSessionLifecycleTests {
+    let device = BlockDevice(bsdName: "disk42", displayName: "Fixture", sizeBytes: 1024, isInternal: false, isBootVolume: false)
+    struct EmptyReader: BlockReader {
+        var sizeBytes: Int64 { 1024 }
+        func read(at offset: Int64, count: Int) async throws -> Data { Data(count: count) }
+    }
+    @Test func sourceIsKeptAfterScanAndClosedBeforeTheNextScanAndOnTeardown() async {
+        let closes = CloseCounter()
+        let model = ScanViewModel { run, events in
+            try await events.send(.progress(bytesScanned: 1024, totalBytes: 1024))
+            try await events.send(.completed)
+            await run.keepSource(SourceSession(device: run.device, reader: EmptyReader(), close: { await closes.close() }))
+        }
+        model.start(device)
+        while model.isActive { await Task.yield() }
+        #expect(model.state == .completed && model.source != nil)
+        #expect(await closes.count == 0)
+        model.start(device)
+        while model.isActive { await Task.yield() }
+        #expect(await closes.count == 1 && model.source != nil)
+        model.stopForTeardown()
+        #expect(model.source == nil)
+        while await closes.count < 2 { await Task.yield() }
+        #expect(await closes.count == 2)
+    }
+}
+private actor CloseCounter {
+    var count = 0
+    func close() { count += 1 }
+}

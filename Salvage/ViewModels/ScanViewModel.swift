@@ -9,6 +9,8 @@ struct ScanRun: Sendable {
     let pauseGate: ScanPauseGate
     let checkpoints: AsyncStream<ScanCheckpoint>.Continuation
     let resumeFrom: ScanCheckpoint?
+    /// Hands the still-open source reader to the view model when the scan ends, for preview and recovery.
+    let keepSource: @Sendable (SourceSession) async -> Void
 }
 
 @MainActor @Observable
@@ -41,6 +43,8 @@ final class ScanViewModel {
     private(set) var canRetryFromCheckpoint = false
     /// The newest checkpoint received from the running scan (exposed for tests).
     private(set) var latestCheckpoint: ScanCheckpoint?
+    /// The scanned device's open read-only session, kept after the scan for preview and recovery.
+    private(set) var source: SourceSession?
     private var task: Task<Void, Never>?
     private var gate: ScanPauseGate?
     private var scanningStartedAt: Date?
@@ -109,6 +113,7 @@ final class ScanViewModel {
     /// Window teardown. Cancels the scan's Task like `cancel()`, but writes the latest checkpoint
     /// first and keeps it, so the interrupted scan can be resumed later.
     func stopForTeardown() {
+        releaseSource()
         guard let task else { return }
         if stopReason == nil { stopReason = .teardown }
         persistLatestCheckpoint()
@@ -123,16 +128,35 @@ final class ScanViewModel {
         requestedResume = false; stopReason = nil
     }
 
+    /// Closes the kept source session (e.g. leaving results, or before scanning again).
+    func releaseSource() {
+        guard let source else { return }
+        self.source = nil
+        Task { await source.close() }
+    }
+
+    private func adopt(_ session: SourceSession) async {
+        if stopReason == .teardown { await session.close(); return }
+        let previous = source
+        source = session
+        await previous?.close()
+    }
+
     private func begin(_ device: BlockDevice, from checkpoint: ScanCheckpoint?) {
+        // The previous device session must be released before a new scan reserves a device.
+        let previous = source
+        source = nil
         reset(for: device)
         requestedResume = checkpoint != nil
         startedAt = now(); state = .preparing; isActive = true
         let gate = ScanPauseGate()
         self.gate = gate
         task = Task { [runner] in
+            await previous?.close()
             let (stream, continuation) = AsyncStream<ScanEvent>.makeStream(bufferingPolicy: .bufferingOldest(64))
             let (checkpointStream, checkpoints) = AsyncStream<ScanCheckpoint>.makeStream(bufferingPolicy: .bufferingNewest(1))
-            let run = ScanRun(device: device, pauseGate: gate, checkpoints: checkpoints, resumeFrom: checkpoint)
+            let run = ScanRun(device: device, pauseGate: gate, checkpoints: checkpoints, resumeFrom: checkpoint,
+                              keepSource: { session in await self.adopt(session) })
             var completed = false
             await withTaskGroup(of: Void.self) { group in
                 group.addTask {

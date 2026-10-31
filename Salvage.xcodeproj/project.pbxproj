@@ -14,6 +14,7 @@
 		52354930675517AFF3E449A9 /* UpdateCheckerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F798DD8A6F1B8EF9E72517BA /* UpdateCheckerTests.swift */; };
 		59D8A403E40711D298D4493F /* ScanViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D688D515CDA1F3D3D907DEB /* ScanViewModelTests.swift */; };
 		680844754611EBBCB5945B3F /* TrustPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71F3E757E68865FD5D2FA447 /* TrustPanelView.swift */; };
+		6A926703E084480718248DBB /* SourceSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 033C52D0FB3387397999220A /* SourceSession.swift */; };
 		6B72BE7198AFA1AD22773D13 /* UpdateChecker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A78CB2252556649B9DABE08 /* UpdateChecker.swift */; };
 		6BEE060426D0E80E24AF664C /* ScanViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4CD440ACD4B335303928637 /* ScanViewModel.swift */; };
 		82973B300A3833E3A4CAE166 /* DeviceListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200C8811715FB24AA7CA8091 /* DeviceListView.swift */; };
@@ -37,6 +38,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		033C52D0FB3387397999220A /* SourceSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SourceSession.swift; sourceTree = "<group>"; };
 		0A4FDEF94C4B425FCAF71692 /* SalvageCore */ = {isa = PBXFileReference; lastKnownFileType = folder; name = SalvageCore; path = SalvageCore; sourceTree = SOURCE_ROOT; };
 		200C8811715FB24AA7CA8091 /* DeviceListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceListView.swift; sourceTree = "<group>"; };
 		3A78CB2252556649B9DABE08 /* UpdateChecker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateChecker.swift; sourceTree = "<group>"; };
@@ -133,6 +135,7 @@
 				99D08CCB19B88001DA0D7837 /* DeviceListViewModel.swift */,
 				A823EAB151C49C3DEBC69CF6 /* ScanCheckpointStore.swift */,
 				F4CD440ACD4B335303928637 /* ScanViewModel.swift */,
+				033C52D0FB3387397999220A /* SourceSession.swift */,
 			);
 			path = ViewModels;
 			sourceTree = "<group>";
@@ -251,6 +254,7 @@
 				141EC4A99902299F276C46AF /* ScanCheckpointStore.swift in Sources */,
 				0062F4592C4C75593540D448 /* ScanProgressView.swift in Sources */,
 				6BEE060426D0E80E24AF664C /* ScanViewModel.swift in Sources */,
+				6A926703E084480718248DBB /* SourceSession.swift in Sources */,
 				680844754611EBBCB5945B3F /* TrustPanelView.swift in Sources */,
 				6B72BE7198AFA1AD22773D13 /* UpdateChecker.swift in Sources */,
 				852D2C18EBC9D9A45C4D231C /* UpdateCommands.swift in Sources */,
