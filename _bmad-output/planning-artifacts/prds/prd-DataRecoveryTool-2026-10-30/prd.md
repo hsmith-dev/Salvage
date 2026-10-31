@@ -297,7 +297,10 @@ App includes a plain-language, in-app explanation of exactly what it reads from 
 1. **~~Product name~~ — RESOLVED.** Salvage.
 2. **~~License~~ — RESOLVED.** MIT.
 3. **~~Who funds the $99/yr Apple Developer Program fee~~ — RESOLVED.** Developer ID signing/notarization is already available under HSmithDev LLC.
-4. **Exact Full Disk Access / SIP entitlement mechanics** for raw `/dev/diskN` access were not independently confirmed during research (Open Questions 9 and 10, formerly grouped with this one, are now resolved — see below). Still needs a hands-on technical spike before implementation begins — current working assumption (FDA + Developer ID signing suffices, matching competitors) remains unverified, and the spike should also confirm whether Apple's newer FSKit framework (macOS 15.4+) has any bearing on this, per `ARCHITECTURE-SPINE.md`'s Deferred section.
+4. ~~Exact Full Disk Access / SIP entitlement mechanics~~ **Resolved 2026-10-31 (Architecture AD-13).**
+   - Physical-drive raw nodes are root-owned, so a normal app can't open them, with or without Full Disk Access. Salvage uses a user-approved, read-only privileged helper (Story 1.12).
+   - User-owned devices, such as attached disk images, need neither Full Disk Access nor the helper.
+   - The working assumption that Full Disk Access plus Developer ID signing would be enough was wrong.
 5. **Minimum supported macOS version.** Not yet set `[ASSUMPTION: macOS 14 Sonoma or later, pending confirmation against real target-user OS distribution]`.
 6. **Should a command-line interface accompany the GUI** (TestDisk/PhotoRec-style, for power users or scripting)? Not decided.
 7. **Recovery-confidence scoring methodology.** FR-12 requires a conservative, honest scoring approach, but the concrete algorithm (what evidence maps to High/Medium/Low) needs to be defined during Architecture or UX — a label invented ad hoc risks violating SM-C1.

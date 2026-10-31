@@ -107,6 +107,19 @@ graph TD
 - **Prevents:** a contributor adding a stray network call anywhere outside the one sanctioned path — exactly the scenario PRD counter-metric SM-C3 warns against, and the product's single most reputation-critical guarantee alongside FR-15.
 - **Rule:** CI fails the build if any network-capable API (`URLSession`, `Network.framework`, raw sockets) is referenced anywhere in the codebase except one explicitly designated file in the `Salvage` app target implementing the manual "Check for Updates" action (FR-17). No exceptions elsewhere, including `SalvageCore` and `SalvageDiskIO`, where none should ever be needed.
 
+### AD-13 — Raw access to physical drives goes through a privileged read-only helper
+
+- **Binds:** FR-1, FR-2, FR-15
+- **Prevents:** a shipping app that can read user-owned disk images but no real drive. It also prevents the opposite failure: a root helper broad enough to break the read-only guarantee.
+- **Evidence (spike, 2026-10-31):** physical-disk raw nodes (`/dev/rdiskN`) are `root:operator 0640`, and a normal user isn't in `operator`. Opening one fails with EACCES before any TCC or Full Disk Access check applies. A disk image the user attaches is owned by that user and opens without Full Disk Access. Real exFAT and FAT32 images created by macOS were scanned end to end through `ScanSession`, and live and deleted files were found with the right names, paths, sizes and timestamps.
+- **Rule:**
+  - Salvage ships a small privileged helper: a launchd daemon registered with `SMAppService.daemon`, which the user approves once in System Settings.
+  - The helper exposes exactly one operation over an authenticated XPC connection: open a validated whole-disk `/dev/rdiskN` with `O_RDONLY`, then pass the file descriptor to the app.
+  - It re-applies the same boot-disk refusal and whole-disk name validation as `SalvageDiskIO` (AD-4). It verifies the caller's code signature: same Team ID and bundle ID.
+  - It never writes, never mounts, has no network access and runs no other command.
+  - All parsing stays in the unprivileged app. A user-owned device (such as an attached disk image) is opened directly, without the helper.
+  - The helper is SalvageDiskIO territory: the app never talks to the helper's XPC service except through `RawBlockReader`.
+
 ## Consistency Conventions
 
 | Concern | Convention |
@@ -174,7 +187,7 @@ A `ScanSession` targets either a whole `BlockDevice` (normal scan, which discove
 
 - **CLI companion** (PRD Open Question 6) — architecture already supports it for free (Core/DiskIO have no SwiftUI dependency), but no CLI target is built in v1.
 - **Linux/Windows DiskIO adapters** — `BlockReader` is designed for this; no second adapter exists yet (v1 is macOS-only per PRD Non-Goals).
-- **Exact FDA/TCC requirement at the raw-device level** (PRD Open Question 4) — not confirmed by research (only a vendor help page claims it, no Apple source does); needs a hands-on spike before this becomes an AD. **Fold into the same spike:** whether Apple's newer FSKit framework (shipped macOS 15.4 beta, 2025) is relevant to Salvage's read-only raw-access need, or whether it targets implementing new filesystem types rather than reading existing ones at the block level (current working read, not yet confirmed) — AD-4's DiskArbitration choice should be revisited only if the spike finds otherwise.
+- **Exact FDA/TCC requirement at the raw-device level:** *resolved 2026-10-31 by spike, see AD-13.* POSIX ownership (`root:operator`), not TCC, is the first gate for physical drives. Whether TCC additionally gates a root helper's raw open is to be confirmed when the helper is first built (Story 1.12). FSKit targets implementing filesystems, not raw block reads, and is not used.
 - **Live read path for the running boot volume** (v2+, see AD-4's boot-volume exception) — a weaker read-only guarantee than the unmount-based path, needing its own FR-19 disclosure; not built in v1.
 - **Medium vs. Low confidence boundary beyond the binary floor** (part of PRD Open Question 7) — left to `SalvageCore`'s implementation once AD-7's function exists and real carved-file test cases inform it.
 - **Initial carving signature set** (PRD Open Question 8) — which formats ship in v1's `Signatures/*.json` is a content decision for implementation, not an architectural one.

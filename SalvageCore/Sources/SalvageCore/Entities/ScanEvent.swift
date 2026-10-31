@@ -46,12 +46,33 @@ public struct RecoveredFile: Identifiable, Sendable, Equatable {
     /// True when the source metadata marks the entry deleted (not a live file).
     public let isDeleted: Bool
     public let sourceMetadata: SourceMetadata
+    /// Where the file's bytes live, in file order. Empty with `residentData == nil` means the
+    /// parser couldn't map the contents; preview and recovery must treat it as unavailable.
+    public let content: FileContent
     public init(id: UUID = UUID(), name: String, path: String, sizeBytes: Int64,
-                modified: Date? = nil, isDeleted: Bool = false, sourceMetadata: SourceMetadata) {
+                modified: Date? = nil, isDeleted: Bool = false, sourceMetadata: SourceMetadata,
+                content: FileContent = .unmapped) {
         self.id = id; self.name = name; self.path = path; self.sizeBytes = sizeBytes
         self.modified = modified; self.isDeleted = isDeleted
-        self.sourceMetadata = sourceMetadata
+        self.sourceMetadata = sourceMetadata; self.content = content
     }
+}
+
+/// A contiguous piece of file data in file order. `deviceOffset == nil` is a sparse hole that
+/// reads as zeros.
+public struct DataRun: Sendable, Equatable {
+    public let deviceOffset: Int64?
+    public let length: Int64
+    public init(deviceOffset: Int64?, length: Int64) { self.deviceOffset = deviceOffset; self.length = length }
+}
+
+public enum FileContent: Sendable, Equatable {
+    /// The parser didn't (or couldn't) map this file's bytes.
+    case unmapped
+    /// Bytes stored inside the metadata record itself (e.g. NTFS resident `$DATA`).
+    case resident(Data)
+    /// Device-absolute runs covering at least `sizeBytes` in file order; reads stop at `sizeBytes`.
+    case runs([DataRun])
 }
 
 public struct SourceMetadata: Sendable, Equatable {

@@ -98,7 +98,27 @@ FR-19: Epic 1 - In-app transparency statement
 A user can scan a USB drive, SD card, or external drive formatted FAT32 or exFAT, watch live progress, browse results bucketed by file type with an honest recovery-confidence indicator, preview files before committing, and recover selected files to a destination of their choice — all while being able to verify, not just trust, that the app made zero network calls and did nothing it didn't disclose. This epic also stands up the project's foundation: the three-module scaffold (`SalvageCore`/`SalvageDiskIO`/`Salvage`), CI-enforced module and network boundaries (AD-9, AD-12), the scan event protocol (AD-11), destination-safety enforcement (AD-8), and the signed/notarized release pipeline (AD-10) needed to ship anything at all. The Full Disk Access/SIP entitlement spike (PRD Open Question 4) runs early here, since the raw-read path every later epic depends on rests on its answer.
 **FRs covered:** FR-1, FR-2, FR-3, FR-4, FR-5 (FAT32/exFAT), FR-11, FR-12, FR-13, FR-14, FR-15, FR-16, FR-17, FR-18, FR-19
 
-### Epic 2: Recover from Mac-Native Drives, Including Encrypted Ones
+#### Story 1.12: Read Physical Drives via a Read-Only Privileged Helper
+
+As a user,
+I want Salvage to scan my real USB drives and SD cards, not just disk images,
+So that I can recover files from the media I actually lost them on.
+
+**Acceptance Criteria:**
+
+**Given** a physical removable drive whose raw node is root-owned
+**When** I select it and approve Salvage's helper once in System Settings
+**Then** the scan proceeds, reading the drive read-only, without my running anything as root
+
+**Given** the helper
+**When** any caller other than a validly signed Salvage app connects, or any non-whole-disk or boot-disk target is requested
+**Then** the request is refused
+
+**Given** I haven't approved the helper
+**When** I select a physical drive
+**Then** the app explains in plain language how to approve it and offers to open the right System Settings pane, and user-owned devices still scan without it
+
+## Epic 2: Recover from Mac-Native Drives, Including Encrypted Ones
 A user can scan and recover from APFS- or HFS+-formatted drives — internal (non-boot) and external — including FileVault-encrypted volumes, unlocked safely via `diskutil apfs unlockVolume -nomount` with credentials held only transiently, and with the same confidence-indicator and recovery flow Epic 1 established. This is where the project's single biggest engineering risk lives: an original, MIT-licensed, from-scratch APFS parser (AD-2, still flagged `[ASSUMPTION]` pending explicit confirmation). A timeboxed technical spike against a read-only, unencrypted APFS volume is recommended before committing to full-epic scope.
 **FRs covered:** FR-5 (APFS/HFS+), FR-6
 
