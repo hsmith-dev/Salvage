@@ -2,7 +2,7 @@
 title: 'Map Discovered Files to Their On-Disk Bytes (FAT, NTFS, EXT)'
 type: 'tech'
 created: '2026-10-31'
-status: 'ready-for-dev'
+status: 'done'
 baseline_commit: '0654e86'
 route: 'dispatch'
 context:

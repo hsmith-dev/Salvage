@@ -2,7 +2,7 @@
 title: 'Browse Results by File Type, with the Recovery-Confidence Indicator (Stories 1.7 + 1.8)'
 type: 'feature'
 created: '2026-10-31'
-status: 'review'
+status: 'done'
 baseline_commit: '0654e86'
 route: 'dispatch'
 context:

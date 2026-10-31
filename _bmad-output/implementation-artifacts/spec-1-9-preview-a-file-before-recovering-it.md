@@ -2,7 +2,7 @@
 title: 'Preview a File Before Recovering It'
 type: 'feature'
 created: '2026-10-31'
-status: 'ready-for-dev'
+status: 'done'
 baseline_commit: '0654e86'
 route: 'dispatch'
 context:

@@ -20,3 +20,10 @@
 - source_spec: `spec-1-3-select-and-list-scan-target-devices.md`
   summary: Direct tests for DiskWatchRegistration start/stop (DAUnregisterCallback context matching) and for List deselection clearing the selection.
   evidence: Verification-gap review. Both fixes are in the code but have no direct tests: `DeviceWatcherTests` never reaches `DASessionCreate`, and the SwiftUI `List` nil-selection path can't be driven from Swift Testing. Needs a DA-session seam or a UI test target.
+
+- source_spec: `spec-1-12-read-physical-drives-via-a-read-only-privileged-helper.md`
+  summary: Run the signed end-to-end check of the privileged helper, and add a release.yml check that the bundled plist's SpawnConstraint team-identifier matches the app's team.
+  evidence: The helper and its hardening are unit-tested only. Still unverified on a live launchd: Developer ID-only caller enforcement, that launchd accepts SpawnConstraint for an SMAppService daemon, idle exit, and whether TCC also gates a root helper's raw open of removable media (the open question in AD-13). The manual steps are in the spec's Implementation Notes. This needs a Developer ID build signed with the team and the user's approval, on the user's machine.
+- source_spec: `spec-1-7-1-8-browse-results-and-confidence.md`
+  summary: Hands-on UI pass of scan → browse → preview → recover in the running app (keyboard shortcuts, Cmd-A precedence, pane layout).
+  evidence: Every flow is unit-tested, and the app launches with 0 network sockets, but computer use wasn't available to drive the UI. The core path was validated headlessly on real macOS-created exFAT/FAT32 images: live and deleted files were recovered byte-identical.
