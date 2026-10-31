@@ -1,0 +1,64 @@
+# STATUS DEFINITIONS:
+# ==================
+# Epic Status:
+#   - backlog: Epic not yet started
+#   - in-progress: Epic actively being worked on
+#   - done: All stories in epic completed
+
+# Story Status:
+#   - backlog: Story only exists in epic file
+#   - ready-for-dev: Story file created, ready for development
+#   - in-progress: Developer actively working on implementation
+#   - review: Implementation complete, ready for review
+#   - done: Story completed
+
+# Retrospective Status:
+#   - optional: Can be completed but not required
+#   - done: Retrospective has been completed
+
+# Action Item Status:
+#   - open: Committed during a retrospective, not yet addressed
+#   - in-progress: Actively being worked on
+#   - done: Completed
+
+# WORKFLOW NOTES:
+# ===============
+# - Epic transitions to 'in-progress' automatically when its first story starts (via build's sprint sync)
+# - Stories can be worked in parallel if team capacity allows
+# - Developer typically creates the next story after the previous one is 'done' to incorporate learnings
+# - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
+# - Retrospective appends its action items to action_items; the status view surfaces open ones
+generated: 10-31-2026 09:25
+last_updated: 10-31-2026 09:25
+project: Salvage
+project_key: NOKEY
+tracking_system: file-system
+story_location: _bmad-output/implementation-artifacts
+development_status:
+  epic-1: backlog
+  1-1-project-foundation-trustworthy-module-scaffold: backlog
+  1-2-full-disk-access-raw-device-access-spike: backlog
+  1-3-select-and-list-scan-target-devices: backlog
+  1-4-scan-a-fat32-exfat-device-with-live-progress: backlog
+  1-5-pause-resume-and-cancel-a-scan: backlog
+  1-6-recover-deleted-files-via-intact-metadata: backlog
+  1-7-browse-results-by-file-type: backlog
+  1-8-see-and-trust-the-recovery-confidence-indicator: backlog
+  1-9-preview-a-file-before-recovering-it: backlog
+  1-10-recover-selected-files-to-a-safe-destination: backlog
+  1-11-verify-the-app-s-privacy-guarantees-yourself: backlog
+  epic-1-retrospective: optional
+
+  epic-2: backlog
+  2-1-apfs-parsing-strategy-spike: backlog
+  2-2-scan-and-recover-deleted-files-from-an-apfs-drive: backlog
+  2-3-scan-and-recover-deleted-files-from-an-hfs-drive: backlog
+  2-4-unlock-and-recover-from-a-filevault-encrypted-volume: backlog
+  epic-2-retrospective: optional
+
+  epic-3: backlog
+  3-1-carve-files-from-raw-bytes-when-metadata-is-gone: backlog
+  3-2-organize-reconstructed-files-sensibly: backlog
+  3-3-discover-a-lost-partition: backlog
+  3-4-recover-files-from-a-lost-partition: backlog
+  epic-3-retrospective: optional
