@@ -1,0 +1,64 @@
+# xcodegen spec for Salvage.xcodeproj.
+#
+# Salvage.xcodeproj is committed alongside this file so CI and contributors without xcodegen
+# installed can build directly; this file is the source of truth to regenerate it after
+# structural changes (new files, new targets, new local packages) via `xcodegen generate`.
+#
+# Per spec-1-1's Resolved Decisions: DEVELOPMENT_TEAM is deliberately left unset here. Locally,
+# pick a team in Xcode's Signing & Capabilities tab (the team picker, backed by the signed-in
+# Apple ID) -- never hardcode a Team ID string in this file. In CI, DEVELOPMENT_TEAM is supplied
+# as a secret/variable at build time instead (see .github/workflows/release.yml).
+name: Salvage
+
+options:
+  bundleIdPrefix: dev.hsmith
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+
+packages:
+  SalvageCore:
+    path: SalvageCore
+  SalvageDiskIO:
+    path: SalvageDiskIO
+
+targets:
+  Salvage:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Salvage
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.hsmith.Salvage
+        PRODUCT_NAME: Salvage
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+        ENABLE_HARDENED_RUNTIME: YES
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSHumanReadableCopyright: ""
+        CODE_SIGN_STYLE: Automatic
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+    dependencies:
+      - package: SalvageCore
+        product: SalvageCore
+      - package: SalvageDiskIO
+        product: SalvageDiskIO
+
+schemes:
+  Salvage:
+    build:
+      targets:
+        Salvage: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - package: SalvageCore/SalvageCoreTests
+        - package: SalvageDiskIO/SalvageDiskIOTests
+    archive:
+      config: Release

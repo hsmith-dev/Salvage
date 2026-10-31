@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-check:
+    name: Build & Enforce Module Boundaries
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Pin the Xcode/toolchain version explicitly rather than relying on macos-latest's
+      # ever-changing default Xcode, so the build toolchain can't silently drift when GitHub
+      # rotates the runner image. Bump this version deliberately when the project's actual
+      # minimum Xcode requirement changes.
+      - name: Select Xcode version
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16.0'
+
+      - name: Show toolchain versions
+        run: |
+          swift --version
+          xcodebuild -version
+
+      # Architecture AD-9: the Core/DiskIO import boundary is CI-enforced, not just reviewed.
+      # Runs before any build so a policy violation that would still compile (e.g. `import
+      # SwiftUI` inside SalvageCore compiles fine on macOS) is caught and named explicitly,
+      # independent of build success.
+      - name: Enforce Core/DiskIO module boundary (AD-9)
+        run: ./scripts/check-core-boundary.sh
+
+      - name: Test the boundary checker itself (violation detection)
+        run: ./scripts/test-check-core-boundary.sh
+
+      - name: Test the release-secrets checker itself
+        run: ./scripts/test-check-release-secrets.sh
+
+      - name: Build SalvageCore (swift build)
+        run: swift build --package-path SalvageCore
+
+      - name: Build SalvageDiskIO (swift build)
+        run: swift build --package-path SalvageDiskIO
+
+      - name: Run SalvageCore tests
+        run: swift test --package-path SalvageCore
+
+      - name: Run SalvageDiskIO tests
+        run: swift test --package-path SalvageDiskIO
+
+      # Unsigned debug build: CI has no Developer ID identity/team configured (see release.yml
+      # for the signed/notarized release pipeline), so signing is explicitly disabled here.
+      - name: Build Salvage app (xcodebuild)
+        run: |
+          xcodebuild \
+            -project Salvage.xcodeproj \
+            -scheme Salvage \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
