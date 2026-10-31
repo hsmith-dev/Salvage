@@ -67,7 +67,7 @@ context:
 - [x] `scripts/test-check-core-boundary.sh` -- automated, repeatable coverage for the boundary checker's violation-detection paths (added during review: the I/O matrix's forbidden-import rows had only ad hoc manual verification, not a committed test) -- wired into `ci.yml`
 - [x] `.github/workflows/ci.yml` -- builds all three targets and invokes `check-core-boundary.sh` (and now `test-check-core-boundary.sh`) on every push/PR -- CI entry point
 - [x] `.github/workflows/release.yml` -- on version-tag push: build, sign with Developer ID, notarize via `notarytool`, publish to GitHub Releases with SHA-256 checksums -- implements AD-10, wired to secret names per Resolved decisions
-- [ ] GitHub repo `hsmith-dev/Salvage`, public -- **not part of this task's implementation scope** (no push/remote ops during implementation); created and pushed by the orchestrating session after this story's local build and review pass, per Resolved decisions
+- [x] GitHub repo `hsmith-dev/Salvage`, public -- created and pushed by the orchestrating session after local build/review passed; live at https://github.com/hsmith-dev/Salvage
 
 **Acceptance Criteria:**
 - Given a fresh checkout, when `swift build` runs in `SalvageCore/`, then it builds with zero non-Foundation dependencies.
