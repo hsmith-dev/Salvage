@@ -16,8 +16,9 @@ public final class ScanPauseGate: @unchecked Sendable {
 
     public var isPaused: Bool { lock.withLock { paused } }
 
-    /// Number of scan loops currently suspended at the gate (exposed for tests).
-    var waiterCount: Int { lock.withLock { waiters.count } }
+    /// Number of scan loops currently parked at the gate. Public so tests in other modules can
+    /// prove a scan is actually blocked before acting, rather than relying on timing.
+    public var waiterCount: Int { lock.withLock { waiters.count } }
 
     public func pause() { lock.withLock { paused = true } }
 

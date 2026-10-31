@@ -32,6 +32,7 @@ public struct ScanSession: Sendable, Identifiable {
             let extents = try await VolumeDiscovery(reader: reader).discover()
             var total: Int64 = 0
             for extent in extents { total = try checkedAdd(total, extent.length) }
+            let fingerprint = extents.map { ScanCheckpoint.Extent(offset: $0.offset, length: $0.length) }
             let measured = MeasuredReader(base: reader, extents: extents, total: total, emit: emit,
                                           interval: progressInterval, now: now, gate: pauseGate)
             let start = checkpoint.flatMap { Self.sweepStart($0, extents: extents, total: total, deviceSize: reader.sizeBytes) }
@@ -59,7 +60,7 @@ public struct ScanSession: Sendable, Identifiable {
                     _ = try await measured.read(at: checkedAdd(extent.offset, offset), count: count)
                     offset += Int64(count)
                     checkpoints?.yield(ScanCheckpoint(deviceSizeBytes: reader.sizeBytes, totalBytes: total,
-                                                      sweepVolumeIndex: index, sweepOffset: offset,
+                                                      extents: fingerprint, sweepVolumeIndex: index, sweepOffset: offset,
                                                       bytesScanned: await measured.measured))
                 }
             }
@@ -75,9 +76,12 @@ public struct ScanSession: Sendable, Identifiable {
     }
 
     /// The sweep position a checkpoint resumes from, or nil when it does not fit this device's layout.
+    /// The checkpoint's extent fingerprint must equal the freshly discovered layout exactly, so a
+    /// re-partitioned device with the same size, total and volume count still scans from zero.
     static func sweepStart(_ checkpoint: ScanCheckpoint, extents: [VolumeExtent], total: Int64,
                            deviceSize: Int64) -> (volume: Int, offset: Int64)? {
         guard checkpoint.isWellFormed, checkpoint.deviceSizeBytes == deviceSize, checkpoint.totalBytes == total,
+              checkpoint.extents == extents.map({ ScanCheckpoint.Extent(offset: $0.offset, length: $0.length) }),
               extents.indices.contains(checkpoint.sweepVolumeIndex),
               checkpoint.sweepOffset <= extents[checkpoint.sweepVolumeIndex].length else { return nil }
         return (checkpoint.sweepVolumeIndex, checkpoint.sweepOffset)

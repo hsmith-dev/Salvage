@@ -4,19 +4,31 @@ import Foundation
 /// or contents. `sweepOffset` is relative to the start of volume `sweepVolumeIndex`; every byte of
 /// earlier volumes and every byte of that volume before `sweepOffset` has already been read.
 public struct ScanCheckpoint: Codable, Sendable, Equatable {
-    public static let currentVersion = 1
+    /// Version 2 added the `extents` layout fingerprint.
+    public static let currentVersion = 2
+
+    /// One discovered volume extent, as a device-absolute byte range.
+    public struct Extent: Codable, Sendable, Equatable, Hashable {
+        public let offset: Int64
+        public let length: Int64
+        public init(offset: Int64, length: Int64) { self.offset = offset; self.length = length }
+    }
 
     public let version: Int
     /// The source device size when the checkpoint was taken; a different size means a different device.
     public let deviceSizeBytes: Int64
     public let totalBytes: Int64
+    /// The ordered layout of supported volumes the sweep walked. A resume is applied only when the
+    /// device's freshly discovered layout matches this exactly.
+    public let extents: [Extent]
     public let sweepVolumeIndex: Int
     public let sweepOffset: Int64
     public let bytesScanned: Int64
 
     public init(version: Int = ScanCheckpoint.currentVersion, deviceSizeBytes: Int64, totalBytes: Int64,
-                sweepVolumeIndex: Int, sweepOffset: Int64, bytesScanned: Int64) {
+                extents: [Extent], sweepVolumeIndex: Int, sweepOffset: Int64, bytesScanned: Int64) {
         self.version = version; self.deviceSizeBytes = deviceSizeBytes; self.totalBytes = totalBytes
+        self.extents = extents
         self.sweepVolumeIndex = sweepVolumeIndex; self.sweepOffset = sweepOffset; self.bytesScanned = bytesScanned
     }
 
@@ -25,5 +37,8 @@ public struct ScanCheckpoint: Codable, Sendable, Equatable {
         version == Self.currentVersion && deviceSizeBytes > 0 && totalBytes > 0
             && sweepVolumeIndex >= 0 && sweepOffset >= 0
             && bytesScanned >= 0 && bytesScanned <= totalBytes && totalBytes <= deviceSizeBytes
+            && extents.indices.contains(sweepVolumeIndex)
+            && extents.allSatisfy { $0.offset >= 0 && $0.length > 0 }
+            && extents.reduce(Int64(0)) { $0.addingReportingOverflow($1.length).partialValue } == totalBytes
     }
 }
