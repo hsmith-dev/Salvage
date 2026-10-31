@@ -37,6 +37,15 @@ jobs:
       - name: Test the boundary checker itself (violation detection)
         run: ./scripts/test-check-core-boundary.sh
 
+      # Architecture AD-12 / FR-18: no network-capable API anywhere except the designated,
+      # user-initiated Check for Updates file (Salvage/Updates/UpdateChecker.swift), and no
+      # remote package dependencies.
+      - name: Enforce zero-network policy (AD-12)
+        run: ./scripts/check-no-network.sh
+
+      - name: Test the zero-network checker itself (violation detection)
+        run: ./scripts/test-check-no-network.sh
+
       - name: Test the release-secrets checker itself
         run: ./scripts/test-check-release-secrets.sh
 

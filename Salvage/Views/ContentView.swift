@@ -25,16 +25,7 @@ struct ContentView: View {
         .toolbar {
             Button("What Salvage reads and writes", systemImage: "info.circle") { showsTrust = true }
         }
-        .sheet(isPresented: $showsTrust) {
-            VStack(alignment: .leading, spacing: 16) {
-                Text("What Salvage reads and writes").font(.headline)
-                ScrollView {
-                    Text("Salvage unmounts the selected device and reads it through a read-only session. This scan indexes intact file metadata and copies no files. Scanning makes no network calls. Your startup drive cannot be scanned while macOS is running from it. The device stays unmounted after scanning; reconnect it to use it in Finder.")
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                Button("Done") { showsTrust = false }.keyboardShortcut(.defaultAction)
-            }.padding(24).frame(width: 460, height: 280)
-        }
+        .trustPanel(isPresented: $showsTrust, isScanning: scan.isActive)
         .frame(minWidth: 760, minHeight: 480)
     }
 }
