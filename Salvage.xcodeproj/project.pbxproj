@@ -10,6 +10,7 @@
 		0062F4592C4C75593540D448 /* ScanProgressView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B06FDFC018E70AED252E2AD4 /* ScanProgressView.swift */; };
 		13470E4C7A849C2924C5A455 /* SalvageDiskIO in Frameworks */ = {isa = PBXBuildFile; productRef = CA3B2287E3126452573584A3 /* SalvageDiskIO */; };
 		141EC4A99902299F276C46AF /* ScanCheckpointStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A823EAB151C49C3DEBC69CF6 /* ScanCheckpointStore.swift */; };
+		29BABD96F117CF581C32C536 /* PreviewLoader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13AB8B7E7A20544CD69D8CBF /* PreviewLoader.swift */; };
 		4E4930C119561323B128C398 /* DeviceListViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99D08CCB19B88001DA0D7837 /* DeviceListViewModel.swift */; };
 		52354930675517AFF3E449A9 /* UpdateCheckerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F798DD8A6F1B8EF9E72517BA /* UpdateCheckerTests.swift */; };
 		59D8A403E40711D298D4493F /* ScanViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D688D515CDA1F3D3D907DEB /* ScanViewModelTests.swift */; };
@@ -17,6 +18,8 @@
 		6A926703E084480718248DBB /* SourceSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 033C52D0FB3387397999220A /* SourceSession.swift */; };
 		6B72BE7198AFA1AD22773D13 /* UpdateChecker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A78CB2252556649B9DABE08 /* UpdateChecker.swift */; };
 		6BEE060426D0E80E24AF664C /* ScanViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4CD440ACD4B335303928637 /* ScanViewModel.swift */; };
+		7258392A62CEBE52A5E50D56 /* FilePreviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E17D8A77B7537474A88104D /* FilePreviewView.swift */; };
+		7D91E05428F149D39FF3CE3F /* PreviewLoaderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5482A784FE2B89690AB6EF74 /* PreviewLoaderTests.swift */; };
 		82973B300A3833E3A4CAE166 /* DeviceListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200C8811715FB24AA7CA8091 /* DeviceListView.swift */; };
 		836C443FB69E9C1B42F4BAEC /* SalvageCore in Frameworks */ = {isa = PBXBuildFile; productRef = 93F6F4111F1AFB9602871901 /* SalvageCore */; };
 		83D05F08C8BEEF5CD38636E0 /* SalvageApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1DE755CB1D6209CEB18BBAE /* SalvageApp.swift */; };
@@ -40,10 +43,13 @@
 /* Begin PBXFileReference section */
 		033C52D0FB3387397999220A /* SourceSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SourceSession.swift; sourceTree = "<group>"; };
 		0A4FDEF94C4B425FCAF71692 /* SalvageCore */ = {isa = PBXFileReference; lastKnownFileType = folder; name = SalvageCore; path = SalvageCore; sourceTree = SOURCE_ROOT; };
+		13AB8B7E7A20544CD69D8CBF /* PreviewLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewLoader.swift; sourceTree = "<group>"; };
 		200C8811715FB24AA7CA8091 /* DeviceListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceListView.swift; sourceTree = "<group>"; };
 		3A78CB2252556649B9DABE08 /* UpdateChecker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateChecker.swift; sourceTree = "<group>"; };
+		5482A784FE2B89690AB6EF74 /* PreviewLoaderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewLoaderTests.swift; sourceTree = "<group>"; };
 		71F3E757E68865FD5D2FA447 /* TrustPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrustPanelView.swift; sourceTree = "<group>"; };
 		7D688D515CDA1F3D3D907DEB /* ScanViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScanViewModelTests.swift; sourceTree = "<group>"; };
+		8E17D8A77B7537474A88104D /* FilePreviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilePreviewView.swift; sourceTree = "<group>"; };
 		98C64227FE351987F85FA819 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		99D08CCB19B88001DA0D7837 /* DeviceListViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceListViewModel.swift; sourceTree = "<group>"; };
 		A242CDC4F6EB012427768849 /* UpdateCommands.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateCommands.swift; sourceTree = "<group>"; };
@@ -93,6 +99,7 @@
 			isa = PBXGroup;
 			children = (
 				E40E27E6E6443F51724D8027 /* DeviceListViewModelTests.swift */,
+				5482A784FE2B89690AB6EF74 /* PreviewLoaderTests.swift */,
 				7D688D515CDA1F3D3D907DEB /* ScanViewModelTests.swift */,
 				F798DD8A6F1B8EF9E72517BA /* UpdateCheckerTests.swift */,
 			);
@@ -113,6 +120,7 @@
 			children = (
 				98C64227FE351987F85FA819 /* ContentView.swift */,
 				200C8811715FB24AA7CA8091 /* DeviceListView.swift */,
+				8E17D8A77B7537474A88104D /* FilePreviewView.swift */,
 				B06FDFC018E70AED252E2AD4 /* ScanProgressView.swift */,
 				71F3E757E68865FD5D2FA447 /* TrustPanelView.swift */,
 			);
@@ -133,6 +141,7 @@
 			isa = PBXGroup;
 			children = (
 				99D08CCB19B88001DA0D7837 /* DeviceListViewModel.swift */,
+				13AB8B7E7A20544CD69D8CBF /* PreviewLoader.swift */,
 				A823EAB151C49C3DEBC69CF6 /* ScanCheckpointStore.swift */,
 				F4CD440ACD4B335303928637 /* ScanViewModel.swift */,
 				033C52D0FB3387397999220A /* SourceSession.swift */,
@@ -250,6 +259,8 @@
 				DB4FF45FD4E869D4490DA392 /* ContentView.swift in Sources */,
 				82973B300A3833E3A4CAE166 /* DeviceListView.swift in Sources */,
 				4E4930C119561323B128C398 /* DeviceListViewModel.swift in Sources */,
+				7258392A62CEBE52A5E50D56 /* FilePreviewView.swift in Sources */,
+				29BABD96F117CF581C32C536 /* PreviewLoader.swift in Sources */,
 				83D05F08C8BEEF5CD38636E0 /* SalvageApp.swift in Sources */,
 				141EC4A99902299F276C46AF /* ScanCheckpointStore.swift in Sources */,
 				0062F4592C4C75593540D448 /* ScanProgressView.swift in Sources */,
@@ -266,6 +277,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				D86AD77E4FE679401396EFA9 /* DeviceListViewModelTests.swift in Sources */,
+				7D91E05428F149D39FF3CE3F /* PreviewLoaderTests.swift in Sources */,
 				59D8A403E40711D298D4493F /* ScanViewModelTests.swift in Sources */,
 				52354930675517AFF3E449A9 /* UpdateCheckerTests.swift in Sources */,
 			);
