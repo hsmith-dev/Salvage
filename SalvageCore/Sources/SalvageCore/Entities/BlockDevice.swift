@@ -34,13 +34,20 @@ public struct BlockDevice: Identifiable, Equatable, Sendable {
     /// a valid scan-selection target (Architecture AD-4's boot-volume exception).
     public let isBootVolume: Bool
 
+    /// Set only on the value carried by `ScanEvent.unlockRequired`: the encrypted APFS volume
+    /// (UUID and name) inside this device that needs a password or recovery key (FR-6).
+    public let encryptedVolumeUUID: String?
+    public let encryptedVolumeName: String?
+
     public init(
         bsdName: String,
         displayName: String,
         sizeBytes: Int64,
         isInternal: Bool,
         isBootVolume: Bool,
-        mediaIdentity: UInt64? = nil
+        mediaIdentity: UInt64? = nil,
+        encryptedVolumeUUID: String? = nil,
+        encryptedVolumeName: String? = nil
     ) {
         self.bsdName = bsdName
         self.mediaIdentity = mediaIdentity
@@ -48,6 +55,15 @@ public struct BlockDevice: Identifiable, Equatable, Sendable {
         self.sizeBytes = sizeBytes
         self.isInternal = isInternal
         self.isBootVolume = isBootVolume
+        self.encryptedVolumeUUID = encryptedVolumeUUID
+        self.encryptedVolumeName = encryptedVolumeName
+    }
+
+    /// The same device, annotated with the encrypted volume that blocked part of its scan.
+    public func requiringUnlock(volumeUUID: String, volumeName: String?) -> BlockDevice {
+        BlockDevice(bsdName: bsdName, displayName: displayName, sizeBytes: sizeBytes, isInternal: isInternal,
+                    isBootVolume: isBootVolume, mediaIdentity: mediaIdentity,
+                    encryptedVolumeUUID: volumeUUID, encryptedVolumeName: volumeName)
     }
 
     public var id: String { bsdName }

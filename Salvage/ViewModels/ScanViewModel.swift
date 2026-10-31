@@ -29,6 +29,10 @@ final class ScanViewModel {
     private(set) var state: State = .idle
     private(set) var device: BlockDevice?
     private(set) var files: [RecoveredFile] = []
+    /// Filesystems found in unallocated space (FR-9); their files are in `files`, keyed by volume offset.
+    private(set) var lostPartitions: [LostPartitionCandidate] = []
+    /// Encrypted volumes the scan could not read; each needs a password or recovery key (FR-6).
+    private(set) var unlockRequests: [BlockDevice] = []
     private(set) var bytesScanned: Int64 = 0
     private(set) var totalBytes: Int64 = 0
     private(set) var startedAt: Date?
@@ -122,6 +126,7 @@ final class ScanViewModel {
 
     private func reset(for device: BlockDevice) {
         self.device = device; files = []; seenFiles = []; bytesScanned = 0; totalBytes = 0
+        lostPartitions = []; unlockRequests = []
         startedAt = nil; scanningStartedAt = nil; endedAt = nil; baselineBytes = 0
         pausedAt = nil; pausedTotal = 0; latestCheckpoint = nil; lastCheckpointSave = nil
         pendingCheckpoint = nil; resumedFromCheckpoint = false; canRetryFromCheckpoint = false
@@ -188,7 +193,8 @@ final class ScanViewModel {
                         if seenFiles.insert(key).inserted { files.append(file) }
                     case .error(let error): state = .failed(error)
                     case .completed: completed = true
-                    case .lostPartitionFound, .unlockRequired: break
+                    case .lostPartitionFound(let candidate): lostPartitions.append(candidate)
+                    case .unlockRequired(let device): unlockRequests.append(device)
                     }
                 }
                 if Task.isCancelled { group.cancelAll() }

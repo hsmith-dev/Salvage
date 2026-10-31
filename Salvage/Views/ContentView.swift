@@ -11,7 +11,7 @@ struct ContentView: View {
     nonisolated private static func runScan(run: ScanRun, events: AsyncStream<ScanEvent>.Continuation) async throws {
         let reader = try await RawBlockReader.prepare(device: run.device)
         await ScanSession(reader: reader).run(events: events, pauseGate: run.pauseGate,
-                                              checkpoints: run.checkpoints, resumingFrom: run.resumeFrom)
+                                              checkpoints: run.checkpoints, resumingFrom: run.resumeFrom, device: run.device)
         await run.keepSource(SourceSession(device: run.device, reader: reader, close: { await reader.close() }))
     }
     @State private var showsTrust = false

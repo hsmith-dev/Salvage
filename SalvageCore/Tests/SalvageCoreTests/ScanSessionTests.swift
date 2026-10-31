@@ -511,3 +511,33 @@ private struct AdvancingReader: BlockReader {
         return data.subdata(in: Int(offset)..<Int(offset)+count)
     }
 }
+
+@Suite("Signature detection for formats whose parsers are pending")
+struct PendingFormatDetectionTests {
+    func disk(_ stamp: (inout Data) -> Void) -> Data {
+        var image = Data(repeating: 0, count: 16 * 512); stamp(&image); return image
+    }
+    @Test func apfsContainerAndBareVolumeAreRecognised() async {
+        let container = disk { $0.text(32, "NXSB") }
+        let volume = disk { $0.text(32, "APSB") }
+        #expect(await scan(container) == [.error(.unsupportedFilesystem)])
+        #expect(await scan(volume) == [.error(.unsupportedFilesystem)])
+    }
+    @Test func hfsPlusAndHfsxAreRecognised() async {
+        for signature: [UInt8] in [[0x48, 0x2B], [0x48, 0x58]] {
+            let image = disk { $0[1024] = signature[0]; $0[1025] = signature[1] }
+            #expect(await scan(image) == [.error(.unsupportedFilesystem)])
+        }
+    }
+    @Test func pendingFormatPartitionsAreSkippedNotFailed() async {
+        let fat = exfatImage(), sectors = fat.count / 512
+        var apfs = Data(repeating: 0, count: 8 * 512); apfs.text(32, "NXSB")
+        var image = Data(repeating: 0, count: 512) + fat + apfs
+        image.put(446+4, 7, 1); image.put(446+8, 1, 4); image.put(446+12, UInt64(sectors), 4)
+        image.put(446+16+4, 0xAF, 1); image.put(446+16+8, UInt64(1 + sectors), 4); image.put(446+16+12, 8, 4)
+        image.put(510, 0xaa55, 2)
+        let events = await scan(image)
+        #expect(events.last == .completed)
+        #expect(events.contains(.progress(bytesScanned: Int64(fat.count), totalBytes: Int64(fat.count))))
+    }
+}

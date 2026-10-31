@@ -50,9 +50,6 @@ public enum RecoveryConfidence: Sendable, Equatable, CaseIterable {
 }
 
 extension RecoveredFile {
-    /// Every file a filesystem parser reports was found through intact metadata.
-    public var recoveryMethod: RecoveryMethod { .metadata }
-
     /// True when the file can't be previewed or recovered: the parser couldn't map its bytes, or
     /// the mapping it reported fails `FileContentReader.validate`'s size-coverage rules (see
     /// `mappingCoversSize`), which the reader would reject at read time anyway.
@@ -82,8 +79,8 @@ extension RecoveredFile {
         }
     }
 
-    /// Evidence for AD-7. Live and deleted files from intact metadata both report no overwrite:
-    /// deleted files are only reported after their clusters passed the free-space check.
+    /// Evidence for AD-7. The fragment count comes from the mapping; the overwrite estimate is
+    /// the producer's (`overwriteConfidence`, 0 for metadata parsers).
     public var recoveryEvidence: RecoveryEvidence {
         let fragments: Int
         switch content {
@@ -91,7 +88,7 @@ extension RecoveredFile {
         case .resident: fragments = 1
         case .runs(let runs): fragments = runs.lazy.filter { $0.deviceOffset != nil }.count
         }
-        return RecoveryEvidence(fragmentCount: fragments, overwriteConfidence: 0)
+        return RecoveryEvidence(fragmentCount: fragments, overwriteConfidence: overwriteConfidence)
     }
 
     /// The file's recovery confidence, or nil when it can't be recovered at all (unmapped, or a

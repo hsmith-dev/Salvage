@@ -40,7 +40,7 @@ graph TD
 - **Prevents:** disk-access logic leaking into SwiftUI views; UI logic leaking into the recovery engine; a Linux/Windows port requiring a Core rewrite; two unsynchronized integration points with the same Apple framework.
 - **Rule:** `SalvageCore` depends on nothing but Foundation. `SalvageDiskIO` depends only on `SalvageCore` (to conform to its ports). `Salvage` (app) depends on both and is the only module permitted to construct a concrete adapter and wire it into Core. **`SalvageDiskIO` is the exclusive owner of DiskArbitration** — `Salvage` (app) never imports or calls DiskArbitration directly, including for AD-8's destination-safety check, which goes through a `SalvageDiskIO`-exposed API (enforced by AD-9).
 
-### AD-2 — APFS parsing is original, MIT-licensed code `[ASSUMPTION — confirm]`
+### AD-2 — APFS parsing is original, MIT-licensed code `[ADOPTED 2026-10-31]`
 
 - **Binds:** FR-4, FR-5, FR-9, FR-10
 - **Prevents:** license contamination of the MIT codebase; a hard runtime dependency on installing a FUSE kernel extension (macFUSE) for an end-user consumer app.

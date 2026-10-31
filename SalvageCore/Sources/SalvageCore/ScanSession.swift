@@ -25,8 +25,11 @@ public struct ScanSession: Sendable, Identifiable {
     /// device's volumes is ignored and the scan starts from zero.
     public func run(events: AsyncStream<ScanEvent>.Continuation, pauseGate: ScanPauseGate? = nil,
                     checkpoints: AsyncStream<ScanCheckpoint>.Continuation? = nil,
-                    resumingFrom checkpoint: ScanCheckpoint? = nil) async {
+                    resumingFrom checkpoint: ScanCheckpoint? = nil, device: BlockDevice? = nil) async {
         let emit: @Sendable (ScanEvent) async throws -> Void = { try await events.send($0) }
+        // Byte ranges owned by files found through metadata; the carver skips them.
+        let claimed = ClaimedRuns()
+        let carver: any Carver = SignatureCarver(emit: { try await emit(.found($0)) })
         do {
             try Task.checkCancellation()
             let extents = try await VolumeDiscovery(reader: reader).discover()
@@ -44,12 +47,15 @@ public struct ScanSession: Sendable, Identifiable {
             }
             try await emit(.progress(bytesScanned: await measured.measured, totalBytes: total))
             for extent in extents {
-                try await scanVolume(extent, reader: measured, emit: { file in
-                    try await emit(.found(file))
+                try await scanVolume(extent, reader: measured, device: device, emit: { event in
+                    if case .found(let file) = event, case .runs(let runs) = file.content { await claimed.add(runs) }
+                    try await emit(event)
                 })
             }
             // Finish a bounded, read-only pass over supported volumes. Progress measures unique
             // source bytes actually read, including metadata; unsupported partitions are skipped.
+            // The carver sees every swept chunk (a resumed scan carves only the remaining bytes).
+            try await carver.begin(claimed: await claimed.runs, deviceSizeBytes: reader.sizeBytes)
             for (index, extent) in extents.enumerated() {
                 guard index >= (start?.volume ?? 0) else { continue }
                 var offset: Int64 = index == start?.volume ? start?.offset ?? 0 : 0
@@ -57,13 +63,16 @@ public struct ScanSession: Sendable, Identifiable {
                     try Task.checkCancellation()
                     try await pauseGate?.wait()
                     let count = Int(min(1024 * 1024, extent.length - offset))
-                    _ = try await measured.read(at: checkedAdd(extent.offset, offset), count: count)
+                    let deviceOffset = try checkedAdd(extent.offset, offset)
+                    let chunk = try await measured.read(at: deviceOffset, count: count)
+                    try await carver.consume(chunk, at: deviceOffset)
                     offset += Int64(count)
                     checkpoints?.yield(ScanCheckpoint(deviceSizeBytes: reader.sizeBytes, totalBytes: total,
                                                       extents: fingerprint, sweepVolumeIndex: index, sweepOffset: offset,
                                                       bytesScanned: await measured.measured))
                 }
             }
+            try await carver.finish()
             try Task.checkCancellation()
             try await emit(.completed)
         } catch is CancellationError {
@@ -161,4 +170,10 @@ public extension AsyncStream<ScanEvent>.Continuation {
             }
         }
     }
+}
+
+/// Device-absolute byte ranges owned by files found through metadata.
+actor ClaimedRuns {
+    private(set) var runs: [DataRun] = []
+    func add(_ new: [DataRun]) { runs.append(contentsOf: new.filter { $0.deviceOffset != nil }) }
 }

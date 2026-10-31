@@ -30,8 +30,10 @@ public struct LostPartitionCandidate: Identifiable, Sendable, Equatable {
     public let id: UUID
     public let offset: Int64
     public let sizeBytes: Int64
-    public init(id: UUID = UUID(), offset: Int64, sizeBytes: Int64) {
-        self.id = id; self.offset = offset; self.sizeBytes = sizeBytes
+    /// Plain-language filesystem name from the signature that revealed it, e.g. "exFAT".
+    public let formatName: String
+    public init(id: UUID = UUID(), offset: Int64, sizeBytes: Int64, formatName: String = "Unknown") {
+        self.id = id; self.offset = offset; self.sizeBytes = sizeBytes; self.formatName = formatName
     }
 }
 
@@ -49,12 +51,24 @@ public struct RecoveredFile: Identifiable, Sendable, Equatable {
     /// Where the file's bytes live, in file order. Empty with `residentData == nil` means the
     /// parser couldn't map the contents; preview and recovery must treat it as unavailable.
     public let content: FileContent
+    /// How the file was found (AD-7). Filesystem parsers report `.metadata`; the carving engine
+    /// reports `.carved`.
+    public let recoveryMethod: RecoveryMethod
+    /// True when the producer knows the content is incomplete (e.g. a carve cut short by a
+    /// missing footer). Shown as "Partial — may be incomplete"; never presented as complete.
+    public let isPartial: Bool
+    /// Producer's estimate, in `0...1`, that the bytes were overwritten since the file was lost.
+    /// Metadata parsers report 0 (deleted files already passed a free-space check).
+    public let overwriteConfidence: Double
     public init(id: UUID = UUID(), name: String, path: String, sizeBytes: Int64,
                 modified: Date? = nil, isDeleted: Bool = false, sourceMetadata: SourceMetadata,
-                content: FileContent = .unmapped) {
+                content: FileContent = .unmapped, recoveryMethod: RecoveryMethod = .metadata,
+                isPartial: Bool = false, overwriteConfidence: Double = 0) {
         self.id = id; self.name = name; self.path = path; self.sizeBytes = sizeBytes
         self.modified = modified; self.isDeleted = isDeleted
         self.sourceMetadata = sourceMetadata; self.content = content
+        self.recoveryMethod = recoveryMethod; self.isPartial = isPartial
+        self.overwriteConfidence = overwriteConfidence
     }
 }
 
@@ -76,7 +90,7 @@ public enum FileContent: Sendable, Equatable {
 }
 
 public struct SourceMetadata: Sendable, Equatable {
-    public enum Filesystem: String, Sendable { case fat32, exfat, ntfs, ext }
+    public enum Filesystem: String, Sendable { case fat32, exfat, ntfs, ext, apfs, hfsPlus, carved }
     public let filesystem: Filesystem
     public let volumeOffset: Int64
     /// Device-absolute byte offset of the metadata record: FAT/exFAT directory entry, NTFS MFT

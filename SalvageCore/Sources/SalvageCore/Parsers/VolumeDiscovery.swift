@@ -88,10 +88,16 @@ struct VolumeDiscovery {
         let boot = try await read(offset, 512)
         if isFAT(boot) { return .fat }
         if String(decoding: boot[3..<11], as: UTF8.self) == "NTFS    " { return .ntfs }
-        // ext superblock: 1024 bytes into the volume, magic 0xEF53 at superblock offset 56.
+        // APFS: nx_superblock (container) or apfs_superblock (bare unlocked volume), magic at 32.
+        let apfsMagic = String(decoding: boot[32..<36], as: UTF8.self)
+        if apfsMagic == "NXSB" || apfsMagic == "APSB" { return .apfs }
+        // ext superblock and the HFS+ volume header both sit 1024 bytes into the volume.
         guard length >= 2048 else { return nil }
-        let superblock = try await read(checkedAdd(offset, 1024), 512)
-        return try superblock.number(56, 2) == 0xef53 ? .ext : nil
+        let block = try await read(checkedAdd(offset, 1024), 512)
+        if try block.number(56, 2) == 0xef53 { return .ext }
+        // HFS+ signature is big-endian "H+" (0x482B) or "HX" (HFSX, 0x4858).
+        if block[0] == 0x48, block[1] == 0x2B || block[1] == 0x58 { return .hfsPlus }
+        return nil
     }
     func isFAT(_ data: Data) -> Bool {
         guard data.count >= 90 else { return false }
