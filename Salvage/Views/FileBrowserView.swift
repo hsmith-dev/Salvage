@@ -16,9 +16,16 @@ struct FileBrowserView: View {
         let source: SourceSession
     }
 
-    @State private var sortOrder = [KeyPathComparator(\ResultsViewModel.Row.name)]
+    @State private var sortOrder: [KeyPathComparator<ResultsViewModel.Row>]
     @State private var showsPreview = true
     @State private var recovery: RecoveryRequest?
+    @FocusState private var tableFocused: Bool
+
+    init(model: ResultsViewModel, source: SourceSession?, onBack: @escaping () -> Void) {
+        self.model = model; self.source = source; self.onBack = onBack
+        // Start from the model's sort so the header arrow matches the order shown.
+        _sortOrder = State(initialValue: Self.sortOrder(for: model.sort))
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -30,37 +37,70 @@ struct FileBrowserView: View {
             }
         }
         .searchable(text: $model.searchText, placement: .toolbar, prompt: "Search names and paths")
-        // Filtering and sorting run off the main actor; a newer query supersedes an older one.
-        .task(id: model.query) { await model.refresh() }
+        // Filtering and sorting run off the main actor; a newer query cancels and supersedes an
+        // older one, and search edits are debounced.
+        .task(id: model.query) { await model.refresh(debounceSearch: true) }
         .onChange(of: sortOrder) { _, order in model.sort = Self.sort(from: order) }
         .sheet(item: $recovery) { request in recoverySheet(request) }
+        .background { keyboardShortcuts }
     }
 
     private var header: some View {
         HStack(alignment: .firstTextBaseline, spacing: 16) {
             Button("All results", systemImage: "chevron.backward", action: onBack)
-            Text(title).font(.headline)
+            Text(model.browserTitle).font(.headline)
             Spacer()
             Toggle("Show system files", isOn: $model.showSystemFiles).toggleStyle(.checkbox)
+            Button(showsPreview ? "Hide Preview" : "Show Preview") { showsPreview.toggle() }
+            selectionMenu
+            if let summary = model.selectionSummary {
+                Text(summary)
+                    .font(.subheadline).foregroundStyle(.secondary)
+                    .help("Ticked files hidden by the current filter or search aren't recovered.")
+            }
             Button(model.recoverButtonTitle) {
                 guard let source else { return }
                 recovery = RecoveryRequest(files: model.checkedFiles, source: source)
             }
             .buttonStyle(.borderedProminent)
             .tint(.salvageAccent)
-            .disabled(model.checkedCount == 0 || source == nil)
+            .disabled(model.visibleCheckedCount == 0 || source == nil)
             .help(source == nil ? "The device is no longer available. Scan it again to recover files." : "")
         }
     }
 
-    private var title: String {
-        let count = model.visibleRows.count
-        let files = "\(count.formatted()) \(count == 1 ? "file" : "files")"
-        return "\(model.category?.displayName ?? "All files") — \(files)"
+    /// Mouse and VoiceOver path to the keyboard commands; the shortcut hints are shown here and
+    /// handled by `keyboardShortcuts` and the table's key handler.
+    private var selectionMenu: some View {
+        Menu("Select") {
+            Button("Tick or Untick Selected Rows (Return, \u{2318}K)") { model.toggleCheckedForSelection() }
+                .disabled(model.selection.isEmpty)
+            Button("Select All Recoverable (\u{2318}A)") { model.selectAllRecoverable() }
+            Button("Deselect All (\u{2325}\u{2318}A)") { model.deselectAll() }
+                .disabled(model.checkedCount == 0)
+        }
+        .fixedSize()
+    }
+
+    /// Invisible buttons that carry the browser's shortcuts. Cmd-A is enabled only while the
+    /// table has focus, so it never takes Select All away from the search field.
+    private var keyboardShortcuts: some View {
+        Group {
+            Button("Tick or Untick Selected Rows") { model.toggleCheckedForSelection() }
+                .keyboardShortcut("k", modifiers: .command)
+            Button("Select All Recoverable") { model.selectAllRecoverable() }
+                .keyboardShortcut("a", modifiers: .command)
+                .disabled(!tableFocused)
+            Button("Deselect All") { model.deselectAll() }
+                .keyboardShortcut("a", modifiers: [.command, .option])
+        }
+        .opacity(0)
+        .frame(width: 0, height: 0)
+        .accessibilityHidden(true)
     }
 
     private var table: some View {
-        Table(model.visibleRows, selection: $model.focusedID, sortOrder: $sortOrder) {
+        Table(model.visibleRows, selection: $model.selection, sortOrder: $sortOrder) {
             TableColumn("") { (row: ResultsViewModel.Row) in
                 Toggle("Select \(row.name) for recovery", isOn: Binding(
                     get: { model.isChecked(row.id) },
@@ -93,11 +133,23 @@ struct FileBrowserView: View {
             TableColumn("Confidence") { row in ConfidenceLabel(confidence: row.confidence) }
                 .width(min: 90, ideal: 120)
         }
-        // Single click selects and previews; Space shows or hides the preview, like Quick Look.
+        .focused($tableFocused)
+        // Space previews, like Quick Look: it shows a hidden preview and never hides a shown one.
         .onKeyPress(.space) {
-            guard model.focusedID != nil else { return .ignored }
-            showsPreview.toggle()
+            guard !model.selection.isEmpty else { return .ignored }
+            showsPreview = Self.previewVisibility(afterSpaceWhile: showsPreview)
             return .handled
+        }
+        // Return ticks or unticks the selected rows (Cmd-K does the same from anywhere).
+        .onKeyPress(.return) {
+            guard !model.selection.isEmpty else { return .ignored }
+            model.toggleCheckedForSelection()
+            return .handled
+        }
+        .accessibilityActions {
+            Button("Tick or untick selected rows") { model.toggleCheckedForSelection() }
+            Button("Select all recoverable") { model.selectAllRecoverable() }
+            Button("Deselect all") { model.deselectAll() }
         }
         .overlay {
             if model.visibleRows.isEmpty {
@@ -107,38 +159,48 @@ struct FileBrowserView: View {
         }
     }
 
-    private var previewPane: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if let row = model.focusedRow {
-                FilePreviewView(file: row.file, source: source)
-                    .frame(maxWidth: .infinity, minHeight: 200, maxHeight: .infinity)
-                    .background(.background, in: RoundedRectangle(cornerRadius: 12))
+    /// The preview pane. `FilePreviewView` owns the panel, padding and the name/size/modified
+    /// header; this adds only the path and recovery status beneath it.
+    @ViewBuilder private var previewPane: some View {
+        if let row = model.focusedRow {
+            FilePreviewView(file: row.file, source: source) {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(row.name).font(.headline).textSelection(.enabled)
                     Text(row.path).font(.subheadline).foregroundStyle(.secondary).textSelection(.enabled)
-                    Text(ByteCountFormatter.string(fromByteCount: row.sizeBytes, countStyle: .file))
-                        .font(.subheadline).foregroundStyle(.secondary)
                     HStack(spacing: 6) {
                         Text(row.isRecoverable ? "Recovery confidence:" : "Status:").font(.subheadline).foregroundStyle(.secondary)
                         ConfidenceLabel(confidence: row.confidence)
                     }
-                    .accessibilityElement(children: .combine)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(ConfidenceLabel(confidence: row.confidence).accessibilityText)
                     if !row.isRecoverable {
                         Text("Salvage couldn't locate this file's contents on the device.")
                             .font(.subheadline).foregroundStyle(.secondary)
                     }
                 }
-            } else {
-                Text("Select a file to preview.")
-                    .foregroundStyle(.tertiary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+        } else {
+            Text(model.selection.isEmpty ? "Select a file to preview." : "\(model.selection.count.formatted()) files selected.")
+                .foregroundStyle(.tertiary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(24)
         }
-        .padding(16)
     }
 
     @ViewBuilder private func recoverySheet(_ request: RecoveryRequest) -> some View {
         RecoverySheet(files: request.files, source: request.source, onDone: { recovery = nil })
+    }
+
+    /// Space never hides a preview that is showing; it only brings back a hidden one.
+    static func previewVisibility(afterSpaceWhile showing: Bool) -> Bool { true }
+
+    static func sortOrder(for sort: ResultsViewModel.Sort) -> [KeyPathComparator<ResultsViewModel.Row>] {
+        let order: SortOrder = sort.ascending ? .forward : .reverse
+        switch sort.field {
+        case .name: return [KeyPathComparator(\ResultsViewModel.Row.name, order: order)]
+        case .path: return [KeyPathComparator(\ResultsViewModel.Row.path, order: order)]
+        case .size: return [KeyPathComparator(\ResultsViewModel.Row.sizeBytes, order: order)]
+        case .modified: return [KeyPathComparator(\ResultsViewModel.Row.modifiedSortKey, order: order)]
+        }
     }
 
     static func sort(from order: [KeyPathComparator<ResultsViewModel.Row>]) -> ResultsViewModel.Sort {

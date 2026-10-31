@@ -1,6 +1,7 @@
 import CoreGraphics
 import Foundation
 import ImageIO
+import PDFKit
 import SalvageCore
 import Testing
 import UniformTypeIdentifiers
@@ -52,6 +53,27 @@ private func png(width: Int, height: Int) throws -> Data {
     CGImageDestinationAddImage(destination, image, nil)
     #expect(CGImageDestinationFinalize(destination))
     return output as Data
+}
+
+private func encode(_ width: Int, _ height: Int, as type: UTType) throws -> Data {
+    let context = try #require(CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                         space: CGColorSpaceCreateDeviceRGB(),
+                                         bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
+    let image = try #require(context.makeImage())
+    let output = NSMutableData()
+    let destination = try #require(CGImageDestinationCreateWithData(output, type.identifier as CFString, 1, nil))
+    CGImageDestinationAddImage(destination, image, nil)
+    #expect(CGImageDestinationFinalize(destination))
+    return output as Data
+}
+
+/// Deterministic pseudo-random bytes (a fixed-seed LCG), so the test can't flake.
+private func noise(count: Int, seed: UInt64 = 0x5EED) -> [UInt8] {
+    var state = seed
+    return (0..<count).map { _ in
+        state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+        return UInt8(truncatingIfNeeded: state >> 33)
+    }
 }
 
 private func pdf() throws -> Data {
@@ -210,6 +232,92 @@ struct PreviewLoaderTests {
         #expect(PreviewFormat.detect(header: Data("plain".utf8), name: "README.md") == .text)
         #expect(PreviewFormat.detect(header: Data([0, 1, 2]), name: "IMG.HEIC") == .image)
         #expect(PreviewFormat.detect(header: Data([0, 1, 2]), name: "archive.zip") == .unknown)
+    }
+}
+
+extension PreviewLoaderTests {
+    @Test func imageDeclaringOverOneHundredMegapixelsIsRefused() {
+        // Checked from the declared size before any decode. (ImageIO won't report the size of a
+        // header-only fixture this large, so the check is exercised directly.)
+        #expect(PreviewLoader.maxImagePixels == 100_000_000)
+        #expect(PreviewLoader.checkDeclaredSize([kCGImagePropertyPixelWidth: 10_001, kCGImagePropertyPixelHeight: 10_000]) == .tooLarge)
+        #expect(PreviewLoader.checkDeclaredSize([kCGImagePropertyPixelWidth: 20_000, kCGImagePropertyPixelHeight: 20_000]) == .tooLarge)
+        #expect(PreviewLoader.checkDeclaredSize([kCGImagePropertyPixelWidth: Int.max, kCGImagePropertyPixelHeight: 2]) == .tooLarge)
+        #expect(PreviewLoader.checkDeclaredSize([kCGImagePropertyPixelWidth: 10_000, kCGImagePropertyPixelHeight: 10_000]) == nil)
+    }
+
+    @Test func imageWithoutDeclaredDimensionsIsRefused() {
+        #expect(PreviewLoader.checkDeclaredSize([:]) == .unsupportedFormat)
+        #expect(PreviewLoader.checkDeclaredSize([kCGImagePropertyPixelWidth: 100]) == .unsupportedFormat)
+        #expect(PreviewLoader.checkDeclaredSize([kCGImagePropertyPixelHeight: 100]) == .unsupportedFormat)
+        #expect(PreviewLoader.checkDeclaredSize([kCGImagePropertyPixelWidth: 0, kCGImagePropertyPixelHeight: 100]) == .unsupportedFormat)
+    }
+
+    @Test func csvStartingWithBMIPreviewsAsText() async throws {
+        let csv = "BMI,Weight,Height\n22.5,70,1.76\n24.1,80,1.82\n"
+        #expect(PreviewFormat.detect(header: Data(csv.utf8), name: "bmi.csv") == .text)
+        #expect(PreviewFormat.detect(header: Data(csv.utf8), name: "bmi") == .unknown)
+        let (file, session) = fixture(Data(csv.utf8), name: "bmi.csv")
+        guard case .text(let text, _) = try await PreviewLoader(source: session).load(file) else {
+            Issue.record("expected text"); return
+        }
+        #expect(text == csv)
+    }
+
+    @Test func realBMPIsStillDetectedByMagic() throws {
+        let bmp = try encode(16, 8, as: .bmp)
+        #expect(PreviewFormat.isPlausibleBMP([UInt8](bmp.prefix(32))))
+        #expect(PreviewFormat.detect(header: bmp, name: "IMG_0001.dat") == .image)
+        #expect(!PreviewFormat.isPlausibleBMP(Array("BMI,Weight,Height\n22.5,70".utf8)))
+    }
+
+    @Test func byteOrderMarkFollowedByRandomBytesIsNotText() async throws {
+        // Random bytes, nudged so every code unit is non-NUL and not a surrogate: they decode as
+        // UTF-16 without error, so only the printable-ratio check can tell they aren't text.
+        var units = noise(count: 8_000)
+        for i in stride(from: 0, to: units.count - 1, by: 2) {
+            if units[i] == 0, units[i + 1] == 0 { units[i] = 1 }
+            if (0xD8...0xDF).contains(units[i + 1]) { units[i + 1] ^= 0x40 }
+        }
+        let bytes = Data([0xFF, 0xFE] + units)
+        #expect(String(data: bytes, encoding: .utf16).map { !$0.contains("\u{0}") } == true)
+        #expect(PreviewLoader.decodeText(bytes, truncated: false) == nil)
+        let (file, session) = fixture(bytes, name: "blob.bin")
+        #expect(try await PreviewLoader(source: session).load(file).unavailableReason == .unsupportedFormat)
+        #expect(PreviewLoader.decodeText(Data([0xFF, 0xFE] + noise(count: 8_000, seed: 7)), truncated: false) == nil)
+        // Real UTF-16 text with a BOM, including a surrogate pair, still decodes.
+        let text = String(repeating: "Hello, 世界 \u{1F600}\n", count: 50)
+        #expect(PreviewLoader.decodeText(try #require(text.data(using: .utf16)), truncated: false) == text)
+    }
+
+    @Test func binaryHeaderStopsBeforeTheTextRead() async throws {
+        let bytes = Data([0x00, 0x01, 0x02, 0x03]) + Data(noise(count: 20_000))
+        let (file, session) = fixture(bytes, name: "mystery")
+        let probe = ReadProbe()
+        let content = session.content
+        let loader = PreviewLoader { file, limit in
+            await probe.record(limit)
+            return try await content.prefix(of: file, limit: limit)
+        }
+        let result = try await loader.load(file)
+        guard case .unavailable(.unsupportedFormat, let raw?) = result else { Issue.record("got \(result)"); return }
+        #expect(raw.hasPrefix("00000000  00 01 02 03"))
+        #expect(await probe.limits == [PreviewLoader.rawBytesCap])
+    }
+
+    @Test func shortReadWithoutAnErrorIsNeverShownAsContent() async throws {
+        let (file, _) = fixture(Data("hello".utf8), name: "a.txt")
+        let loader = PreviewLoader { _, _ in Data("he".utf8) }   // ends early, doesn't throw
+        #expect(try await loader.load(file).unavailableReason == .deviceUnreadable)
+    }
+
+    @MainActor @Test func pdfLinkClicksAreSwallowed() throws {
+        let blocker = PDFLinkBlocker()
+        // PDFView opens the URL itself only when its delegate doesn't implement this method.
+        #expect(blocker.responds(to: #selector(PDFViewDelegate.pdfViewWillClick(onLink:with:))))
+        let url = try #require(URL(string: "https://example.com/track"))
+        blocker.pdfViewWillClick(onLink: PDFView(), with: url)
+        #expect(blocker.blockedURLs == [url])
     }
 }
 

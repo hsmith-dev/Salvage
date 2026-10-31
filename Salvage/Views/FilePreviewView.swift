@@ -7,12 +7,17 @@ import SwiftUI
 /// into memory through the open `SourceSession`. Nothing is written to disk and no QuickLook or
 /// web rendering is used. `DESIGN.md`'s `preview-pane`: surface-raised panel, `rounded/lg`,
 /// "No preview available" in `ink-tertiary`, never a blank pane.
-struct FilePreviewView: View {
+///
+/// The view owns the whole pane: the rendered panel, its padding, and the metadata header (name,
+/// size, modified, "Deleted"). A host adds anything else, such as the path or recovery status,
+/// through `details`, which is laid out under the header rather than around the view.
+struct FilePreviewView<Details: View>: View {
     let file: RecoveredFile
     let source: SourceSession?
+    private let details: Details
 
-    init(file: RecoveredFile, source: SourceSession?) {
-        self.file = file; self.source = source
+    init(file: RecoveredFile, source: SourceSession?, @ViewBuilder details: () -> Details) {
+        self.file = file; self.source = source; self.details = details()
     }
 
     @State private var loaded: (id: RecoveredFile.ID, result: PreviewResult)?
@@ -28,7 +33,10 @@ struct FilePreviewView: View {
                     .strokeBorder(Color(nsColor: .separatorColor)))
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel("Preview of \(file.name)")
-            PreviewMetadataHeader(file: file)
+            VStack(alignment: .leading, spacing: 4) {
+                PreviewMetadataHeader(file: file)
+                details
+            }
         }
         .padding(24)
         .task(id: file.id) {
@@ -84,6 +92,12 @@ struct FilePreviewView: View {
                 .controlSize(.small)
                 .accessibilityLabel("Loading preview")
         }
+    }
+}
+
+extension FilePreviewView where Details == EmptyView {
+    init(file: RecoveredFile, source: SourceSession?) {
+        self.init(file: file, source: source) { EmptyView() }
     }
 }
 
@@ -183,7 +197,7 @@ private struct ReadOnlyTextView: NSViewRepresentable {
 private struct PDFPreview: NSViewRepresentable {
     let document: PDFDocument
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeCoordinator() -> PDFLinkBlocker { PDFLinkBlocker() }
 
     func makeNSView(context: Context) -> PDFView {
         let view = PDFView()
@@ -197,8 +211,15 @@ private struct PDFPreview: NSViewRepresentable {
     func updateNSView(_ view: PDFView, context: Context) {
         if view.document !== document { view.document = document }
     }
+}
 
-    final class Coordinator: NSObject, PDFViewDelegate {
-        func pdfViewWillClick(onLink sender: PDFView, with url: URL) {}
+/// `PDFView`'s delegate. Implementing `pdfViewWillClick(onLink:with:)` replaces PDFView's default
+/// of opening the URL with NSWorkspace; this implementation does nothing with it.
+final class PDFLinkBlocker: NSObject, PDFViewDelegate {
+    /// Links clicked and dropped, most recent last (kept for tests; never opened).
+    private(set) var blockedURLs: [URL] = []
+
+    func pdfViewWillClick(onLink sender: PDFView, with url: URL) {
+        blockedURLs.append(url)
     }
 }

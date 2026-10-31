@@ -53,8 +53,34 @@ extension RecoveredFile {
     /// Every file a filesystem parser reports was found through intact metadata.
     public var recoveryMethod: RecoveryMethod { .metadata }
 
-    /// True when the parser couldn't map the file's bytes, so it can't be previewed or recovered.
-    public var isUnmapped: Bool { content == .unmapped }
+    /// True when the file can't be previewed or recovered: the parser couldn't map its bytes, or
+    /// the mapping it reported fails `FileContentReader.validate`'s size-coverage rules (see
+    /// `mappingCoversSize`), which the reader would reject at read time anyway.
+    public var isUnmapped: Bool { !mappingCoversSize }
+
+    /// Pure mirror of `FileContentReader.validate`'s coverage rules, without the device-bounds
+    /// check (that needs a reader): resident data must hold `sizeBytes`; runs must have
+    /// non-negative lengths and offsets, must not overflow when summed, and must cover
+    /// `sizeBytes` (a zero-byte file needs no coverage). Keep in step with `validate`.
+    public var mappingCoversSize: Bool {
+        switch content {
+        case .unmapped:
+            return false
+        case .resident(let data):
+            return Int64(data.count) >= sizeBytes
+        case .runs(let runs):
+            var covered: Int64 = 0
+            for run in runs {
+                guard run.length >= 0 else { return false }
+                if let offset = run.deviceOffset, offset < 0 { return false }
+                let (sum, overflow) = covered.addingReportingOverflow(run.length)
+                guard !overflow else { return false }
+                covered = sum
+                if covered >= sizeBytes { return true }
+            }
+            return covered >= sizeBytes || sizeBytes == 0
+        }
+    }
 
     /// Evidence for AD-7. Live and deleted files from intact metadata both report no overwrite:
     /// deleted files are only reported after their clusters passed the free-space check.
@@ -68,7 +94,8 @@ extension RecoveredFile {
         return RecoveryEvidence(fragmentCount: fragments, overwriteConfidence: 0)
     }
 
-    /// The file's recovery confidence, or nil when it can't be recovered at all (unmapped).
+    /// The file's recovery confidence, or nil when it can't be recovered at all (unmapped, or a
+    /// mapping that doesn't cover the file).
     public var recoveryConfidence: RecoveryConfidence? {
         isUnmapped ? nil : RecoveryConfidence.assess(method: recoveryMethod, evidence: recoveryEvidence)
     }
