@@ -48,6 +48,23 @@ targets:
       - package: SalvageDiskIO
         product: SalvageDiskIO
 
+  SalvageTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: SalvageTests
+    settings:
+      base:
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+        GENERATE_INFOPLIST_FILE: YES
+    dependencies:
+      - target: Salvage
+      - package: SalvageCore
+        product: SalvageCore
+      - package: SalvageDiskIO
+        product: SalvageDiskIO
+
 schemes:
   Salvage:
     build:
@@ -58,6 +75,7 @@ schemes:
     test:
       config: Debug
       targets:
+        - SalvageTests
         - package: SalvageCore/SalvageCoreTests
         - package: SalvageDiskIO/SalvageDiskIOTests
     archive:

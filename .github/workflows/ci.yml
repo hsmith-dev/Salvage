@@ -75,3 +75,14 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             build
+
+      - name: Run app view-model tests
+        run: |
+          xcodebuild \
+            -project Salvage.xcodeproj \
+            -scheme Salvage \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            -only-testing:SalvageTests \
+            CODE_SIGNING_ALLOWED=NO \
+            test

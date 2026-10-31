@@ -27,6 +27,9 @@ let package = Package(
             dependencies: ["SalvageCore"],
             swiftSettings: [
                 .swiftLanguageMode(.v6)
+            ],
+            linkerSettings: [
+                .linkedFramework("DiskArbitration")
             ]
         ),
         .testTarget(

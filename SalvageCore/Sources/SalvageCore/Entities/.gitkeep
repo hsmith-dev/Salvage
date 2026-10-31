@@ -1,2 +1,0 @@
-Reserved for domain entities (BlockDevice, ScanSession, RecoveredFile, LostPartitionCandidate,
-RecoveryConfidence) -- see Architecture Structural Seed. Populated by later Epic 1 stories.

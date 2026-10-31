@@ -44,6 +44,17 @@
             parallelizable = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
+               BlueprintIdentifier = "157BA7DD7D7CEC8AB92F0240"
+               BuildableName = "SalvageTests.xctest"
+               BlueprintName = "SalvageTests"
+               ReferencedContainer = "container:Salvage.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
                BlueprintIdentifier = "SalvageCoreTests"
                BuildableName = "SalvageCoreTests"
                BlueprintName = "SalvageCoreTests"

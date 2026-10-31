@@ -1,22 +1,42 @@
+import SalvageCore
+import SalvageDiskIO
 import SwiftUI
 
-/// The app's initial shell: a blank window, nothing more. Intentionally has no recovery
-/// features, device list, or disk I/O -- those land in later Epic 1 stories (1.3+). Makes zero
-/// network calls, satisfying FR-17/FR-18 from the very first build.
+/// The composition root is the only place connecting a platform reader to the Core engine.
 struct ContentView: View {
+    @State private var scan: ScanViewModel
+    init() { _scan = State(initialValue: ScanViewModel(runner: Self.runScan)) }
+    nonisolated private static func runScan(device: BlockDevice, events: AsyncStream<ScanEvent>.Continuation) async throws {
+        let reader = try await RawBlockReader.prepare(device: device)
+        await ScanSession(reader: reader).run(events: events)
+        await reader.close()
+    }
+    @State private var showsTrust = false
     var body: some View {
-        VStack(spacing: 8) {
-            Text("Salvage")
-                .font(.title)
-            Text("Project foundation scaffold -- no recovery features yet.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
+        NavigationSplitView {
+            DeviceListView(isScanning: scan.isActive, activeDeviceID: scan.device?.id) { device in scan.start(device) }
+                .navigationSplitViewColumnWidth(min: 220, ideal: 280)
+        } detail: {
+            if scan.state == .idle {
+                Text("Select a device to start scanning.").foregroundStyle(.secondary)
+            } else { ScanProgressView(model: scan) }
         }
-        .frame(minWidth: 480, minHeight: 320)
-        .padding()
+        .onDisappear { scan.cancel() }
+        .toolbar {
+            Button("What Salvage reads and writes", systemImage: "info.circle") { showsTrust = true }
+        }
+        .sheet(isPresented: $showsTrust) {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("What Salvage reads and writes").font(.headline)
+                ScrollView {
+                    Text("Salvage unmounts the selected device and reads it through a read-only session. This scan indexes intact file metadata and copies no files. Scanning makes no network calls. Your startup drive cannot be scanned while macOS is running from it. The device stays unmounted after scanning; reconnect it to use it in Finder.")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                Button("Done") { showsTrust = false }.keyboardShortcut(.defaultAction)
+            }.padding(24).frame(width: 460, height: 280)
+        }
+        .frame(minWidth: 760, minHeight: 480)
     }
 }
 
-#Preview {
-    ContentView()
-}
+#Preview { ContentView() }
