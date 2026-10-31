@@ -50,7 +50,7 @@ fi
 
 echo
 echo "== [2/3] DiskArbitration must only be imported inside SalvageDiskIO =="
-all_disk_arbitration_imports="$(grep -rnE --exclude-dir=.git --exclude-dir=.build --exclude-dir=DerivedData --include='*.swift' "${import_prefix}DiskArbitration\\b" . 2>/dev/null)"
+all_disk_arbitration_imports="$(grep -rnE --exclude-dir=.git --exclude-dir=.claude --exclude-dir=.build --exclude-dir=DerivedData --include='*.swift' "${import_prefix}DiskArbitration\\b" . 2>/dev/null)"
 leaked="$(printf '%s\n' "$all_disk_arbitration_imports" | grep -v '^\./SalvageDiskIO/' | grep -v '^\./scripts/spike-raw-device-access/' | grep -v '^$')"
 if [ -n "$leaked" ]; then
     echo "VIOLATION: DiskArbitration imported outside SalvageDiskIO:"

@@ -2,7 +2,7 @@
 title: "Verify the App's Privacy Guarantees Yourself"
 type: 'feature'
 created: '2026-10-31'
-status: 'ready-for-dev'
+status: 'done'
 baseline_commit: 'c1b21a3'
 route: 'dispatch'
 review_loop_iteration: 0
@@ -89,15 +89,27 @@ context:
 
 ## Tasks & Acceptance
 
-- [ ] Trust Panel view with the full content, reachable from the toolbar.
-- [ ] UpdateChecker (user-initiated only, ephemeral session, injectable fetch) plus tests for comparing semantic-version tags (with or without a leading `v`) and parse failures.
-- [ ] Menu command, disabled while scanning.
-- [ ] `check-no-network.sh` and its self-test, wired into CI. Both must pass on the current tree.
+- [x] Trust Panel view with the full content, reachable from the toolbar.
+- [x] UpdateChecker (user-initiated only, ephemeral session, injectable fetch) plus tests for comparing semantic-version tags (with or without a leading `v`) and parse failures.
+- [x] Menu command, disabled while scanning.
+- [x] `check-no-network.sh` and its self-test, wired into CI. Both must pass on the current tree.
 
 **Acceptance criteria:**
 - Given first open, an in-app plain-language explanation of what is read and written, and when, is reachable from the main UI.
 - Given a scan or recovery session, there are zero outbound connections. CI enforces this, and nothing in Core or DiskIO can reach the network.
 - Given no scan in progress, the only network call anywhere is the explicit Check for Updates action.
+
+## Implementation Notes
+
+- **Scan state reaches the app menu through a tracker, not `ScanViewModel`.** The menu lives in `SalvageApp`, but the `ScanViewModel` is built inside `ContentView` (Story 1.5's code). The new `ScanActivity` (`Salvage/Updates/UpdateCommands.swift`) is an app-level observable that each window reports its `scan.isActive` to. The reporting is done by the `.trustPanel(isPresented:isScanning:)` modifier that replaced the old inline `.sheet`, so the `ContentView` edit is a single line in the sheet slot. This also keeps the menu item disabled when a different window (such as the update window) has focus during a scan. A `focusedSceneValue` would not do that.
+- **Where the update result shows.** The menu item opens a small `Window` scene ("Check for Updates") that shows the result. The Trust Panel's own "Check for Updates…" button shows the same status inline. Both read one shared `UpdateChecker`. Opening or restoring the window never starts a check; only the menu item, the panel's button, and the window's "Check Again" button do, and all three are disabled while scanning. EXPERIENCE.md mentions Install/Later. The frozen spec forbids installing, so the only action is "Open Release Page" (`NSWorkspace`).
+- **Request headers.** The ephemeral session has cookies, cache and credential storage turned off. The request sets `Accept: application/vnd.github+json` and replaces the default user agent (which names the macOS/CFNetwork build) with a bare `User-Agent: Salvage`, which GitHub's API requires. The Trust Panel says plainly that GitHub can still see the user's IP address.
+- **Release page validation.** `html_url` is used only if it is an `https://github.com/hsmith-dev/Salvage/...` URL. Otherwise the page falls back to the fixed `/releases/latest` page.
+- **Version comparison.** A leading `v`/`V` is stripped and pre-release or build suffixes (`-beta`, `+meta`) are ignored, since `/releases/latest` never returns a pre-release. Missing components count as 0 (`0.1` = `0.1.0`). Non-numeric tags are a plain "couldn't read" failure. A non-200 status names the status code.
+- **Checker details.** `check-no-network.sh` accepts an optional root argument, so `test-check-no-network.sh` plants violations in a temporary `rsync` copy and never touches the real tree. This differs from `test-check-core-boundary.sh`, which writes into the real tree. `socket(` and `connect(` are matched on a word boundary so `disconnect(` doesn't trip the check. The `Package.swift` search skips hidden directories, so running it from the main checkout doesn't scan `.claude/worktrees/*`. A commented-out `.package(url:` line also fails, which is the deliberately conservative choice.
+- **Sandbox.** `project.yml` and `project.pbxproj` have no entitlements and no `ENABLE_APP_SANDBOX`, so the app isn't sandboxed and no entitlement was added.
+- **Xcode project.** `Salvage` sources aren't folder-synchronized, so `Salvage.xcodeproj` was regenerated with `xcodegen generate`. The diff only adds the three new files.
+- **Not touched.** `deferred-work.md` still lists the AD-12 enforcement gap from Story 1.1. Its entry, and `sprint-status.yaml`, were left alone because they are shared files that the parallel story branches would conflict on. Mark that entry resolved when merging.
 
 ## Verification
 

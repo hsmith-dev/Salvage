@@ -7,6 +7,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-1-project-foundation-trustworthy-module-scaffold.md`
   summary: Implement AD-12's zero-network CI enforcement (fail the build if any network-capable API appears outside the designated Check-for-Updates path).
   evidence: Architecture AD-12 documents this as a first-class requirement, and epic-1-context.md names it, but no story in Epic 1 besides 1.11 ("Verify the App's Privacy Guarantees Yourself") owns implementing it. Out of Story 1.1's committed scope (frozen Intent names only AD-1/AD-9/AD-10) -- flagged here so it isn't silently forgotten before Story 1.11 starts.
+  status: resolved by Story 1.11 (scripts/check-no-network.sh + self-test, wired into CI).
 
 - source_spec: `spec-1-4-scan-a-fat32-exfat-device-with-live-progress.md`
   summary: Bound boot-disk metadata subprocess execution and drain both output streams so watcher startup and scan preparation cannot hang indefinitely.
