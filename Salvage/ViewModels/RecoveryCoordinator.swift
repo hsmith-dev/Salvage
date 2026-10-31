@@ -53,18 +53,30 @@ enum RecoveryPaths {
     /// Bytes of UTF-8 a sanitized component may use, leaving room under NAME_MAX (255) for a
     /// collision suffix and the temporary `.partial` name.
     static let maxComponentBytes = 200
+    /// UTF-8 bytes of the file name kept in its temporary `.partial` name.
+    static let partialStemBytes = 40
 
     /// Makes one name or path component safe to create: removes NUL, `/`, `:` and other C0
-    /// control characters, strips leading dots, and maps an empty, `.` or `..` result to `_`.
+    /// control characters, strips leading dots together with any leading combining marks and
+    /// invisible (format / default-ignorable) characters -- working on Unicode scalars, so a dot
+    /// followed by a combining mark can't hide from the check -- and maps an empty result to `_`.
     static func sanitize(_ component: String) -> String {
-        var scalars = String.UnicodeScalarView()
-        for scalar in component.unicodeScalars where scalar != "/" && scalar != ":" && scalar.value >= 0x20 && scalar.value != 0x7F {
-            scalars.append(scalar)
+        var scalars: [Unicode.Scalar] = component.unicodeScalars.filter {
+            $0 != "/" && $0 != ":" && $0.value >= 0x20 && $0.value != 0x7F
         }
-        var name = String(scalars)
-        while name.hasPrefix(".") { name.removeFirst() }
+        while let first = scalars.first, first == "." || isInvisibleLeader(first) { scalars.removeFirst() }
+        var view = String.UnicodeScalarView()
+        view.append(contentsOf: scalars)
+        let name = String(view)
         if name.isEmpty || name == "." || name == ".." { return "_" }
         return truncate(name, keepingExtension: true)
+    }
+
+    private static func isInvisibleLeader(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.properties.generalCategory {
+        case .nonspacingMark, .spacingMark, .enclosingMark, .format: return true
+        default: return scalar.properties.isDefaultIgnorableCodePoint
+        }
     }
 
     /// The sanitized folder components of `file.path` (the file's own name excluded).
@@ -86,6 +98,27 @@ enum RecoveryPaths {
         return ext.isEmpty ? "\(stem) (\(attempt))" : "\(stem) (\(attempt)).\(ext)"
     }
 
+    /// The temporary name a file is streamed into: at most `partialStemBytes` of its name (cut on
+    /// a scalar boundary), a random tag and `.partial`.
+    static func partialName(for finalName: String) -> String {
+        var stem = String.UnicodeScalarView()
+        var bytes = 0
+        for scalar in finalName.unicodeScalars {
+            let size = String(scalar).utf8.count
+            guard bytes + size <= partialStemBytes else { break }
+            stem.append(scalar); bytes += size
+        }
+        return "\(String(stem)).\(UUID().uuidString.prefix(8)).partial"
+    }
+
+    /// Whether an absolute path stays under the OS path limit (PATH_MAX bytes including the NUL).
+    static func fitsPathLimit(_ path: String) -> Bool { path.utf8.count < Int(PATH_MAX) }
+
+    /// `base` + "/" + each component, without touching the file system.
+    static func join(_ base: String, _ components: [String]) -> String {
+        components.reduce(base) { $0.utf8.last == UInt8(ascii: "/") ? $0 + $1 : $0 + "/" + $1 }
+    }
+
     private static func truncate(_ name: String, keepingExtension: Bool) -> String {
         guard name.utf8.count > maxComponentBytes else { return name }
         let ns = name as NSString
@@ -103,28 +136,38 @@ enum RecoveryPaths {
 
 /// Copies files from the source into a fresh root folder under the destination, one at a time.
 /// Every directory and file is created relative to an open directory descriptor with
-/// `O_NOFOLLOW`, so no component can redirect a write through a symlink, and each target folder's
-/// real path is confirmed to sit inside the root before anything is written there.
+/// `O_NOFOLLOW`, so no component can redirect a write through a symlink, and each target folder
+/// is confirmed to sit inside the root -- by walking its `..` chain and comparing
+/// `(st_dev, st_ino)` with the root's, which needs no path strings -- before anything is written.
 struct RecoveryEngine: Sendable {
     let content: FileContentReader
+    /// Flushes a file to stable storage before it is published; returns an errno on failure.
+    var sync: @Sendable (Int32) -> Int32? = { RecoveryEngine.durableSync($0) }
+    var publishOps = PublishOps.live
 
-    func run(files: [RecoveredFile], rootName: String, in destination: URL,
+    func run(files: [RecoveredFile], rootName: String, in destination: URL, checked: DestinationAssessment,
              progress: @Sendable (RecoveryProgress) -> Void) async -> Result<RecoverySummary, RecoveryStartError> {
         let destinationPath = destination.resolvingSymlinksInPath().path
         let destinationFD = open(destinationPath, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
         guard destinationFD >= 0 else { return .failure(.destinationUnavailable(Self.describe(errno: errno))) }
         defer { close(destinationFD) }
+        // The folder actually opened must be on the volume that was checked; a volume mounted
+        // over the path (or a swapped symlink) since the check means the verdict doesn't apply.
+        guard checked.covers(openedMountSource: mountSourceName(ofDescriptor: destinationFD)) else {
+            return .failure(.destinationUnsafe)
+        }
 
-        let rootFD: Int32
+        let rootFD: Int32, rootActual: String
         switch Self.makeDirectory(in: destinationFD, named: RecoveryPaths.sanitize(rootName), reuseExisting: false) {
-        case .success(let made): rootFD = made.0
+        case .success(let made): (rootFD, rootActual) = made
         case .failure(let error): return .failure(.destinationUnavailable(Self.describe(errno: error.code)))
         }
         defer { close(rootFD) }
-        guard let rootReal = Self.realPath(of: rootFD) else {
+        guard let rootID = FileID(fd: rootFD) else {
             return .failure(.destinationUnavailable("Couldn't open the recovery folder."))
         }
-        let rootURL = URL(fileURLWithPath: rootReal, isDirectory: true)
+        let rootPath = RecoveryPaths.join(destinationPath, [rootActual])
+        let rootURL = URL(fileURLWithPath: rootPath, isDirectory: true)
 
         var directoryNames: [String: String] = [:]  // logical relative folder path -> actual name
         var written: [RecoveredCopy] = []
@@ -137,7 +180,8 @@ struct RecoveryEngine: Sendable {
             state.currentName = file.name
             progress(state)
             let baseBytes = state.bytesDone
-            let outcome = await copy(file, rootFD: rootFD, rootReal: rootReal, directoryNames: &directoryNames) { done in
+            let root = Root(fd: rootFD, id: rootID, path: rootPath)
+            let outcome = await copy(file, root: root, directoryNames: &directoryNames) { done in
                 var update = state
                 update.bytesDone = baseBytes + done
                 progress(update)
@@ -188,18 +232,32 @@ struct RecoveryEngine: Sendable {
         }
     }
 
-    private func copy(_ file: RecoveredFile, rootFD: Int32, rootReal: String, directoryNames: inout [String: String],
+    struct Root {
+        let fd: Int32
+        let id: FileID
+        let path: String
+    }
+
+    private func copy(_ file: RecoveredFile, root: Root, directoryNames: inout [String: String],
                       progress: (Int64) -> Void) async -> Result<RecoveredCopy, CopyFailure> {
         do { try content.validate(file) } catch let error as FileContentError {
             return .failure(error == .unmapped ? .unmapped : .damagedMapping)
         } catch { return .failure(.damagedMapping) }
 
+        let components = RecoveryPaths.folderComponents(of: file)
+        let finalName = RecoveryPaths.sanitize(file.name)
+        // Refuse up front (before creating any folder) a path the OS can't name as a whole.
+        guard RecoveryPaths.fitsPathLimit(RecoveryPaths.join(root.path, components + [finalName])) else {
+            return .failure(.destination(ENAMETOOLONG))
+        }
+
         // Open (creating as needed) each folder level below the root.
-        var dirFD = dup(rootFD)
+        var dirFD = dup(root.fd)
         guard dirFD >= 0 else { return .failure(.destination(errno)) }
         defer { close(dirFD) }
         var logical = ""
-        for component in RecoveryPaths.folderComponents(of: file) {
+        var actualComponents: [String] = []
+        for component in components {
             logical += "/" + component
             let made: Result<(Int32, String), Errno>
             if let known = directoryNames[logical] {
@@ -211,15 +269,14 @@ struct RecoveryEngine: Sendable {
             case .success(let (fd, actual)):
                 close(dirFD); dirFD = fd
                 directoryNames[logical] = actual
+                actualComponents.append(actual)
             case .failure(let error): return .failure(.destination(error.code))
             }
         }
-        guard let dirReal = Self.realPath(of: dirFD), dirReal == rootReal || dirReal.hasPrefix(rootReal + "/") else {
-            return .failure(.outsideRoot)
-        }
+        guard Self.isInside(dirFD, root: root.id, maxLevels: components.count) else { return .failure(.outsideRoot) }
+        let dirPath = RecoveryPaths.join(root.path, actualComponents)
 
-        let finalName = RecoveryPaths.sanitize(file.name)
-        let partialName = "\(finalName.prefix(40)).\(UUID().uuidString.prefix(8)).partial"
+        let partialName = RecoveryPaths.partialName(for: finalName)
         let fd = openat(dirFD, partialName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o644)
         guard fd >= 0 else { return .failure(.destination(errno)) }
         var fdOpen = true
@@ -255,28 +312,125 @@ struct RecoveryEngine: Sendable {
                          timespec(tv_sec: Int(seconds), tv_nsec: max(0, min(nanos, 999_999_999)))]
             if futimens(fd, &times) != 0 { let code = errno; discard(); return .failure(.destination(code)) }
         }
-        if fsync(fd) != 0 { let code = errno; discard(); return .failure(.destination(code)) }
+        if let code = sync(fd) { discard(); return .failure(.destination(code)) }
         close(fd); fdOpen = false
 
-        // Atomic, never-overwriting publish: RENAME_EXCL fails with EEXIST instead of replacing.
+        switch Self.publish(partialName, as: finalName, in: dirFD, ops: publishOps,
+                            fits: { RecoveryPaths.fitsPathLimit(RecoveryPaths.join(dirPath, [$0])) }) {
+        case .success(let name):
+            _ = fsync(dirFD)
+            let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+            let url = URL(fileURLWithPath: dirPath, isDirectory: true).appendingPathComponent(name, isDirectory: false)
+            return .success(RecoveredCopy(sourcePath: file.path, url: url, bytes: total, sha256: digest))
+        case .failure(let error):
+            discard(); return .failure(.destination(error.code))
+        }
+    }
+
+    // MARK: Publishing
+
+    /// The directory-entry primitives `publish` uses; injectable so each fallback can be tested
+    /// on any file system. Each returns 0 or an errno.
+    struct PublishOps: Sendable {
+        var renameExclusive: @Sendable (Int32, String, String) -> Int32
+        var link: @Sendable (Int32, String, String) -> Int32
+        var createExclusive: @Sendable (Int32, String) -> Int32
+        var rename: @Sendable (Int32, String, String) -> Int32
+
+        static let live = PublishOps(
+            renameExclusive: { dir, from, to in renameatx_np(dir, from, dir, to, UInt32(RENAME_EXCL)) == 0 ? 0 : errno },
+            link: { dir, from, to in linkat(dir, from, dir, to, 0) == 0 ? 0 : errno },
+            createExclusive: { dir, name in
+                let fd = openat(dir, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o644)
+                guard fd >= 0 else { return errno }
+                close(fd); return 0
+            },
+            rename: { dir, from, to in renameat(dir, from, dir, to) == 0 ? 0 : errno }
+        )
+    }
+
+    /// Gives the finished `.partial` file its final name without ever replacing an existing file,
+    /// trying " (2)"-style names on `EEXIST`. Strategies, in order of preference:
+    ///
+    /// 1. `renameatx_np(RENAME_EXCL)`: atomic and no-overwrite (APFS, HFS+, most local volumes).
+    /// 2. If that's unsupported (`ENOTSUP`/`EINVAL`), `linkat(partial -> final)` -- also atomic
+    ///    and no-overwrite, since a link never replaces an existing name -- then `unlinkat(partial)`.
+    /// 3. If hard links are unsupported too (FAT32, exFAT: both calls return `ENOTSUP`), create the
+    ///    final name as an empty placeholder with `O_CREAT | O_EXCL | O_NOFOLLOW`, then
+    ///    `renameat(partial, final)`. The exclusive create proves the name was free, so the rename
+    ///    replaces only the placeholder this run just made. Chosen over copying the bytes a second
+    ///    time: it costs no extra I/O, and the only residual race (another process deleting our
+    ///    placeholder and creating its own file at that name in the instant before the rename) is
+    ///    acceptable on these permission-less volumes. If the rename fails the placeholder is removed.
+    ///
+    /// Returns the name used, or the errno that stopped it.
+    static func publish(_ partial: String, as finalName: String, in dirFD: Int32, ops: PublishOps,
+                        fits: (String) -> Bool = { _ in true }) -> Result<String, Errno> {
+        enum Strategy { case renameExclusive, link, placeholder }
+        var strategy = Strategy.renameExclusive
         var attempt = 1
-        while true {
+        while attempt <= 10_000 {
             let name = RecoveryPaths.candidate(finalName, attempt: attempt, isDirectory: false)
-            if renameatx_np(dirFD, partialName, dirFD, name, UInt32(RENAME_EXCL)) == 0 {
-                _ = fsync(dirFD)
-                let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
-                let url = URL(fileURLWithPath: dirReal, isDirectory: true).appendingPathComponent(name, isDirectory: false)
-                return .success(RecoveredCopy(sourcePath: file.path, url: url, bytes: total, sha256: digest))
+            guard fits(name) else { return .failure(Errno(code: ENAMETOOLONG)) }
+            let code: Int32
+            switch strategy {
+            case .renameExclusive:
+                code = ops.renameExclusive(dirFD, partial, name)
+                if code == ENOTSUP || code == EOPNOTSUPP || code == EINVAL { strategy = .link; continue }
+            case .link:
+                code = ops.link(dirFD, partial, name)
+                if code == 0 { _ = unlinkat(dirFD, partial, 0) }
+                if [ENOTSUP, EOPNOTSUPP, EPERM, EINVAL, EMLINK].contains(code) { strategy = .placeholder; continue }
+            case .placeholder:
+                let created = ops.createExclusive(dirFD, name)
+                if created == 0 {
+                    let renamed = ops.rename(dirFD, partial, name)
+                    if renamed != 0 { _ = unlinkat(dirFD, name, 0) }
+                    code = renamed
+                } else {
+                    code = created
+                }
             }
-            let code = errno
-            guard code == EEXIST, attempt < 10_000 else { discard(); return .failure(.destination(code)) }
+            if code == 0 { return .success(name) }
+            guard code == EEXIST else { return .failure(Errno(code: code)) }
             attempt += 1
         }
+        return .failure(Errno(code: EEXIST))
     }
 
     // MARK: POSIX helpers
 
     struct Errno: Error, Equatable { let code: Int32 }
+
+    /// A file's identity on its volume.
+    struct FileID: Equatable {
+        let device: dev_t
+        let inode: ino_t
+        init?(fd: Int32) {
+            var info = stat()
+            guard fstat(fd, &info) == 0 else { return nil }
+            device = info.st_dev; inode = info.st_ino
+        }
+    }
+
+    /// Whether the directory open as `fd` is the root or sits at most `maxLevels` folders below
+    /// it: walks `..` with `O_NOFOLLOW` relative opens and compares `(st_dev, st_ino)`, so it
+    /// needs no path strings and works at any depth. Reaching the file system's top (or any
+    /// error) without meeting the root means outside.
+    static func isInside(_ fd: Int32, root: FileID, maxLevels: Int) -> Bool {
+        var current = dup(fd)
+        guard current >= 0 else { return false }
+        defer { close(current) }
+        for _ in 0...max(0, maxLevels) {
+            guard let id = FileID(fd: current) else { return false }
+            if id == root { return true }
+            let parent = openat(current, "..", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            guard parent >= 0 else { return false }
+            close(current); current = parent
+            if FileID(fd: parent) == id { return false }  // "/" is its own parent
+        }
+        return false
+    }
 
     /// Creates (or, with `reuseExisting`, opens an existing real directory) under `parent`,
     /// adding " (2)"-style suffixes when the name is taken by something else. Never follows a
@@ -302,11 +456,17 @@ struct RecoveryEngine: Sendable {
         return .failure(Errno(code: EEXIST))
     }
 
-    static func realPath(of fd: Int32) -> String? {
-        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
-        guard fcntl(fd, F_GETPATH, &buffer) != -1 else { return nil }
-        let path = String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
-        return path.isEmpty ? nil : path
+    /// `F_FULLFSYNC` (flushes the drive's own write cache, which plain `fsync` doesn't on macOS),
+    /// falling back to `fsync` where the file system or device doesn't support it. Returns an
+    /// errno on failure.
+    static func durableSync(_ fd: Int32,
+                            fullSync: (Int32) -> Int32 = { fcntl($0, F_FULLFSYNC) == -1 ? errno : 0 },
+                            plainSync: (Int32) -> Int32 = { fsync($0) == 0 ? 0 : errno }) -> Int32? {
+        let full = fullSync(fd)
+        if full == 0 { return nil }
+        guard [ENOTSUP, EOPNOTSUPP, ENOTTY, EINVAL].contains(full) else { return full }
+        let plain = plainSync(fd)
+        return plain == 0 ? nil : plain
     }
 
     /// Writes every byte, retrying short writes and EINTR. Returns the errno on failure.
@@ -361,16 +521,19 @@ final class RecoveryCoordinator {
     private let engine: RecoveryEngine
     private let deviceName: String
     private let now: @Sendable () -> Date
-    private let destinationCheck: @Sendable (URL) -> DestinationVerdict
+    private let destinationCheck: @Sendable (URL) -> DestinationAssessment
     private var task: Task<Void, Never>?
     private var checkGeneration = 0
 
     init(files: [RecoveredFile], content: FileContentReader, deviceName: String,
          now: @escaping @Sendable () -> Date = { Date() },
-         destinationCheck: @escaping @Sendable (URL) -> DestinationVerdict) {
+         sync: (@Sendable (Int32) -> Int32?)? = nil,
+         destinationCheck: @escaping @Sendable (URL) -> DestinationAssessment) {
         self.files = files
         self.totalBytes = files.reduce(0) { $0 + max(0, $1.sizeBytes) }
-        self.engine = RecoveryEngine(content: content)
+        var engine = RecoveryEngine(content: content)
+        if let sync { engine.sync = sync }
+        self.engine = engine
         self.deviceName = deviceName
         self.now = now
         self.destinationCheck = destinationCheck
@@ -379,20 +542,31 @@ final class RecoveryCoordinator {
     convenience init(files: [RecoveredFile], source: SourceSession) {
         let device = source.device
         self.init(files: files, content: source.content, deviceName: device.displayName,
-                  destinationCheck: { DestinationSafety.live.check(destination: $0, source: device) })
+                  destinationCheck: { DestinationSafety.live.assess(destination: $0, source: device) })
     }
 
-    var canRecover: Bool { phase == .ready && destinationStatus == .safe && !files.isEmpty }
+    /// Whether the confirmation is showing: before a run, or after one failed to start (the user
+    /// may then pick another folder or retry).
+    var isConfirming: Bool {
+        switch phase {
+        case .ready, .failedToStart: true
+        case .running, .finished: false
+        }
+    }
 
-    /// Records the chosen folder and checks it off the main thread.
+    var canRecover: Bool { isConfirming && destinationStatus == .safe && !files.isEmpty }
+
+    /// Records the chosen folder and checks it off the main thread. Choosing again after a failed
+    /// start clears the failure and returns to the ready state.
     func chooseDestination(_ url: URL) async {
-        guard phase == .ready else { return }
+        guard isConfirming else { return }
+        phase = .ready
         checkGeneration += 1
         let generation = checkGeneration
         destination = url
         destinationStatus = .checking
         let check = destinationCheck
-        let verdict = await Task.detached { check(url) }.value
+        let verdict = await Task.detached { check(url).verdict }.value
         guard generation == checkGeneration else { return }
         destinationStatus = verdict.isSafe ? .safe : .blocked
     }
@@ -404,20 +578,23 @@ final class RecoveryCoordinator {
         let rootName = Self.rootFolderName(device: deviceName, date: now())
         task = Task { [weak self] in
             // Re-check right before writing: the volume under the chosen path may have changed.
-            let verdict = await Task.detached { check(destination) }.value
+            let assessment = await Task.detached { check(destination) }.value
             if Task.isCancelled { self?.phase = .ready; return }
-            guard verdict.isSafe else {
+            guard assessment.verdict.isSafe else {
                 self?.destinationStatus = .blocked
                 self?.phase = .ready
                 return
             }
             let (stream, continuation) = AsyncStream<RecoveryProgress>.makeStream(bufferingPolicy: .bufferingNewest(1))
             async let result = Self.runEngine(engine, files: files, rootName: rootName, destination: destination,
-                                              continuation: continuation)
+                                              checked: assessment, continuation: continuation)
             for await update in stream { self?.progress = update }
             switch await result {
             case .success(let summary): self?.phase = .finished(summary)
-            case .failure(.destinationUnsafe): self?.phase = .failedToStart(Self.blockedMessage)
+            case .failure(.destinationUnsafe):
+                // The folder opened wasn't on the checked volume: block, exactly like a bad verdict.
+                self?.destinationStatus = .blocked
+                self?.phase = .ready
             case .failure(.destinationUnavailable(let reason)): self?.phase = .failedToStart(reason)
             }
         }
@@ -429,10 +606,11 @@ final class RecoveryCoordinator {
     func waitUntilFinished() async { await task?.value }
 
     nonisolated private static func runEngine(_ engine: RecoveryEngine, files: [RecoveredFile], rootName: String,
-                                              destination: URL, continuation: AsyncStream<RecoveryProgress>.Continuation)
+                                              destination: URL, checked: DestinationAssessment,
+                                              continuation: AsyncStream<RecoveryProgress>.Continuation)
         async -> Result<RecoverySummary, RecoveryStartError> {
         defer { continuation.finish() }
-        return await engine.run(files: files, rootName: rootName, in: destination) { continuation.yield($0) }
+        return await engine.run(files: files, rootName: rootName, in: destination, checked: checked) { continuation.yield($0) }
     }
 
     nonisolated static func rootFolderName(device: String, date: Date) -> String {

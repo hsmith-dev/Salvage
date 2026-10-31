@@ -5,13 +5,16 @@ import SalvageDiskIO
 import Testing
 @testable import Salvage
 
-/// In-memory device. Reads at `failAt` throw; reads at `blockAt` wait until the task is cancelled.
+/// In-memory device. Reads at `failAt` throw; reads at `blockAt` wait until the task is cancelled;
+/// `onRead` runs before every read (tests use it to change the destination mid-run).
 private struct MemoryReader: BlockReader {
     let bytes: Data
     var failAt: Int64? = nil
     var blockAt: Int64? = nil
+    var onRead: (@Sendable (Int64) -> Void)? = nil
     var sizeBytes: Int64 { Int64(bytes.count) }
     func read(at offset: Int64, count: Int) async throws -> Data {
+        onRead?(offset)
         if offset == failAt { throw ScanError.io("injected") }
         if offset == blockAt {
             while !Task.isCancelled { try? await Task.sleep(for: .milliseconds(5)) }
@@ -38,6 +41,18 @@ private final class TempDir {
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     }
     deinit { try? FileManager.default.removeItem(at: url) }
+    /// Relative paths of the regular files (not folders or links) under this directory.
+    func regularFiles() -> [String] { Self.regularFiles(under: url) }
+    static func regularFiles(under url: URL) -> [String] {
+        let base = url.resolvingSymlinksInPath()
+        let enumerator = FileManager.default.enumerator(atPath: base.path)
+        var all: [String] = []
+        while let item = enumerator?.nextObject() as? String { all.append(item) }
+        return all.sorted().filter { relative in
+            var info = stat()
+            return lstat(base.appendingPathComponent(relative).path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFREG
+        }
+    }
     func allFiles() -> [String] {
         let base = url.resolvingSymlinksInPath().path
         let enumerator = FileManager.default.enumerator(atPath: base)
@@ -49,13 +64,26 @@ private final class TempDir {
 
 private func deviceBytes(_ count: Int) -> Data { Data((0..<count).map { UInt8(truncatingIfNeeded: $0 &* 31 &+ 7) }) }
 
+/// A destination check with a fixed verdict, reporting the real volume of the checked path (so the
+/// engine's `fstatfs` confirmation of the opened folder passes).
+private func checked(_ verdict: DestinationVerdict) -> @Sendable (URL) -> DestinationAssessment {
+    { url in DestinationAssessment(verdict: verdict, mountSource: mountSourceName(ofPath: url.resolvingSymlinksInPath().path)) }
+}
+
 @MainActor
 private func recover(_ files: [RecoveredFile], reader: MemoryReader, into dir: TempDir, chunk: Int = 512,
                      verdict: DestinationVerdict = .safe) async -> RecoveryCoordinator {
+    await recover(files, reader: reader, into: dir.url, chunk: chunk, verdict: verdict)
+}
+
+@MainActor
+private func recover(_ files: [RecoveredFile], reader: MemoryReader, into url: URL, chunk: Int = 512,
+                     verdict: DestinationVerdict = .safe,
+                     sync: (@Sendable (Int32) -> Int32?)? = nil) async -> RecoveryCoordinator {
     let coordinator = RecoveryCoordinator(files: files, content: FileContentReader(reader: reader, chunkSize: chunk),
                                           deviceName: "Fixture", now: { Date(timeIntervalSince1970: 0) },
-                                          destinationCheck: { _ in verdict })
-    await coordinator.chooseDestination(dir.url)
+                                          sync: sync, destinationCheck: checked(verdict))
+    await coordinator.chooseDestination(url)
     coordinator.start()
     await coordinator.waitUntilFinished()
     return coordinator
@@ -110,12 +138,16 @@ struct RecoveryCoordinatorTests {
         let coordinator = await recover(files, reader: reader, into: dir)
         let result = try #require(summary(coordinator))
         #expect(result.written.count == files.count)
-        let root = result.root.path
-        for copy in result.written { #expect(copy.url.path.hasPrefix(root + "/")) }
-        // Nothing was created beside the root folder.
-        #expect(try FileManager.default.contentsOfDirectory(atPath: dir.url.path) == [result.root.lastPathComponent])
-        let names = Set(dir.allFiles().map { String($0.dropFirst(result.root.lastPathComponent.count + 1)) })
-        #expect(names.isSuperset(of: ["_/_/_/escape.txt", "a/_/_/b/_/c.txt", "dir/evil", "xy/namez", "hidden/profile", "_"]))
+        // Judge by what is actually on disk, not by the URLs the engine reports.
+        let rootName = result.root.lastPathComponent
+        #expect(try FileManager.default.contentsOfDirectory(atPath: dir.url.path) == [rootName])
+        let regular = dir.regularFiles()
+        #expect(regular.count == files.count)
+        #expect(regular.allSatisfy { $0.hasPrefix(rootName + "/") })
+        let names = Set(regular.map { String($0.dropFirst(rootName.count + 1)) })
+        // The ".." file becomes "_", which the "_" folder from the traversal path already holds.
+        #expect(names == ["_/_/_/escape.txt", "a/_/_/b/_/c.txt", "dir/evil", "xy/namez", "hidden/profile", "_ (2)"])
+        #expect(!dir.allFiles().contains { ($0 as NSString).lastPathComponent.hasPrefix(".") })
     }
 
     @Test func collisionsGetNumberedSuffixesAndNeverOverwrite() async throws {
@@ -177,7 +209,7 @@ struct RecoveryCoordinatorTests {
             file("/never.bin", size: 512, content: .runs([DataRun(deviceOffset: 0, length: 512)])),
         ]
         let coordinator = RecoveryCoordinator(files: files, content: FileContentReader(reader: reader, chunkSize: 512),
-                                              deviceName: "Fixture", destinationCheck: { _ in .safe })
+                                              deviceName: "Fixture", destinationCheck: checked(.safe))
         await coordinator.chooseDestination(dir.url)
         coordinator.start()
         while coordinator.progress.currentName != "stuck.bin" || coordinator.progress.bytesDone < 1536 {
@@ -199,7 +231,7 @@ struct RecoveryCoordinatorTests {
             let dir = try TempDir()
             let files = [file("/a.txt", size: 1, content: .resident(Data("a".utf8)))]
             let coordinator = RecoveryCoordinator(files: files, content: FileContentReader(reader: MemoryReader(bytes: Data())),
-                                                  deviceName: "Fixture", destinationCheck: { _ in verdict })
+                                                  deviceName: "Fixture", destinationCheck: checked(verdict))
             await coordinator.chooseDestination(dir.url)
             #expect(coordinator.destinationStatus == .blocked)
             #expect(!coordinator.canRecover)
@@ -216,7 +248,7 @@ struct RecoveryCoordinatorTests {
         let files = [file("/a.txt", size: 1, content: .resident(Data("a".utf8)))]
         let coordinator = RecoveryCoordinator(files: files, content: FileContentReader(reader: MemoryReader(bytes: Data())),
                                               deviceName: "Fixture",
-                                              destinationCheck: { _ in calls.next() == 1 ? .safe : .sameDevice })
+                                              destinationCheck: { url in checked(calls.next() == 1 ? .safe : .sameDevice)(url) })
         await coordinator.chooseDestination(dir.url)
         #expect(coordinator.canRecover)
         coordinator.start()
@@ -253,7 +285,295 @@ struct RecoveryCoordinatorTests {
         #expect(RecoveryPaths.candidate("a.tar.gz", attempt: 2, isDirectory: false) == "a.tar (2).gz")
         #expect(RecoveryPaths.candidate("v1.2", attempt: 3, isDirectory: true) == "v1.2 (3)")
     }
+
+    @Test func sanitizeStripsLeadingCombiningAndInvisibleCharacters() {
+        #expect(RecoveryPaths.sanitize("\u{301}x") == "x")
+        #expect(RecoveryPaths.sanitize(".\u{301}hidden") == "hidden")   // a dot hidden in one grapheme
+        #expect(RecoveryPaths.sanitize("\u{200B}.profile") == "profile")
+        #expect(RecoveryPaths.sanitize("\u{FEFF}\u{20DD}") == "_")
+        #expect(RecoveryPaths.sanitize("e\u{301}t\u{200B}e") == "e\u{301}t\u{200B}e")  // only leading ones go
+        #expect(RecoveryPaths.partialName(for: String(repeating: "e\u{301}", count: 100)).utf8.count < 80)
+    }
+
+    // MARK: Start failure and retry
+
+    @Test func startFailureAllowsChoosingAnotherDestinationAndRetrying() async throws {
+        let dir = try TempDir()
+        let missing = dir.url.appendingPathComponent("gone", isDirectory: true)
+        let files = [file("/a.txt", size: 1, content: .resident(Data("a".utf8)))]
+        let coordinator = RecoveryCoordinator(files: files, content: FileContentReader(reader: MemoryReader(bytes: Data())),
+                                              deviceName: "Fixture", destinationCheck: checked(.safe))
+        await coordinator.chooseDestination(missing)
+        coordinator.start()
+        await coordinator.waitUntilFinished()
+        guard case .failedToStart(let reason) = coordinator.phase else { Issue.record("expected a start failure"); return }
+        #expect(reason == RecoveryEngine.describe(errno: ENOENT))
+
+        // Retrying the same folder once it exists works...
+        try FileManager.default.createDirectory(at: missing, withIntermediateDirectories: true)
+        #expect(coordinator.canRecover)
+        coordinator.start()
+        await coordinator.waitUntilFinished()
+        #expect(summary(coordinator)?.written.count == 1)
+
+        // ...and so does choosing a different folder after a failure, which resets to ready.
+        let again = RecoveryCoordinator(files: files, content: FileContentReader(reader: MemoryReader(bytes: Data())),
+                                        deviceName: "Fixture", destinationCheck: checked(.safe))
+        await again.chooseDestination(dir.url.appendingPathComponent("also-gone"))
+        again.start()
+        await again.waitUntilFinished()
+        if case .failedToStart = again.phase {} else { Issue.record("expected a start failure") }
+        let other = try TempDir()
+        await again.chooseDestination(other.url)
+        #expect(again.phase == .ready && again.destination == other.url && again.canRecover)
+        again.start()
+        await again.waitUntilFinished()
+        #expect(summary(again)?.written.count == 1)
+    }
+
+    // MARK: The opened folder must be on the checked volume
+
+    @Test func openedFolderOnAnotherVolumeThanCheckedIsBlocked() async throws {
+        let dir = try TempDir()
+        let files = [file("/a.txt", size: 1, content: .resident(Data("a".utf8)))]
+        let coordinator = RecoveryCoordinator(files: files, content: FileContentReader(reader: MemoryReader(bytes: Data())),
+                                              deviceName: "Fixture",
+                                              destinationCheck: { _ in DestinationAssessment(verdict: .safe, mountSource: "/dev/disk999s9") })
+        await coordinator.chooseDestination(dir.url)
+        #expect(coordinator.canRecover)
+        coordinator.start()
+        await coordinator.waitUntilFinished()
+        #expect(coordinator.destinationStatus == .blocked && coordinator.phase == .ready)
+        #expect(dir.allFiles().isEmpty)
+    }
+
+    // MARK: Durability
+
+    @Test func eachFileIsFullySyncedBeforeItIsPublished() async throws {
+        let dir = try TempDir()
+        let log = SyncLog()
+        let base = dir.url
+        let files = [file("/a.txt", size: 1, content: .resident(Data("a".utf8))),
+                     file("/b.txt", size: 1, content: .resident(Data("b".utf8)))]
+        let coordinator = await recover(files, reader: MemoryReader(bytes: Data()), into: base, sync: { fd in
+            let published = TempDir.regularFiles(under: base).filter { !$0.hasSuffix(".partial") }
+            log.append(published.map { ($0 as NSString).lastPathComponent })
+            return RecoveryEngine.durableSync(fd)
+        })
+        #expect(summary(coordinator)?.written.count == 2)
+        #expect(log.entries == [[], ["a.txt"]])
+    }
+
+    @Test func fullSyncFallsBackToFsyncOnlyWhenUnsupported() {
+        let plain = Counter()
+        #expect(RecoveryEngine.durableSync(3, fullSync: { _ in 0 }, plainSync: { _ in _ = plain.next(); return 0 }) == nil)
+        #expect(RecoveryEngine.durableSync(3, fullSync: { _ in ENOTSUP }, plainSync: { _ in _ = plain.next(); return 0 }) == nil)
+        #expect(RecoveryEngine.durableSync(3, fullSync: { _ in ENOTTY }, plainSync: { _ in _ = plain.next(); return EIO }) == EIO)
+        #expect(RecoveryEngine.durableSync(3, fullSync: { _ in EIO }, plainSync: { _ in _ = plain.next(); return 0 }) == EIO)
+        #expect(plain.next() == 3)  // fsync ran only for the two unsupported cases
+    }
+
+    // MARK: Publishing without RENAME_EXCL (FAT32, exFAT, ...)
+
+    @Test(arguments: [false, true]) func publishFallsBackWithoutEverOverwriting(linksUnsupported: Bool) throws {
+        let dir = try TempDir()
+        let fd = open(dir.url.path, O_RDONLY | O_DIRECTORY)
+        defer { close(fd) }
+        try Data("keep".utf8).write(to: dir.url.appendingPathComponent("a.txt"))
+        try Data("new".utf8).write(to: dir.url.appendingPathComponent("a.partial"))
+        var ops = RecoveryEngine.PublishOps.live
+        ops.renameExclusive = { _, _, _ in ENOTSUP }
+        if linksUnsupported { ops.link = { _, _, _ in ENOTSUP } }
+        let published = RecoveryEngine.publish("a.partial", as: "a.txt", in: fd, ops: ops)
+        #expect(published == .success("a (2).txt"))
+        #expect(try Data(contentsOf: dir.url.appendingPathComponent("a.txt")) == Data("keep".utf8))
+        #expect(try Data(contentsOf: dir.url.appendingPathComponent("a (2).txt")) == Data("new".utf8))
+        #expect(Set(dir.allFiles()) == ["a.txt", "a (2).txt"])
+    }
+
+    @Test func placeholderIsRemovedWhenTheFinalRenameFails() throws {
+        let dir = try TempDir()
+        let fd = open(dir.url.path, O_RDONLY | O_DIRECTORY)
+        defer { close(fd) }
+        try Data("new".utf8).write(to: dir.url.appendingPathComponent("a.partial"))
+        var ops = RecoveryEngine.PublishOps.live
+        ops.renameExclusive = { _, _, _ in EINVAL }
+        ops.link = { _, _, _ in EPERM }
+        ops.rename = { _, _, _ in EIO }
+        #expect(RecoveryEngine.publish("a.partial", as: "a.txt", in: fd, ops: ops) == .failure(.init(code: EIO)))
+        #expect(dir.allFiles() == ["a.partial"])
+    }
+
+    /// Real FAT32 and exFAT volumes on disk images this test creates in its own temp directory.
+    @Test(.enabled(if: ScratchDiskImage.isAvailable), arguments: ["MS-DOS FAT32", "ExFAT"])
+    func recoversOntoFATVolumes(filesystem: String) async throws {
+        guard let image = ScratchDiskImage(filesystem: filesystem) else {
+            print("Skipping \(filesystem): couldn't create or attach a scratch disk image here.")
+            return
+        }
+        defer { image.detach() }
+        let device = deviceBytes(8192)
+        let fragmented = file("/DCIM/100/photo.jpg", size: 2500, content: .runs([
+            DataRun(deviceOffset: 4096, length: 1024), DataRun(deviceOffset: nil, length: 512),
+            DataRun(deviceOffset: 1024, length: 2048)]), modified: Date(timeIntervalSince1970: 1_600_000_000))
+        let files = [fragmented,
+                     file("/a.txt", size: 1, content: .resident(Data("1".utf8))),
+                     file("/A.TXT", size: 1, content: .resident(Data("2".utf8))),  // same name on FAT
+                     file("/a.txt", size: 1, content: .resident(Data("3".utf8)))]
+        let coordinator = await recover(files, reader: MemoryReader(bytes: device), into: image.mountPoint)
+        let result = try #require(summary(coordinator))
+        #expect(result.failed.isEmpty, "\(result.failed.map(\.reason))")
+        #expect(result.written.count == 4)
+        var expected = device.subdata(in: 4096..<5120)
+        expected.append(Data(count: 512))
+        expected.append(device.subdata(in: 1024..<1988))
+        #expect(try Data(contentsOf: result.root.appendingPathComponent("DCIM/100/photo.jpg")) == expected)
+        #expect(try Data(contentsOf: result.root.appendingPathComponent("a.txt")) == Data("1".utf8))
+        #expect(try Data(contentsOf: result.root.appendingPathComponent("A (2).TXT")) == Data("2".utf8))
+        #expect(try Data(contentsOf: result.root.appendingPathComponent("a (3).txt")) == Data("3".utf8))
+        let names = try FileManager.default.contentsOfDirectory(atPath: result.root.path)
+        #expect(!names.contains { $0.hasSuffix(".partial") })
+        #expect(Set(names.filter { !$0.hasPrefix("._") }) == ["DCIM", "a.txt", "A (2).TXT", "a (3).txt"])
+    }
+
+    // MARK: Containment without path strings
+
+    @Test func deepFoldersBeyondThePathLimitAreReportedAsTooLong() async throws {
+        let dir = try TempDir()
+        let component = String(repeating: "d", count: 200)
+        let deep = "/" + Array(repeating: component, count: 8).joined(separator: "/") + "/deep.txt"
+        let shallow = "/" + Array(repeating: component, count: 3).joined(separator: "/") + "/ok.txt"
+        let files = [file(deep, size: 1, content: .resident(Data("x".utf8))),
+                     file(shallow, size: 1, content: .resident(Data("y".utf8)))]
+        let coordinator = await recover(files, reader: MemoryReader(bytes: Data()), into: dir)
+        let result = try #require(summary(coordinator))
+        #expect(result.failed.map(\.reason) == [RecoveryEngine.CopyFailure.destination(ENAMETOOLONG).reason])
+        #expect(result.failed.first?.reason != RecoveryEngine.CopyFailure.outsideRoot.reason)
+        #expect(result.written.map(\.sourcePath) == [shallow])
+        #expect(try Data(contentsOf: try #require(result.written.first).url) == Data("y".utf8))
+        // Refused before any folder was made: the deep chain's 4th level (still under PATH_MAX,
+        // so it's observable by path) was never created beside the shallow file's folders.
+        let fourth = result.root.appendingPathComponent(Array(repeating: component, count: 4).joined(separator: "/"))
+        #expect(fourth.path.utf8.count < Int(PATH_MAX))
+        #expect(!FileManager.default.fileExists(atPath: fourth.path))
+    }
+
+    @Test func containmentIsCheckedByIdentityNotPath() throws {
+        let dir = try TempDir()
+        let outside = try TempDir()
+        let nested = dir.url.appendingPathComponent(Array(repeating: String(repeating: "n", count: 200), count: 6).joined(separator: "/"))
+        // Build the deep chain with relative mkdirat calls (the absolute path exceeds PATH_MAX).
+        var fd = open(dir.url.path, O_RDONLY | O_DIRECTORY)
+        let root = try #require(RecoveryEngine.FileID(fd: fd))
+        for _ in 0..<6 {
+            #expect(mkdirat(fd, String(repeating: "n", count: 200), 0o755) == 0)
+            let child = openat(fd, String(repeating: "n", count: 200), O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+            close(fd); fd = child
+        }
+        defer { close(fd) }
+        #expect(nested.path.utf8.count >= Int(PATH_MAX))
+        #expect(RecoveryEngine.isInside(fd, root: root, maxLevels: 6))
+        #expect(!RecoveryEngine.isInside(fd, root: root, maxLevels: 5))
+        let other = open(outside.url.path, O_RDONLY | O_DIRECTORY)
+        defer { close(other) }
+        #expect(!RecoveryEngine.isInside(other, root: root, maxLevels: 64))
+    }
+
+    @Test func symlinkPlantedInsideTheRootDuringARunIsNeverFollowed() async throws {
+        let dir = try TempDir()
+        let outside = try TempDir()
+        let base = dir.url.resolvingSymlinksInPath()
+        let target = outside.url
+        let planted = Counter()
+        // While "/trigger.bin" is being read, swap the root's "known" folder for a symlink to
+        // `outside` and plant a symlink at "fresh" too.
+        let reader = MemoryReader(bytes: deviceBytes(1024), onRead: { _ in
+            guard planted.next() == 1,
+                  let rootName = try? FileManager.default.contentsOfDirectory(atPath: base.path).first else { return }
+            let root = base.appendingPathComponent(rootName)
+            try? FileManager.default.moveItem(at: root.appendingPathComponent("known"), to: root.appendingPathComponent("moved"))
+            try? FileManager.default.createSymbolicLink(at: root.appendingPathComponent("known"), withDestinationURL: target)
+            try? FileManager.default.createSymbolicLink(at: root.appendingPathComponent("fresh"), withDestinationURL: target)
+        })
+        let files = [file("/known/one.txt", size: 1, content: .resident(Data("1".utf8))),
+                     file("/trigger.bin", size: 512, content: .runs([DataRun(deviceOffset: 0, length: 512)])),
+                     file("/known/two.txt", size: 1, content: .resident(Data("2".utf8))),
+                     file("/fresh/three.txt", size: 1, content: .resident(Data("3".utf8)))]
+        let coordinator = await recover(files, reader: reader, into: dir)
+        let result = try #require(summary(coordinator))
+        #expect(outside.allFiles().isEmpty)
+        #expect(result.written.map(\.sourcePath) == ["/known/one.txt", "/trigger.bin", "/fresh/three.txt"])
+        #expect(result.failed.map(\.sourcePath) == ["/known/two.txt"])
+        #expect(try Data(contentsOf: result.root.appendingPathComponent("fresh (2)/three.txt")) == Data("3".utf8))
+        #expect(try Data(contentsOf: result.root.appendingPathComponent("moved/one.txt")) == Data("1".utf8))
+    }
 }
+
+private final class SyncLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [[String]] = []
+    func append(_ entry: [String]) { lock.withLock { stored.append(entry) } }
+    var entries: [[String]] { lock.withLock { stored } }
+}
+
+/// A small FAT32/exFAT disk image created, attached (`-nobrowse`, at a private mount point) and
+/// detached by the test itself. Nothing outside its own temporary directory is touched.
+private final class ScratchDiskImage: @unchecked Sendable {
+    static let hdiutil = "/usr/bin/hdiutil"
+    static var isAvailable: Bool { FileManager.default.isExecutableFile(atPath: hdiutil) }
+
+    let base: URL
+    let mountPoint: URL
+    private var devices: [String] = []
+    private var attached = false
+
+    init?(filesystem: String) {
+        base = FileManager.default.temporaryDirectory.appendingPathComponent("SalvageFATTests-\(UUID().uuidString)", isDirectory: true)
+        mountPoint = base.appendingPathComponent("mnt", isDirectory: true)
+        let image = base.appendingPathComponent("scratch.dmg")
+        do { try FileManager.default.createDirectory(at: mountPoint, withIntermediateDirectories: true) } catch { return nil }
+        // FAT32 needs more than 32 MB of clusters; 64 MB suits both formats.
+        guard Self.run(["create", "-size", "64m", "-fs", filesystem, "-volname", "SALVTEST", image.path]).status == 0 else {
+            cleanUp(); return nil
+        }
+        let attach = Self.run(["attach", "-nobrowse", "-noautoopen", "-mountpoint", mountPoint.path, "-plist", image.path])
+        if let plist = try? PropertyListSerialization.propertyList(from: attach.output, format: nil) as? [String: Any],
+           let entities = plist["system-entities"] as? [[String: Any]] {
+            devices = entities.compactMap { $0["dev-entry"] as? String }
+        }
+        attached = attach.status == 0
+        guard attached, mountSourceName(ofPath: mountPoint.path) != mountSourceName(ofPath: base.path) else {
+            detach(); return nil
+        }
+    }
+
+    func detach() {
+        if attached {
+            if Self.run(["detach", mountPoint.path]).status != 0 {
+                // Only ever the whole disk this image was attached as.
+                if let whole = devices.min(by: { $0.count < $1.count }) { _ = Self.run(["detach", "-force", whole]) }
+            }
+            attached = false
+        }
+        cleanUp()
+    }
+
+    private func cleanUp() { try? FileManager.default.removeItem(at: base) }
+
+    private static func run(_ arguments: [String]) -> (status: Int32, output: Data) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: hdiutil)
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return (-1, Data()) }
+        let output = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, output)
+    }
+}
+
 
 private final class Counter: @unchecked Sendable {
     private let lock = NSLock()

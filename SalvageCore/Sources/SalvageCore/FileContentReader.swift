@@ -39,6 +39,9 @@ public struct FileContentReader: Sendable {
         }
     }
 
+    /// Called once per chunk the iterator produces (tests observe backpressure with it).
+    var chunkObserver: (@Sendable () -> Void)?
+
     /// Reads up to `limit` bytes from the start of the file (e.g. for previews).
     public func prefix(of file: RecoveredFile, limit: Int64) async throws -> Data {
         var result = Data()
@@ -47,43 +50,81 @@ public struct FileContentReader: Sendable {
     }
 
     /// The file's bytes in order, at most `limit` bytes (default: the whole file).
-    public func chunks(of file: RecoveredFile, limit: Int64? = nil) -> AsyncThrowingStream<Data, Error> {
-        let total = min(file.sizeBytes, limit ?? file.sizeBytes)
-        let reader = self.reader, chunkSize = self.chunkSize
-        return AsyncThrowingStream { continuation in
-            let task = Task {
-                do {
-                    try validate(file)
-                    var remaining = total
-                    switch file.content {
-                    case .unmapped: throw FileContentError.unmapped
-                    case .resident(let data):
-                        if remaining > 0 { continuation.yield(data.prefix(Int(remaining))) }
-                    case .runs(let runs):
-                        for run in runs where remaining > 0 {
-                            var done: Int64 = 0
-                            let length = min(run.length, remaining)
-                            while done < length {
-                                try Task.checkCancellation()
-                                let count = Int(min(Int64(chunkSize), length - done))
-                                if let offset = run.deviceOffset {
-                                    let data = try await reader.read(at: offset + done, count: count)
-                                    guard data.count == count else { throw ScanError.io("Short read.") }
-                                    continuation.yield(data)
-                                } else {
-                                    continuation.yield(Data(count: count))
-                                }
-                                done += Int64(count)
-                            }
-                            remaining -= length
-                        }
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
+    ///
+    /// Pull-based: there is no producer task and no buffer. Each `next()` reads (or, for a sparse
+    /// hole, zero-fills) exactly one chunk of at most `chunkSize` bytes, so memory stays bounded
+    /// by one chunk however large the file or its holes are, and a consumer that stops early
+    /// costs nothing further.
+    public func chunks(of file: RecoveredFile, limit: Int64? = nil) -> FileContentChunks {
+        FileContentChunks(content: self, file: file, total: max(0, min(file.sizeBytes, limit ?? file.sizeBytes)))
+    }
+}
+
+/// A file's content as an `AsyncSequence` of `Data` chunks; see `FileContentReader.chunks(of:limit:)`.
+/// Each iterator starts from the beginning of the file.
+public struct FileContentChunks: AsyncSequence, Sendable {
+    public typealias Element = Data
+
+    let content: FileContentReader
+    let file: RecoveredFile
+    let total: Int64
+
+    public func makeAsyncIterator() -> AsyncIterator { AsyncIterator(content: content, file: file, total: total) }
+
+    public struct AsyncIterator: AsyncIteratorProtocol {
+        private let content: FileContentReader
+        private let file: RecoveredFile
+        private var remaining: Int64
+        private var validated = false
+        private var finished = false
+        private var runIndex = 0
+        private var offsetInRun: Int64 = 0
+        private var zeros = Data()
+
+        init(content: FileContentReader, file: RecoveredFile, total: Int64) {
+            self.content = content; self.file = file; self.remaining = total
+        }
+
+        public mutating func next() async throws -> Data? {
+            guard !finished else { return nil }
+            do {
+                let chunk = try await produce()
+                if chunk == nil { finished = true } else { content.chunkObserver?() }
+                return chunk
+            } catch {
+                finished = true
+                throw error
             }
-            continuation.onTermination = { _ in task.cancel() }
+        }
+
+        private mutating func produce() async throws -> Data? {
+            if !validated { try content.validate(file); validated = true }
+            guard remaining > 0 else { return nil }
+            try Task.checkCancellation()
+            switch file.content {
+            case .unmapped: throw FileContentError.unmapped
+            case .resident(let data):
+                defer { remaining = 0 }
+                return data.prefix(Int(remaining))
+            case .runs(let runs):
+                // Skip exhausted (or empty) runs; validation guarantees coverage of `remaining`.
+                while runIndex < runs.count, offsetInRun >= runs[runIndex].length { runIndex += 1; offsetInRun = 0 }
+                guard runIndex < runs.count else { throw FileContentError.runsShorterThanFile }
+                let run = runs[runIndex]
+                let count = Int(Swift.min(Int64(content.chunkSize), run.length - offsetInRun, remaining))
+                let data: Data
+                if let offset = run.deviceOffset {
+                    data = try await content.reader.read(at: offset + offsetInRun, count: count)
+                    guard data.count == count else { throw ScanError.io("Short read.") }
+                } else {
+                    // One zero buffer, allocated once and sliced, serves every hole chunk.
+                    if zeros.count < count { zeros = Data(count: content.chunkSize) }
+                    data = zeros.prefix(count)
+                }
+                offsetInRun += Int64(count)
+                remaining -= Int64(count)
+                return data
+            }
         }
     }
 }
