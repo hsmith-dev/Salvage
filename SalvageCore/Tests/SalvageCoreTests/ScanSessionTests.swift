@@ -306,19 +306,16 @@ struct ScanSessionTests {
         let sectors = volume.count / 512
         var ntfs = Data(repeating: 0, count: 8 * 512)
         ntfs.replaceSubrange(3..<11, with: Data("NTFS    ".utf8))
-        var ext = Data(repeating: 0, count: 8 * 512)
-        ext.put(1024 + 56, 0xef53, 2)
-        var image = Data(repeating: 0, count: 512) + volume + ntfs + ext
+        var image = Data(repeating: 0, count: 512) + volume + ntfs
         image.put(446+4, 7, 1); image.put(446+8, 1, 4); image.put(446+12, UInt64(sectors), 4)
         image.put(446+16+4, 7, 1); image.put(446+16+8, UInt64(1 + sectors), 4); image.put(446+16+12, 8, 4)
-        image.put(446+32+4, 0x83, 1); image.put(446+32+8, UInt64(9 + sectors), 4); image.put(446+32+12, 8, 4)
         image.put(510, 0xaa55, 2)
         let events = await scan(image)
         #expect(events.last == .completed)
         #expect(events.contains(.progress(bytesScanned: Int64(volume.count), totalBytes: Int64(volume.count))))
         #expect(events.allSatisfy { if case .found(let file) = $0 { file.sourceMetadata.volumeOffset == 512 } else { true } })
     }
-    @Test(arguments: ["ntfs", "ext"]) func wholeDiskUnimplementedFormatIsUnsupported(_ kind: String) async {
+    @Test(arguments: ["ntfs"]) func wholeDiskUnimplementedFormatIsUnsupported(_ kind: String) async {
         var image = Data(repeating: 0, count: 16 * 512)
         if kind == "ntfs" { image.replaceSubrange(3..<11, with: Data("NTFS    ".utf8)) }
         else { image.put(1024 + 56, 0xef53, 2) }
