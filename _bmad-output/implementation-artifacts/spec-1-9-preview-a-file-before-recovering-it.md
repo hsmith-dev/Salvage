@@ -56,3 +56,16 @@ context:
 - `./scripts/check-no-network.sh`
 - `xcodebuild -project Salvage.xcodeproj -scheme Salvage -configuration Debug -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO -only-testing:SalvageTests test`
 - `xcodebuild -project Salvage.xcodeproj -scheme Salvage -configuration Debug -destination 'platform=macOS' CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO build`
+
+## Implementation Notes
+
+- **Interface:** `FilePreviewView(file: RecoveredFile, source: SourceSession?)` exactly as contracted. All loading lives in `PreviewLoader` (a `Sendable` struct; `load(_:)` is a nonisolated async function, so it runs off the main actor). It is injectable through `init(readPrefix:)`; `init(source:)` wires it to `source.content.prefix(of:limit:)`. The view drives it from `.task(id: file.id)`, so a selection change cancels the in-flight read.
+- **Read order:** the loader first reads a 4 KiB header for format detection and the raw-bytes dump. It then reads the rest, up to the format's cap, only when needed. An image or PDF larger than 32 MiB is refused as "too large" after the header read only. The full 32 MiB is never pulled for a file that can't be shown.
+- **Text over 1 MiB:** shown truncated to the first 1 MiB with a "Showing the first 1 MB." note, rather than refused. A multi-byte UTF-8 sequence split by the cap is trimmed. UTF-16 is recognised only with a BOM. UTF-8 text with NULs or other control bytes counts as binary.
+- **Images:** decoded with ImageIO (`CGImageSourceCreateThumbnailAtIndex`, max 2048 px, EXIF transform applied) instead of `NSImage(data:)`. That is still Apple's decoder, and it avoids a full-size decode. An image whose declared pixel count is over 400 megapixels is refused as "too large" before decoding, to avoid a decompression bomb.
+- **PDF:** decoded with `PDFDocument(data:)` in the loader. It is wrapped `@unchecked Sendable` to hand it to the main actor (it is not mutated afterwards). `PDFView` link clicks are swallowed through its delegate, so a hostile PDF can't open a URL.
+- **Reasons:** I added a fifth reason, `empty` ("This file is empty."). A missing `SourceSession` reports "The device couldn't be read." `FileContentError.runsShorterThanFile` and `.runOutsideDevice` count as "unmapped" ("can't be recovered"), alongside `.unmapped`.
+- **Truncated reads:** `FileContentReader.prefix` can return short data without throwing when its stream is cancelled. The loader rejects any read whose length is not the expected one, and checks for cancellation after each read, so a partial read is never shown as content.
+- **Raw bytes:** offered as "Show raw bytes" on the no-preview state whenever the header could be read (unsupported format, corrupt image or PDF, or too large). It is not offered for unmapped or unreadable files.
+- **Accessibility:** the preview region is labelled "Preview of <name>". The no-preview state is one combined element labelled "No preview available. <reason>", and the same string is posted as an `AccessibilityNotification.Announcement`.
+- **Not done here:** Story 1.7 owns placing this view in the File Browser, and the Space-bar shortcut. `sprint-status.yaml` was left untouched to avoid merge conflicts between the parallel branches.
