@@ -44,4 +44,72 @@ struct FileContentReaderTests {
         let reader = FileContentReader(reader: ImageReader(data: device))
         await #expect(throws: (any Error).self) { _ = try await reader.prefix(of: file(512, content), limit: .max) }
     }
+
+    /// 10 GiB of mapped content, consumed slowly: the reader must only touch the device when the
+    /// consumer asks for the next chunk, never race ahead of it.
+    @Test func mappedChunksAreReadOnlyOnDemand() async throws {
+        let device = CountingReader(sizeBytes: 10 << 30)
+        let reader = FileContentReader(reader: device, chunkSize: 4096)
+        let f = file(10 << 30, .runs([DataRun(deviceOffset: 0, length: 10 << 30)]))
+        var iterator = reader.chunks(of: f).makeAsyncIterator()
+        for consumed in 1...5 {
+            let chunk = try await iterator.next()
+            #expect(chunk?.count == 4096)
+            try await Task.sleep(for: .milliseconds(20))
+            #expect(device.reads <= consumed + Self.maxAhead, "read \(device.reads) chunks for \(consumed) consumed")
+        }
+    }
+
+    /// A 10 GiB sparse hole, consumed slowly: zero chunks are produced one per `next()`.
+    @Test func sparseHolesAreProducedLazily() async throws {
+        let produced = ChunkCounter()
+        var reader = FileContentReader(reader: ImageReader(data: device), chunkSize: 4096)
+        reader.chunkObserver = { produced.increment() }
+        let f = file(10 << 30, .runs([DataRun(deviceOffset: nil, length: 10 << 30)]))
+        var iterator = reader.chunks(of: f).makeAsyncIterator()
+        for consumed in 1...5 {
+            let chunk = try await iterator.next()
+            #expect(chunk == Data(count: 4096))
+            try await Task.sleep(for: .milliseconds(20))
+            #expect(produced.value <= consumed + Self.maxAhead, "produced \(produced.value) chunks for \(consumed) consumed")
+        }
+    }
+
+    @Test func iterationEndsAndRestartsCleanly() async throws {
+        let reader = FileContentReader(reader: ImageReader(data: device), chunkSize: 512)
+        let f = file(1100, .runs([DataRun(deviceOffset: 0, length: 600), DataRun(deviceOffset: nil, length: 600)]))
+        let sequence = reader.chunks(of: f)
+        var sizes: [Int] = []
+        for try await chunk in sequence { sizes.append(chunk.count) }
+        #expect(sizes == [512, 88, 500])
+        var again = Data()
+        for try await chunk in sequence { again.append(chunk) }
+        #expect(again == device[0..<600] + Data(count: 500))
+        var iterator = sequence.makeAsyncIterator()
+        while try await iterator.next() != nil {}
+        #expect(try await iterator.next() == nil)
+    }
+
+    /// At most this many chunks may exist ahead of the consumer.
+    static let maxAhead = 1
+}
+
+/// A device of any size that returns zeros and counts reads.
+private final class CountingReader: BlockReader, @unchecked Sendable {
+    let sizeBytes: Int64
+    private let lock = NSLock()
+    private var count = 0
+    init(sizeBytes: Int64) { self.sizeBytes = sizeBytes }
+    var reads: Int { lock.withLock { count } }
+    func read(at offset: Int64, count: Int) async throws -> Data {
+        lock.withLock { self.count += 1 }
+        return Data(count: count)
+    }
+}
+
+private final class ChunkCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    var value: Int { lock.withLock { count } }
+    func increment() { lock.withLock { count += 1 } }
 }

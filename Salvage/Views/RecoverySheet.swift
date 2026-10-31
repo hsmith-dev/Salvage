@@ -44,23 +44,35 @@ struct RecoverySheet: View {
                 Spacer()
                 if coordinator.destinationStatus == .checking { ProgressView().controlSize(.small) }
                 Button("Choose…", action: chooseDestination)
+                    .disabled(!coordinator.isConfirming)
             }
             .accessibilityElement(children: .contain)
             .accessibilityLabel("Destination")
 
             if coordinator.destinationStatus == .blocked { DestinationBlockBanner() }
             if case .failedToStart(let reason) = coordinator.phase {
-                Text(reason).fixedSize(horizontal: false, vertical: true)
+                // Not a block: the user can choose another folder (which clears this) or retry.
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle").accessibilityHidden(true)
+                    Text("\(reason) Choose another folder or try again.")
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .accessibilityElement(children: .combine)
             }
 
             HStack {
                 Spacer()
                 Button("Cancel", role: .cancel, action: onDone).keyboardShortcut(.cancelAction)
-                Button("Recover") { coordinator.start() }
+                Button(isRetry ? "Try Again" : "Recover") { coordinator.start() }
                     .keyboardShortcut(.defaultAction)
                     .disabled(!coordinator.canRecover)
             }
         }
+    }
+
+    private var isRetry: Bool {
+        if case .failedToStart = coordinator.phase { return true }
+        return false
     }
 
     private func chooseDestination() {
