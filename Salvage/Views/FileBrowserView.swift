@@ -138,8 +138,7 @@ struct FileBrowserView: View {
     }
 
     @ViewBuilder private func recoverySheet(_ request: RecoveryRequest) -> some View {
-        // INTEGRATION SLOT (Story 1.10): replace `RecoverySlot` with `RecoverySheet`.
-        RecoverySlot(files: request.files, source: request.source, onDone: { recovery = nil })
+        RecoverySheet(files: request.files, source: request.source, onDone: { recovery = nil })
     }
 
     static func sort(from order: [KeyPathComparator<ResultsViewModel.Row>]) -> ResultsViewModel.Sort {
