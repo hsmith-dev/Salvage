@@ -2,41 +2,47 @@ import Foundation
 import Testing
 @testable import SalvageCore
 
-/// Builds tiny ext2/3/4 images with 1 KiB blocks. Block 1 holds the superblock, block 2 the
-/// group descriptors, blocks 3-7 the bitmaps, 8-23 the inode tables and data starts at 32.
+/// Builds tiny ext2/3/4 images (1 KiB blocks by default). Block 1 (or 0 for larger blocks) holds
+/// the superblock, the next block the group descriptors, blocks 3-7 the bitmaps, 8 onward the
+/// inode tables and data starts at 32.
 struct EXTImage {
-    static let blockSize = 1024
+    let blockSize: Int
     var data: Data
-    let inodeSize: Int, inodesPerGroup = 16, blocksPerGroup: Int, groups: Int, descriptorSize: Int
+    let inodeSize: Int, inodesPerGroup: Int, blocksPerGroup: Int, groups: Int, descriptorSize: Int
+    let firstDataBlock: Int
     var incompat: UInt64
     var roCompat: UInt64 = 0
 
-    init(ext4: Bool = false, wide: Bool = false, inodeSize: Int? = nil) {
+    init(ext4: Bool = false, wide: Bool = false, inodeSize: Int? = nil, blockSize: Int = 1024, inodesPerGroup: Int = 16) {
+        self.blockSize = blockSize
         self.inodeSize = inodeSize ?? (ext4 ? 256 : 128)
+        self.inodesPerGroup = inodesPerGroup
+        firstDataBlock = blockSize == 1024 ? 1 : 0
         groups = wide ? 2 : 1
         blocksPerGroup = wide ? 256 : 8192
         let blocks = wide ? 513 : 512
         descriptorSize = wide ? 64 : 32
         incompat = 0x2 | (ext4 ? 0x40 : 0) | (wide ? 0x80 : 0)
-        data = Data(repeating: 0, count: blocks * Self.blockSize)
+        data = Data(repeating: 0, count: blocks * blockSize)
         let sb = 1024
         data.put(sb, UInt64(inodesPerGroup * groups), 4); data.put(sb + 4, UInt64(blocks), 4)
-        data.put(sb + 20, 1, 4); data.put(sb + 24, 0, 4); data.put(sb + 32, UInt64(blocksPerGroup), 4)
+        data.put(sb + 20, UInt64(firstDataBlock), 4); data.put(sb + 24, UInt64((blockSize / 1024).trailingZeroBitCount), 4)
+        data.put(sb + 32, UInt64(blocksPerGroup), 4)
         data.put(sb + 40, UInt64(inodesPerGroup), 4); data.put(sb + 56, 0xef53, 2); data.put(sb + 76, 1, 4)
         data.put(sb + 84, 11, 4); data.put(sb + 88, UInt64(self.inodeSize), 2)
         if wide { data.put(sb + 254, 64, 2) }
         for group in 0..<groups {
-            let d = 2048 + group * descriptorSize
+            let d = (firstDataBlock + 1) * blockSize + group * descriptorSize
             data.put(d, UInt64(3 + group), 4); data.put(d + 4, UInt64(5 + group), 4)
             data.put(d + 8, UInt64(inodeTable(group)), 4)
         }
-        for block in 1..<32 { mark(block: block) }
+        for block in firstDataBlock..<32 { mark(block: block) }
         for inode in 1...11 { mark(inode: inode) }
     }
-    func inodeTable(_ group: Int) -> Int { 8 + group * (inodesPerGroup * inodeSize / Self.blockSize) }
+    func inodeTable(_ group: Int) -> Int { 8 + group * ((inodesPerGroup * inodeSize + blockSize - 1) / blockSize) }
     func inodeOffset(_ n: Int) -> Int {
         let group = (n - 1) / inodesPerGroup
-        return inodeTable(group) * Self.blockSize + (n - 1) % inodesPerGroup * inodeSize
+        return inodeTable(group) * blockSize + (n - 1) % inodesPerGroup * inodeSize
     }
     var image: Data {
         var result = data
@@ -48,13 +54,13 @@ struct EXTImage {
         return result
     }
     mutating func mark(block: Int, used: Bool = true) {
-        let relative = block - 1, group = relative / blocksPerGroup, bit = relative % blocksPerGroup
-        let byte = (3 + group) * Self.blockSize + bit / 8
+        let relative = block - firstDataBlock, group = relative / blocksPerGroup, bit = relative % blocksPerGroup
+        let byte = (3 + group) * blockSize + bit / 8
         if used { data[byte] |= 1 << (bit % 8) } else { data[byte] &= ~(1 << (bit % 8)) }
     }
     mutating func mark(inode: Int, used: Bool = true) {
         let group = (inode - 1) / inodesPerGroup, bit = (inode - 1) % inodesPerGroup
-        let byte = (5 + group) * Self.blockSize + bit / 8
+        let byte = (5 + group) * blockSize + bit / 8
         if used { data[byte] |= 1 << (bit % 8) } else { data[byte] &= ~(1 << (bit % 8)) }
     }
     /// Writes an inode; live inodes and their blocks are marked used in the bitmaps.
@@ -101,23 +107,74 @@ struct EXTImage {
     /// Writes one dirent; returns the offset just past its real length.
     @discardableResult
     mutating func dirent(at offset: Int, inode: Int, recordLength: Int, name: String, type: UInt8) -> Int {
+        dirent(at: offset, inode: inode, recordLength: recordLength, nameBytes: Data(name.utf8), type: type)
+    }
+    @discardableResult
+    mutating func dirent(at offset: Int, inode: Int, recordLength: Int, nameBytes: Data, type: UInt8) -> Int {
         data.put(offset, UInt64(inode), 4); data.put(offset + 4, UInt64(recordLength), 2)
-        data.put(offset + 6, UInt64(name.utf8.count), 1); data.put(offset + 7, UInt64(type), 1)
-        data.text(offset + 8, name)
-        return offset + (8 + name.utf8.count + 3) / 4 * 4
+        data.put(offset + 6, UInt64(nameBytes.count), 1); data.put(offset + 7, UInt64(type), 1)
+        data.replaceSubrange(offset + 8..<offset + 8 + nameBytes.count, with: nameBytes)
+        return offset + (8 + nameBytes.count + 3) / 4 * 4
     }
     /// Writes ".", ".." and the given entries; the last entry's record spans the block.
     mutating func directory(_ block: Int, this: Int, parent: Int, _ entries: [(Int, String, UInt8)]) {
-        var p = block * Self.blockSize
+        var p = block * blockSize
         let all = [(this, ".", UInt8(2)), (parent, "..", UInt8(2))] + entries
         for (index, (inode, name, type)) in all.enumerated() {
             let real = (8 + name.utf8.count + 3) / 4 * 4
-            let length = index == all.count - 1 ? (block + 1) * Self.blockSize - p : real
+            let length = index == all.count - 1 ? (block + 1) * blockSize - p : real
             dirent(at: p, inode: inode, recordLength: length, name: name, type: type)
             p += length
         }
     }
-    mutating func content(_ block: Int, _ text: String) { data.text(block * Self.blockSize, text) }
+    mutating func content(_ block: Int, _ text: String) { data.text(block * blockSize, text) }
+    /// Sets a group descriptor's bg_flags.
+    mutating func groupFlags(_ group: Int, _ flags: UInt16) {
+        data.put((firstDataBlock + 1) * blockSize + group * descriptorSize + 18, UInt64(flags), 2)
+    }
+}
+
+/// Serves a huge virtual device that is zero except for the given regions.
+struct SparseReader: BlockReader {
+    let sizeBytes: Int64
+    let regions: [(offset: Int64, bytes: Data)]
+    func read(at offset: Int64, count: Int) async throws -> Data {
+        guard offset >= 0, count >= 0, Int64(count) <= sizeBytes - offset else { throw ScanError.io("Out of bounds") }
+        var out = Data(repeating: 0, count: count)
+        for region in regions {
+            let low = max(region.offset, offset), high = min(region.offset + Int64(region.bytes.count), offset + Int64(count))
+            if low < high {
+                out.replaceSubrange(Int(low - offset)..<Int(high - offset),
+                                    with: region.bytes.subdata(in: Int(low - region.offset)..<Int(high - region.offset)))
+            }
+        }
+        return out
+    }
+}
+
+actor FileCollector {
+    var files: [RecoveredFile] = []
+    func add(_ file: RecoveredFile) { files.append(file) }
+}
+
+/// Runs `EXTVolume` directly so tests can lower limits and read its counters.
+func runEXT(_ reader: any BlockReader, limits: EXTLimits = EXTLimits()) async
+    -> (files: [RecoveredFile], error: (any Error)?, volume: EXTVolume) {
+    let collector = FileCollector()
+    let volume = EXTVolume(reader: reader, extent: VolumeExtent(offset: 0, length: reader.sizeBytes, format: .ext)) {
+        await collector.add($0)
+    }
+    await volume.setLimits(limits)
+    var failure: (any Error)? = nil
+    do { try await volume.scan() } catch { failure = error }
+    return (await collector.files, failure, volume)
+}
+func runEXT(_ image: EXTImage, limits: EXTLimits = EXTLimits()) async
+    -> (files: [RecoveredFile], error: (any Error)?, volume: EXTVolume) {
+    await runEXT(ImageReader(data: image.image), limits: limits)
+}
+func isMalformed(_ error: (any Error)?) -> Bool {
+    if case .malformed? = error as? ScanError { true } else { false }
 }
 
 /// ext2 volume: /hello.txt (1 block) and /docs/big.bin (12 direct blocks plus an indirect block).
@@ -193,7 +250,7 @@ struct EXTVolumeTests {
     }
 
     /// Root holds live.txt whose record spans the block; a removed gone.txt survives in the gap.
-    func deletedImage(ext4: Bool = false) -> EXTImage {
+    func deletedImage(ext4: Bool = false, stale: [(Int, String)] = [(13, "gone.txt")]) -> EXTImage {
         var image = EXTImage(ext4: ext4)
         let rootFlags: UInt32 = ext4 ? 0x80000 : 0
         image.inode(2, directory: true, size: 1024, links: 2, flags: rootFlags,
@@ -201,8 +258,12 @@ struct EXTVolumeTests {
         var p = 32 * 1024
         p = image.dirent(at: p, inode: 2, recordLength: 12, name: ".", type: 2)
         p = image.dirent(at: p, inode: 2, recordLength: 12, name: "..", type: 2)
-        let gap = image.dirent(at: p, inode: 12, recordLength: 33 * 1024 - p, name: "live.txt", type: 1)
-        image.dirent(at: gap, inode: 13, recordLength: 33 * 1024 - gap, name: "gone.txt", type: 1)
+        var gap = image.dirent(at: p, inode: 12, recordLength: 33 * 1024 - p, name: "live.txt", type: 1)
+        for (index, (inode, name)) in stale.enumerated() {
+            let real = (8 + name.utf8.count + 3) / 4 * 4
+            gap = image.dirent(at: gap, inode: inode, recordLength: index == stale.count - 1 ? 33 * 1024 - gap : real,
+                               name: name, type: 1)
+        }
         image.inode(12, size: 4, flags: rootFlags, blocks: ext4 ? EXTImage.extentNode([(0, 1, 40)]) : EXTImage.blockMap([40]),
                     used: [40])
         image.inode(13, size: 600, mtime: 1_650_000_000, links: 0, dtime: 1_700_000_000,
@@ -360,5 +421,353 @@ struct EXTVolumeTests {
             #expect(events.contains { if case .error(.malformed) = $0 { true } else { false } })
             #expect(!events.contains(.completed))
         }
+    }
+
+    // MARK: P1 — stale names, reuse after the entry went stale, live reuse
+
+    @Test func staleEntriesThatDisagreeOnNameAreSkipped() async {
+        // mv old.txt gone.txt, then rm gone.txt: both names survive in the slack for inode 13.
+        let image = deletedImage(stale: [(13, "old.txt"), (13, "gone.txt")])
+        let events = await scan(image.image)
+        #expect(events.last == .completed)
+        #expect(files(events).map(\.path) == ["/live.txt"])
+        // Two copies of the same name agree, so the file is still recovered.
+        let agreeing = deletedImage(stale: [(13, "gone.txt"), (13, "gone.txt")])
+        #expect(files(await scan(agreeing.image)).map(\.path) == ["/live.txt", "/gone.txt"])
+    }
+
+    @Test func staleEntriesThatDisagreeOnPathAreSkipped() async {
+        var image = deletedImage()
+        // A subdirectory whose slack also names inode 13 as gone.txt.
+        // Root becomes ".", "..", live.txt, sub, with gone.txt still in sub's slack.
+        image.data.put(32 * 1024 + 24 + 4, 16, 2)
+        image.dirent(at: 32 * 1024 + 40, inode: 14, recordLength: 1024 - 40, name: "sub", type: 2)
+        image.dirent(at: 32 * 1024 + 52, inode: 13, recordLength: 1024 - 52, name: "gone.txt", type: 1)
+        image.inode(14, directory: true, size: 1024, links: 2, blocks: EXTImage.blockMap([34]), used: [34])
+        var p = 34 * 1024
+        p = image.dirent(at: p, inode: 14, recordLength: 12, name: ".", type: 2)
+        p = image.dirent(at: p, inode: 2, recordLength: 1024 - 12, name: "..", type: 2)
+        image.dirent(at: p, inode: 13, recordLength: 35 * 1024 - p, name: "gone.txt", type: 1)
+        let events = await scan(image.image)
+        #expect(events.last == .completed)
+        #expect(files(events).allSatisfy { !$0.isDeleted })
+    }
+
+    @Test func deletionLaterThanTheDirectoryChangeIsSkipped() async {
+        // Root mtime is 1_700_000_000; a later dtime means inode 13 was reused after this entry
+        // went stale and then deleted again.
+        var image = deletedImage()
+        image.inode(13, size: 600, links: 0, dtime: 1_700_000_001, blocks: EXTImage.blockMap([90]), used: [90])
+        let events = await scan(image.image)
+        #expect(events.last == .completed)
+        #expect(files(events).map(\.path) == ["/live.txt"])
+    }
+
+    @Test func liveEntryOnAnInodeMarkedFreeIsNeverAlsoDeleted() async {
+        // live.txt now references inode 13, whose bitmap bit says free; gone.txt names it too.
+        var image = deletedImage()
+        image.data.put(32 * 1024 + 24, 13, 4)
+        let events = await scan(image.image)
+        #expect(events.last == .completed)
+        let found = files(events)
+        #expect(found.map(\.path) == ["/live.txt"])
+        #expect(found.allSatisfy { !$0.isDeleted })
+    }
+
+    // MARK: P2 — needs_recovery
+
+    @Test func needsRecoverySkipsDeletedRecovery() async {
+        var image = deletedImage(); image.incompat |= 0x4
+        let events = await scan(image.image)
+        #expect(events.last == .completed)
+        #expect(files(events).map(\.path) == ["/live.txt"])
+    }
+
+    @Test func freeInodeLiveEntryIsSkippedOnlyWhenJournalNeedsRecovery() async {
+        var image = ext2Image(); image.data.put(image.inodeOffset(12), 0, 2)
+        let clean = await scan(image.image)
+        #expect(clean.contains { if case .error(.malformed) = $0 { true } else { false } })
+        #expect(!clean.contains(.completed))
+        image.incompat |= 0x4
+        let recovering = await scan(image.image)
+        #expect(recovering.last == .completed)
+        #expect(files(recovering).map(\.path) == ["/docs/big.bin"])
+    }
+
+    // MARK: P3 — bounded queued state and candidate memory
+
+    /// Root holds a chain of `depth` nested directories (names `nameLength` bytes long) ending in
+    /// leaf.txt, plus `fanOut` empty sibling directories.
+    func chainImage(depth: Int, nameLength: Int = 8, fanOut: Int = 0) -> (image: EXTImage, names: [String]) {
+        var image = EXTImage(inodesPerGroup: 128)
+        let names = (0..<depth).map { level -> String in
+            let base = "d\(level)"
+            return base + String(repeating: "x", count: nameLength - base.count)
+        }
+        let leafInode = 12 + depth + fanOut, leafBlock = 33 + depth + fanOut
+        var rootEntries: [(Int, String, UInt8)] = depth > 0 ? [(12, names[0], 2)] : [(leafInode, "leaf.txt", 1)]
+        for j in 0..<fanOut { rootEntries.append((12 + depth + j, "f\(j)", 2)) }
+        image.inode(2, directory: true, size: 1024, links: 2, blocks: EXTImage.blockMap([32]), used: [32])
+        image.directory(32, this: 2, parent: 2, rootEntries)
+        for level in 0..<depth {
+            let inode = 12 + level, block = 33 + level
+            image.inode(inode, directory: true, size: 1024, links: 2, blocks: EXTImage.blockMap([block]), used: [block])
+            let child: (Int, String, UInt8) = level + 1 < depth ? (inode + 1, names[level + 1], 2) : (leafInode, "leaf.txt", 1)
+            image.directory(block, this: inode, parent: level == 0 ? 2 : inode - 1, [child])
+        }
+        for j in 0..<fanOut {
+            let inode = 12 + depth + j, block = 33 + depth + j
+            image.inode(inode, directory: true, size: 1024, links: 2, blocks: EXTImage.blockMap([block]), used: [block])
+            image.directory(block, this: inode, parent: 2, [])
+        }
+        image.inode(leafInode, size: 4, blocks: EXTImage.blockMap([leafBlock]), used: [leafBlock])
+        return (image, names)
+    }
+
+    @Test func deepChainAndWideFanOutKeepQueuedStateLinear() async {
+        let depth = 40, nameLength = 100, fanOut = 30
+        let (image, names) = chainImage(depth: depth, nameLength: nameLength, fanOut: fanOut)
+        let result = await runEXT(image)
+        #expect(result.error == nil)
+        #expect(result.files.map(\.path) == ["/" + names.joined(separator: "/") + "/leaf.txt"])
+        let stats = await result.volume.stats
+        // Each directory's own name is stored once; full paths would cost the sum of every prefix.
+        let fanBytes = (0..<fanOut).map { "f\($0)".utf8.count }.reduce(0, +)
+        #expect(stats.directoryNameBytes == depth * nameLength + fanBytes)
+        let fullPathBytes = (1...depth).map { $0 * (nameLength + 1) }.reduce(0, +)
+        #expect(stats.directoryNameBytes * 10 < fullPathBytes)
+        #expect(stats.peakPendingDirectories <= fanOut + 1)
+    }
+
+    @Test func candidateCapsBoundMemoryAndStillDetectConflicts() async {
+        #expect(EXTVolume.maxCandidates == 200_000)
+        #expect(EXTLimits().maxCandidateNameBytes == 16 << 20)
+        // Past the count cap, a second stale name for a kept inode still blocks recovery.
+        let conflicting = deletedImage(stale: [(13, "gone.txt"), (13, "old.txt")])
+        var limits = EXTLimits(); limits.maxCandidates = 1
+        let capped = await runEXT(conflicting, limits: limits)
+        #expect(capped.error == nil)
+        #expect(capped.files.map(\.path) == ["/live.txt"])
+        // With a single stale name, a cap of one still keeps it.
+        let single = await runEXT(deletedImage(), limits: limits)
+        #expect(single.files.map(\.path) == ["/live.txt", "/gone.txt"])
+        // The name-byte cap drops candidates rather than growing.
+        var tiny = EXTLimits(); tiny.maxCandidateNameBytes = 4
+        let dropped = await runEXT(deletedImage(), limits: tiny)
+        #expect(dropped.error == nil)
+        #expect(dropped.files.map(\.path) == ["/live.txt"])
+        #expect(await dropped.volume.candidateNameBytes == 0)
+    }
+
+    // MARK: P4 — bounded work
+
+    @Test func hardLinksAreMappedOnce() async {
+        var image = EXTImage()
+        image.inode(2, directory: true, size: 1024, links: 2, blocks: EXTImage.blockMap([32]), used: [32])
+        image.directory(32, this: 2, parent: 2, [(12, "a", 1), (12, "b", 1), (12, "c", 1)])
+        image.inode(12, size: 5, links: 3, blocks: EXTImage.blockMap([40]), used: [40])
+        let result = await runEXT(image)
+        #expect(result.error == nil)
+        #expect(result.files.map(\.path) == ["/a", "/b", "/c"])
+        // The root directory once, plus the shared file once.
+        #expect(await result.volume.stats.mappingComputations == 2)
+    }
+
+    @Test func deletedWorkBudgetSkipsRemainingCandidates() async {
+        let full = await runEXT(deletedImage())
+        #expect(full.files.map(\.path) == ["/live.txt", "/gone.txt"])
+        let spent = await full.volume.stats.deletedWorkSpent
+        #expect(await full.volume.deletedWorkRemaining + spent == 4 * 512 + 1_000_000)
+        var limits = EXTLimits(); limits.deletedWorkBudget = 1
+        let starved = await runEXT(deletedImage(), limits: limits)
+        #expect(starved.error == nil)
+        #expect(starved.files.map(\.path) == ["/live.txt"])
+        #expect(await starved.volume.stats.deletedBudgetExhausted)
+    }
+
+    @Test func deletedMappingFarLargerThanTheSizeIsSkipped() async {
+        // 600 bytes needs one block, but the old map names 12 direct blocks plus 8 indirect ones.
+        var image = deletedImage()
+        let direct = Array(90..<102)
+        image.inode(13, size: 600, links: 0, dtime: 1, blocks: EXTImage.blockMap(direct, indirect: 102))
+        for k in 0..<8 { image.data.put(102 * 1024 + k * 4, UInt64(103 + k), 4) }
+        let events = await scan(image.image)
+        #expect(events.last == .completed)
+        #expect(files(events).map(\.path) == ["/live.txt"])
+    }
+
+    @Test func overlappingDeletedCandidatesAreAllSkipped() async {
+        var image = deletedImage(stale: [(13, "gone.txt"), (14, "other.txt")])
+        image.inode(14, size: 100, links: 0, dtime: 1, blocks: EXTImage.blockMap([90]))
+        let events = await scan(image.image)
+        #expect(events.last == .completed)
+        #expect(files(events).map(\.path) == ["/live.txt"])
+        // Distinct blocks: both are recovered.
+        image.inode(14, size: 100, links: 0, dtime: 1, blocks: EXTImage.blockMap([91]))
+        #expect(files(await scan(image.image)).map(\.path) == ["/live.txt", "/gone.txt", "/other.txt"])
+    }
+
+    @Test func overlapDetectionFlagsEveryOverlappingOwner() {
+        let claims = [EXTClaim(start: 0, end: 10, owner: 0), EXTClaim(start: 2, end: 3, owner: 1),
+                      EXTClaim(start: 5, end: 20, owner: 2), EXTClaim(start: 20, end: 21, owner: 3),
+                      EXTClaim(start: 30, end: 31, owner: 4), EXTClaim(start: 30, end: 32, owner: 4)]
+        #expect(EXTVolume.overlappingOwners(claims, owners: 5) == [true, true, true, false, true])
+    }
+
+    // MARK: P5 — bigalloc
+
+    @Test func bigallocIsRefused() async {
+        var image = ext2Image(); image.roCompat |= 0x200
+        let events = await scan(image.image)
+        #expect(events.contains(.error(.unsupportedFilesystem)))
+        #expect(files(events).isEmpty && !events.contains(.completed))
+    }
+
+    // MARK: P7 — coverage
+
+    @Test func sixtyFourBitHighHalvesAreRead() async {
+        // 64 KiB blocks and a block count above 2^32: every descriptor field and the block count
+        // have non-zero high halves, so reading the wrong offset (or ignoring it) fails.
+        let blockSize: Int64 = 65536, high: Int64 = 1 << 32, groupCount = 8193
+        func at(_ k: Int64) -> Int64 { (high + k) * blockSize }
+        var superblock = Data(repeating: 0, count: 2048)
+        let s = 1024
+        superblock.put(s, UInt64(groupCount * 16), 4); superblock.put(s + 4, 16, 4); superblock.put(s + 336, 1, 4)
+        superblock.put(s + 24, 6, 4); superblock.put(s + 32, 524_288, 4); superblock.put(s + 40, 16, 4)
+        superblock.put(s + 56, 0xef53, 2); superblock.put(s + 76, 1, 4); superblock.put(s + 84, 11, 4)
+        superblock.put(s + 88, 256, 2); superblock.put(s + 96, 0x2 | 0x40 | 0x80, 4); superblock.put(s + 254, 64, 2)
+        var table = Data(repeating: 0, count: groupCount * 64)
+        for g in 0..<groupCount {
+            let d = g * 64
+            table.put(d, 1, 4); table.put(d + 0x20, 1, 4)
+            table.put(d + 4, 2, 4); table.put(d + 0x24, 1, 4)
+            table.put(d + 8, 3, 4); table.put(d + 0x28, 1, 4)
+        }
+        var inodes = Data(repeating: 0, count: 4096)
+        for (n, mode, size, start) in [(2, UInt64(0x41ed), UInt64(65536), high + 4), (12, 0x81a4, 4, high + 5)] {
+            let o = (n - 1) * 256
+            inodes.put(o, mode, 2); inodes.put(o + 4, size, 4); inodes.put(o + 16, 1_600_000_000, 4)
+            inodes.put(o + 26, 1, 2); inodes.put(o + 32, 0x80000, 4)
+            inodes.replaceSubrange(o + 40..<o + 100, with: EXTImage.extentNode([(0, 1, Int(start))]))
+        }
+        var directory = Data(repeating: 0, count: 65536)
+        for (p, inode, length, name, type) in [(0, 2, 12, ".", 2), (12, 2, 12, "..", 2), (24, 12, 65536 - 24, "far.txt", 1)] {
+            directory.put(p, UInt64(inode), 4); directory.put(p + 4, UInt64(length), 2)
+            directory.put(p + 6, UInt64(name.utf8.count), 1); directory.put(p + 7, UInt64(type), 1)
+            directory.text(p + 8, name)
+        }
+        let reader = SparseReader(sizeBytes: (high + 16) * blockSize,
+                                  regions: [(0, superblock), (blockSize, table), (at(3), inodes), (at(4), directory),
+                                            (at(5), Data("data".utf8))])
+        let result = await runEXT(reader)
+        #expect(result.error == nil)
+        #expect(result.files.map(\.path) == ["/far.txt"])
+        #expect(result.files.first?.sourceMetadata.recordOffset == at(3) + 11 * 256)
+        #expect(result.files.first?.sizeBytes == 4)
+    }
+
+    @Test func crc32cMatchesIndependentVectors() {
+        // RFC 3720 appendix B.4 vectors.
+        #expect(crc32c(Data(repeating: 0, count: 32)) == 0x8A91_36AA)
+        #expect(crc32c(Data(repeating: 0xff, count: 32)) == 0x62A8_AB43)
+        #expect(crc32c(Data(0..<32)) == 0x46DD_794E)
+    }
+
+    @Test func superblockChecksumMatchesAnIndependentlyComputedValue() async {
+        // 0x979B67C8 is the raw CRC32C register (seed ~0, no final inversion) over bytes 0..<1020
+        // of this fixed superblock, computed with a separate table-driven CRC32C implementation
+        // that reproduces the RFC 3720 vectors; it is not derived from the parser's function.
+        var image = ext2Image(); image.roCompat |= 0x400
+        var bytes = image.image
+        bytes.put(1024 + 1020, 0x979B_67C8, 4)
+        #expect((await scan(bytes)).last == .completed)
+        bytes.put(1024 + 1020, 0x979B_67C9, 4)
+        #expect(!(await scan(bytes)).contains(.completed))
+    }
+
+    @Test func fourKiBBlocksWithFirstDataBlockZero() async {
+        var image = EXTImage(blockSize: 4096)
+        image.inode(2, directory: true, size: 4096, links: 2, blocks: EXTImage.blockMap([32]), used: [32])
+        let b = 32 * 4096
+        image.dirent(at: b, inode: 2, recordLength: 12, name: ".", type: 2)
+        image.dirent(at: b + 12, inode: 2, recordLength: 4064 - 12, name: "..", type: 2)
+        image.dirent(at: b + 24, inode: 13, recordLength: 4064 - 24, name: "gone.txt", type: 1)
+        // The last live entry sits right at the block end.
+        image.dirent(at: b + 4064, inode: 12, recordLength: 32, name: "z.txt", type: 1)
+        image.inode(12, size: 5000, blocks: EXTImage.blockMap([40, 41]), used: [40, 41])
+        image.inode(13, size: 100, links: 0, dtime: 1_700_000_000, blocks: EXTImage.blockMap([90]), used: [90])
+        let events = await scan(image.image)
+        #expect(events.last == .completed)
+        let found = files(events)
+        #expect(found.map(\.path) == ["/z.txt", "/gone.txt"])
+        #expect(found.map(\.sizeBytes) == [5000, 100])
+        #expect(found.map(\.isDeleted) == [false, true])
+        #expect(found.first?.sourceMetadata.recordOffset == Int64(8 * 4096 + 11 * 128))
+    }
+
+    @Test func doubleIndirectBlockMapResolves() async throws {
+        var image = ext2Image()
+        // Logical block 268 is the first one reached through the double-indirect pointer.
+        image.inode(12, size: 269 * 1024, blocks: EXTImage.blockMap([40], double: 100), used: [40, 100, 101, 102])
+        image.data.put(100 * 1024, 101, 4); image.data.put(101 * 1024, 102, 4)
+        let result = await runEXT(image)
+        #expect(result.error == nil)
+        #expect(result.files.first { $0.name == "hello.txt" }?.sizeBytes == Int64(269 * 1024))
+        let raw = try await result.volume.inode(12).data
+        let map = try await result.volume.mapping(EXTInode(raw, inodeSize: 128), limit: 512)
+        #expect(map.runs == [EXTRun(logical: 0, physical: 40, count: 1, initialized: true),
+                             EXTRun(logical: 268, physical: 102, count: 1, initialized: true)])
+        #expect(map.metadata == [100, 101])
+    }
+
+    @Test func directoryCyclesAndHardLinkedDirectoriesTerminate() async {
+        var cycle = ext2Image()
+        cycle.directory(33, this: 13, parent: 2, [(14, "big.bin", 1), (2, "loop", 2)])
+        var linked = ext2Image()
+        linked.directory(32, this: 2, parent: 2, [(12, "hello.txt", 1), (13, "docs", 2), (13, "again", 2)])
+        for image in [cycle, linked] {
+            let events = await scan(image.image)
+            #expect(events.contains { if case .error(.malformed(let reason)) = $0 { reason.contains("cycle") } else { false } })
+            #expect(!events.contains(.completed))
+        }
+    }
+
+    @Test func directoryDepthIsCapped() async {
+        #expect(EXTLimits().maxDirectoryDepth == 2048)
+        var limits = EXTLimits(); limits.maxDirectoryDepth = 3
+        let allowed = await runEXT(chainImage(depth: 3).image, limits: limits)
+        #expect(allowed.error == nil)
+        #expect(allowed.files.count == 1)
+        let tooDeep = await runEXT(chainImage(depth: 4).image, limits: limits)
+        #expect(isMalformed(tooDeep.error))
+        #expect(tooDeep.files.isEmpty)
+    }
+
+    @Test func uninitializedGroupBitmapsSkipDeletedCandidates() async {
+        var image = deletedImage(); image.roCompat |= 0x10
+        #expect(files(await scan(image.image)).map(\.path) == ["/live.txt", "/gone.txt"])
+        for flag: UInt16 in [0x1, 0x2] {
+            var uninit = image; uninit.groupFlags(0, flag)
+            let events = await scan(uninit.image)
+            #expect(events.last == .completed)
+            #expect(files(events).map(\.path) == ["/live.txt"])
+        }
+    }
+
+    @Test func nonUTF8LiveNameIsEscaped() async {
+        var image = EXTImage()
+        image.inode(2, directory: true, size: 1024, links: 2, blocks: EXTImage.blockMap([32]), used: [32])
+        var p = 32 * 1024
+        p = image.dirent(at: p, inode: 2, recordLength: 12, name: ".", type: 2)
+        p = image.dirent(at: p, inode: 2, recordLength: 12, name: "..", type: 2)
+        let nameBytes = Data("caf".utf8) + Data([0xe9]) + Data(".txt".utf8)
+        image.dirent(at: p, inode: 12, recordLength: 33 * 1024 - p, nameBytes: nameBytes, type: 1)
+        image.inode(12, size: 3, blocks: EXTImage.blockMap([40]), used: [40])
+        let events = await scan(image.image)
+        #expect(events.last == .completed)
+        let found = files(events)
+        #expect(found.map(\.name) == ["caf\\xE9.txt"])
+        #expect(found.map(\.path) == ["/caf\\xE9.txt"])
+        #expect(found.first?.sourceMetadata.rawRecord.suffix(nameBytes.count) == nameBytes)
     }
 }
