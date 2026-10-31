@@ -91,7 +91,7 @@ jobs:
             MARKETING_VERSION="$marketing_version" \
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="Developer ID Application" \
-            OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN_PATH" \
+            OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN_PATH --timestamp" \
             build
           echo "APP_PATH=$derived_data/Build/Products/Release/Salvage.app" >> "$GITHUB_ENV"
 
@@ -100,6 +100,29 @@ jobs:
           set -euo pipefail
           codesign --verify --deep --strict --verbose=2 "$APP_PATH"
           codesign --display --verbose=4 "$APP_PATH"
+
+          # Story 1.12 / AD-13: the nested privileged helper is signed inside-out (Xcode signs the
+          # SalvageHelper target, then re-signs it on copy into Contents/MacOS before sealing the
+          # app). Its identifier and Team ID are what the app and helper pin in their XPC peer
+          # requirements, so verify both, plus hardened runtime and a secure timestamp, which
+          # notarization requires of every nested binary.
+          helper="$APP_PATH/Contents/MacOS/SalvageHelper"
+          plutil -lint "$APP_PATH/Contents/Library/LaunchDaemons/dev.hsmith.Salvage.Helper.plist"
+          codesign --verify --strict --verbose=2 "$helper"
+          helper_info="$(codesign --display --verbose=4 "$helper" 2>&1)"
+          app_info="$(codesign --display --verbose=4 "$APP_PATH" 2>&1)"
+          echo "$helper_info"
+          helper_id="$(printf '%s\n' "$helper_info" | sed -n 's/^Identifier=//p')"
+          helper_team="$(printf '%s\n' "$helper_info" | sed -n 's/^TeamIdentifier=//p')"
+          app_team="$(printf '%s\n' "$app_info" | sed -n 's/^TeamIdentifier=//p')"
+          if [ "$helper_id" != "dev.hsmith.Salvage.Helper" ]; then
+            echo "::error::SalvageHelper is signed as '$helper_id', expected dev.hsmith.Salvage.Helper"; exit 1
+          fi
+          if [ -z "$helper_team" ] || [ "$helper_team" = "not set" ] || [ "$helper_team" != "$app_team" ]; then
+            echo "::error::SalvageHelper Team ID '$helper_team' does not match the app's '$app_team'"; exit 1
+          fi
+          printf '%s\n' "$helper_info" | grep -q 'flags=.*runtime' || { echo "::error::SalvageHelper lacks hardened runtime"; exit 1; }
+          printf '%s\n' "$helper_info" | grep -q '^Timestamp=' || { echo "::error::SalvageHelper lacks a secure timestamp"; exit 1; }
 
       - name: Notarize app bundle
         env:

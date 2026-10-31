@@ -7,8 +7,10 @@ set -uo pipefail
 # Check for Updates"):
 #
 #   1. No network-capable API may appear in any .swift file under Salvage/, SalvageCore/,
-#      SalvageDiskIO/ or scripts/, except the one designated update-check file,
-#      Salvage/Updates/UpdateChecker.swift.
+#      SalvageDiskIO/, SalvageHelper/ (the privileged read-only helper, AD-13) or scripts/,
+#      except the one designated update-check file, Salvage/Updates/UpdateChecker.swift.
+#      XPC (xpc_connection_*, NSXPCConnection) is local IPC, not network, and is allowed; the
+#      patterns below don't match it.
 #   2. No Package.swift may declare a remote dependency (`.package(url:`).
 #
 # Usage: check-no-network.sh [repo-root]
@@ -29,7 +31,7 @@ fi
 cd "$root" || exit 1
 
 status=0
-scan_dirs=(Salvage SalvageCore SalvageDiskIO scripts)
+scan_dirs=(Salvage SalvageCore SalvageDiskIO SalvageHelper scripts)
 allowed_file="Salvage/Updates/UpdateChecker.swift"
 
 # Extended regular expressions, one per forbidden API. `socket(` and `connect(` are anchored on a

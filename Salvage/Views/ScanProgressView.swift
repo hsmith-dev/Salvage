@@ -1,4 +1,5 @@
 import SalvageCore
+import SalvageDiskIO
 import SwiftUI
 
 struct ScanProgressView: View {
@@ -30,8 +31,9 @@ struct ScanProgressView: View {
                 }.font(.subheadline).foregroundStyle(.secondary)
             }
             if case .failed(let error) = model.state {
-                Text(error.description).textSelection(.enabled)
-                if error == .permissionDenied || model.canRetryFromCheckpoint, !model.isActive, let device = model.device {
+                let needsApproval = PrivilegedHelperApproval.isApprovalRequired(error)
+                if needsApproval { HelperApprovalView() } else { Text(error.description).textSelection(.enabled) }
+                if error == .permissionDenied || needsApproval || model.canRetryFromCheckpoint, !model.isActive, let device = model.device {
                     // With a kept checkpoint, retrying offers Resume again rather than starting from zero.
                     Button("Retry scan") { model.start(device) }
                 }

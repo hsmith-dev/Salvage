@@ -72,18 +72,31 @@ jobs:
         run: swift test --package-path scripts/spike-raw-device-access
 
       # Unsigned debug build: CI has no Developer ID identity/team configured (see release.yml
-      # for the signed/notarized release pipeline), so signing is explicitly disabled here.
-      - name: Build Salvage app (xcodebuild)
+      # for the signed/notarized release pipeline), so signing is explicitly disabled here. This
+      # also builds the privileged read-only helper (SalvageHelper, AD-13) unsigned, as an
+      # embedded dependency of the app.
+      - name: Build Salvage app and privileged helper (xcodebuild)
         run: |
           xcodebuild \
             -project Salvage.xcodeproj \
             -scheme Salvage \
             -configuration Debug \
             -destination 'platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             build
+
+      # Story 1.12: SMAppService.daemon(plistName:) only finds the helper at these exact paths.
+      - name: Verify the helper is embedded where launchd expects it
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/DerivedData/Build/Products/Debug/Salvage.app"
+          test -x "$app/Contents/MacOS/SalvageHelper"
+          plist="$app/Contents/Library/LaunchDaemons/dev.hsmith.Salvage.Helper.plist"
+          plutil -lint "$plist"
+          test "$(plutil -extract BundleProgram raw "$plist")" = "Contents/MacOS/SalvageHelper"
 
       - name: Run app view-model tests
         run: |

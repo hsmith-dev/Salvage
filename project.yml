@@ -29,6 +29,13 @@ targets:
     deploymentTarget: "14.0"
     sources:
       - path: Salvage
+      # Story 1.12 / AD-13: the privileged helper's launchd plist, copied to
+      # Salvage.app/Contents/Library/LaunchDaemons/ where SMAppService.daemon(plistName:) finds it.
+      - path: SalvageHelper/dev.hsmith.Salvage.Helper.plist
+        buildPhase:
+          copyFiles:
+            destination: wrapper
+            subpath: Contents/Library/LaunchDaemons
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.hsmith.Salvage
@@ -47,6 +54,42 @@ targets:
         product: SalvageCore
       - package: SalvageDiskIO
         product: SalvageDiskIO
+      # The helper binary lands in Salvage.app/Contents/MacOS/SalvageHelper (the plist's
+      # BundleProgram), signed on copy when signing is enabled (inside-out: helper first).
+      - target: SalvageHelper
+        embed: true
+        codeSign: true
+        copy:
+          destination: executables
+
+  # Story 1.12 / AD-13: the privileged read-only helper, a launchd daemon run as root. It
+  # compiles only its own main.swift plus SalvageDiskIO's HelperShared/ sources (pure validation
+  # rules, IORegistry/statfs queries): no SalvageCore, no DiskArbitration, no package products.
+  SalvageHelper:
+    type: tool
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: SalvageHelper
+        excludes:
+          - "*.plist"
+      - path: SalvageDiskIO/Sources/SalvageDiskIO/HelperShared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.hsmith.Salvage.Helper
+        PRODUCT_NAME: SalvageHelper
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+        ENABLE_HARDENED_RUNTIME: YES
+        # Embeds an Info.plist section so the code-signing identifier is the bundle ID above,
+        # which the app's peer requirement pins.
+        GENERATE_INFOPLIST_FILE: YES
+        CREATE_INFOPLIST_SECTION_IN_BINARY: YES
+        SKIP_INSTALL: YES
+        CODE_SIGN_STYLE: Automatic
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
 
   SalvageTests:
     type: bundle.unit-test
@@ -70,6 +113,7 @@ schemes:
     build:
       targets:
         Salvage: all
+        SalvageHelper: all
     run:
       config: Debug
     test:

@@ -21,6 +21,20 @@
                ReferencedContainer = "container:Salvage.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
+         <BuildActionEntry
+            buildForTesting = "YES"
+            buildForRunning = "YES"
+            buildForProfiling = "YES"
+            buildForArchiving = "YES"
+            buildForAnalyzing = "YES">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "2775E33C14E8415F835FB1F7"
+               BuildableName = "SalvageHelper"
+               BlueprintName = "SalvageHelper"
+               ReferencedContainer = "container:Salvage.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
       </BuildActionEntries>
    </BuildAction>
    <TestAction

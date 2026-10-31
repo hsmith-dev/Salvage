@@ -27,7 +27,7 @@ fresh_copy() {
     rm -rf "$copy"
     mkdir -p "$copy"
     local dir
-    for dir in Salvage SalvageCore SalvageDiskIO scripts; do
+    for dir in Salvage SalvageCore SalvageDiskIO SalvageHelper scripts; do
         [ -d "$dir" ] && rsync -a --exclude .build --exclude DerivedData "$dir" "$copy/"
     done
 }
@@ -115,6 +115,10 @@ plant_violation "CFSocket in SalvageCore" \
     "SalvageCore/Sources/SalvageCore/__TestStrayNetwork.swift" "let s: CFSocket? = nil"
 plant_violation "NSURLConnection in the app target" \
     "Salvage/__TestStrayNetwork.swift" "NSURLConnection.canHandle(r)"
+plant_violation "BSD socket( in the privileged helper" \
+    "SalvageHelper/__TestStrayNetwork.swift" "let fd = socket(AF_INET, SOCK_STREAM, 0)"
+plant_violation "URLSession in the privileged helper" \
+    "SalvageHelper/__TestStrayNetwork.swift" "let s = URLSession.shared"
 
 echo
 echo "=== Scenario: the exclusion is the exact designated path, not a file name ==="
@@ -135,6 +139,15 @@ echo "=== Scenario: no false positives ==="
 fresh_copy
 printf '%s\n' "session.disconnect(reason)" "let socketCount = 0" > "$copy/SalvageCore/Sources/SalvageCore/__TestLookalikes.swift"
 assert_passes "disconnect( and socketCount are not network calls" "$copy"
+fresh_copy
+mkdir -p "$copy/SalvageHelper"
+printf '%s\n' \
+    "let l = xpc_connection_create_mach_service(name, q, UInt64(XPC_CONNECTION_MACH_SERVICE_LISTENER))" \
+    "xpc_connection_set_peer_code_signing_requirement(peer, requirement)" \
+    "xpc_connection_send_message_with_reply(connection, message, queue) { _ in }" \
+    "let c = NSXPCConnection(machServiceName: name, options: .privileged)" \
+    "xpc_connection_cancel(peer)" > "$copy/SalvageHelper/__TestLocalIPC.swift"
+assert_passes "XPC local IPC in the helper is not network" "$copy"
 fresh_copy
 mkdir -p "$copy/SalvageCore/.build/checkouts"
 printf '%s\n' "let s = URLSession.shared" > "$copy/SalvageCore/.build/checkouts/__TestBuildArtifact.swift"

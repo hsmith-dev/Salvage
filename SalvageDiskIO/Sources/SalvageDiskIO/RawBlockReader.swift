@@ -53,10 +53,8 @@ public actor RawBlockReader: BlockReader {
     static func prepare(device: BlockDevice, operations: any RawDeviceOperations,
                         reservations: DeviceReadReservations) async throws -> RawBlockReader {
         let name = device.bsdName
-        guard name.hasPrefix("disk"), !name.dropFirst(4).isEmpty,
-              name.dropFirst(4).allSatisfy({ $0.isASCII && $0.isNumber }) else {
-            throw ScanError.unsafeTarget(notWholeDriveReason)
-        }
+        // Same strict rule the privileged helper re-applies (HelperShared/BSDDeviceNames.swift).
+        guard isWholeDiskBSDName(name) else { throw ScanError.unsafeTarget(notWholeDriveReason) }
         guard !device.isBootVolume else { throw ScanError.unsafeTarget(bootDriveReason) }
         guard device.mediaIdentity != nil else { throw ScanError.deviceChanged }
         try await reservations.acquire(name)
@@ -97,11 +95,12 @@ public actor RawBlockReader: BlockReader {
     }
     private static func checkProtection(_ name: String, operations: any RawDeviceOperations) async throws {
         let protected = try await operations.protectedDisks()
-        guard !protected.isEmpty else { throw ScanError.unsafeTarget("Couldn't identify your startup drive safely. The scan was refused.") }
+        guard !protected.isEmpty else { throw ScanError.unsafeTarget(bootUnresolvedReason) }
         guard !protected.contains(name) else { throw ScanError.unsafeTarget(bootDriveReason) }
     }
     static let bootDriveReason = "Your boot drive can't be scanned while macOS is running from it."
     static let notWholeDriveReason = "This device can't be scanned because its system name isn't a whole drive."
+    static let bootUnresolvedReason = "Couldn't identify your startup drive safely. The scan was refused."
 
     /// Cleanup is explicit and awaited before the app starts another session.
     public func close() async {
@@ -155,10 +154,48 @@ public actor RawBlockReader: BlockReader {
     }
 }
 
+/// Outcome of the unprivileged `open(2)` attempt.
+enum DirectOpenResult: Sendable, Equatable { case opened(Int32), failed(errno: Int32) }
+
+/// AD-13 fallback: open the raw node directly first, which is all a user-owned device (an
+/// attached disk image, a test fixture) needs. Only EACCES/EPERM -- the `root:operator 0640`
+/// ownership of physical drives -- goes to the privileged helper. Either way the descriptor is
+/// then checked with `validateRawDescriptor`, so a helper fd is never trusted blindly.
+func openRawDevice(_ name: String, expected: RawDeviceIdentity, directOpen: (String) -> DirectOpenResult,
+                   helper: any PrivilegedOpening) async throws -> Int32 {
+    guard isWholeDiskBSDName(name) else { throw ScanError.unsafeTarget(RawBlockReader.notWholeDriveReason) }
+    let descriptor: Int32
+    switch directOpen("/dev/r\(name)") {
+    case .opened(let fd):
+        descriptor = fd
+    case .failed(let code) where code == EACCES || code == EPERM:
+        descriptor = try await helper.openWholeDiskReadOnly(
+            PrivilegedOpenRequest(bsdName: name, registryID: expected.registryID, deviceNumber: expected.deviceNumber))
+    case .failed(let code):
+        throw ScanError.io(String(cString: strerror(code)))
+    }
+    try validateRawDescriptor(descriptor, expected: expected)
+    return descriptor
+}
+
+/// The fd must be a character device with the expected device number; it is then switched to
+/// uncached reads. On any mismatch the fd is closed and the device treated as changed.
+func validateRawDescriptor(_ descriptor: Int32, expected: RawDeviceIdentity) throws {
+    var node = stat()
+    guard fstat(descriptor, &node) == 0,
+          isExpectedCharacterDevice(mode: node.st_mode, rdev: node.st_rdev, expected: expected.deviceNumber),
+          fcntl(descriptor, F_NOCACHE, 1) == 0 else {
+        Darwin.close(descriptor); throw ScanError.deviceChanged
+    }
+}
+
 private actor NativeRawDeviceOperations: RawDeviceOperations {
+    private let helper: any PrivilegedOpening
+    init(helper: any PrivilegedOpening = PrivilegedOpenClient.live) { self.helper = helper }
+
     func protectedDisks() async throws -> Set<String> {
         guard case .success(let disks) = resolveBootDisks(), !disks.isEmpty else {
-            throw ScanError.unsafeTarget("Couldn't identify your startup drive safely. The scan was refused.")
+            throw ScanError.unsafeTarget(RawBlockReader.bootUnresolvedReason)
         }
         return disks
     }
@@ -203,20 +240,15 @@ private actor NativeRawDeviceOperations: RawDeviceOperations {
         }
     }
     func openReadOnly(_ name: String, expected: RawDeviceIdentity) async throws -> Int32 {
-        // No suspension between final identity validation and open on this actor.
+        // No suspension between final identity validation and the direct open on this actor.
+        // The helper path does suspend; the helper re-checks registry ID, device number, boot
+        // refusal and mount state itself, and `prepare` re-validates identity after the open.
         guard try await identity(name) == expected else { throw ScanError.deviceChanged }
         try ensureUnmounted(name, sources: ownedMountSources())
-        let fd = Darwin.open("/dev/r\(name)", O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
-        guard fd >= 0 else {
-            if errno == EPERM || errno == EACCES { throw ScanError.permissionDenied }
-            throw ScanError.io(String(cString: strerror(errno)))
-        }
-        var node = stat()
-        guard fstat(fd, &node) == 0, node.st_mode & S_IFMT == S_IFCHR, node.st_rdev == expected.deviceNumber,
-              fcntl(fd, F_NOCACHE, 1) == 0 else {
-            Darwin.close(fd); throw ScanError.deviceChanged
-        }
-        return fd
+        return try await openRawDevice(name, expected: expected, directOpen: { path in
+            let fd = Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+            return fd >= 0 ? .opened(fd) : .failed(errno: errno)
+        }, helper: helper)
     }
     func closeDescriptor(_ descriptor: Int32) async { Darwin.close(descriptor) }
 }
@@ -268,27 +300,13 @@ final class OneShotCompletion: @unchecked Sendable {
 
 /// The production and injected paths share this refusal rule.
 func ensureUnmounted(_ name: String, sources: [String]) throws {
-    if sources.contains(where: { wholeDiskBSDName(fromDevicePath: $0) == name }) {
+    if isMounted(name, sources: sources) {
         throw ScanError.io("The device was mounted again. Close files on it and retry.")
     }
 }
 
-/// getfsstat writes caller-owned storage; unlike getmntinfo it shares no static mount buffer.
+/// getfsstat writes caller-owned storage (see HelperShared/PrivilegedDiskQueries.swift).
 private func ownedMountSources() throws -> [String] {
-    for _ in 0..<3 {
-        let count = getfsstat(nil, 0, MNT_NOWAIT)
-        guard count > 0, count < 1_000_000 else { break }
-        var mounts = Array(repeating: statfs(), count: Int(count) + 16)
-        let fetched = mounts.withUnsafeMutableBufferPointer {
-            getfsstat($0.baseAddress, Int32($0.count * MemoryLayout<statfs>.stride), MNT_NOWAIT)
-        }
-        guard fetched >= 0 else { break }
-        if fetched >= mounts.count { continue }
-        return mounts.prefix(Int(fetched)).map { mount in
-            withUnsafeBytes(of: mount.f_mntfromname) { bytes in
-                String(decoding: bytes.prefix(while: { $0 != 0 }), as: UTF8.self)
-            }
-        }
-    }
-    throw ScanError.io("Couldn't verify the device is unmounted.")
+    guard let sources = mountSourcesSnapshot() else { throw ScanError.io("Couldn't verify the device is unmounted.") }
+    return sources
 }
