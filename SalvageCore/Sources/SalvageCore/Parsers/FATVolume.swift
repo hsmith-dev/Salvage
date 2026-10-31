@@ -185,20 +185,25 @@ actor FATVolume {
         try validCluster(cluster)
         if let previous = owners[cluster], previous != owner { throw ScanError.malformed("Cross-linked allocations.") }
         if exfat {
-            let index = Int64(cluster) - 2, byte = index / 8
-            let bitmapCluster = bitmapClusters[Int(byte / clusterBytes)]
-            let within = byte % clusterBytes
-            let page = within / 4096 * 4096
-            let offset = try checkedAdd(clusterOffset(bitmapCluster), page)
-            if offset != bitmapPageOffset {
-                bitmapPage = try await read(offset, Int(min(4096, clusterBytes - page)))
-                bitmapPageOffset = offset
-            }
-            guard bitmapPage[Int(within - page)] & (UInt8(1) << UInt8(index % 8)) != 0 else {
+            guard try await allocatedInBitmap(cluster) else {
                 throw ScanError.malformed("Live entry references a free allocation cluster.")
             }
         }
         owners[cluster] = owner
+    }
+    /// The active exFAT allocation bitmap's bit for `cluster`, read through a bounded page cache.
+    func allocatedInBitmap(_ cluster: UInt32) async throws -> Bool {
+        try validCluster(cluster)
+        let index = Int64(cluster) - 2, byte = index / 8
+        let bitmapCluster = bitmapClusters[Int(byte / clusterBytes)]
+        let within = byte % clusterBytes
+        let page = within / 4096 * 4096
+        let offset = try checkedAdd(clusterOffset(bitmapCluster), page)
+        if offset != bitmapPageOffset {
+            bitmapPage = try await read(offset, Int(min(4096, clusterBytes - page)))
+            bitmapPageOffset = offset
+        }
+        return bitmapPage[Int(within - page)] & (UInt8(1) << UInt8(index % 8)) != 0
     }
     func validCluster(_ cluster: UInt32) throws {
         guard cluster >= 2, cluster < (exfat ? 0xfffffff7 : 0x0ffffff0), Int64(cluster) - 2 < clusterCount else { throw ScanError.malformed("Invalid cluster.") }
@@ -208,6 +213,13 @@ actor FATVolume {
         return try checkedAdd(heapOffset, checkedMultiply(Int64(cluster) - 2, clusterBytes))
     }
     func next(_ cluster: UInt32) async throws -> UInt32? {
+        let value = try await fatEntry(cluster)
+        if exfat ? value == 0xffffffff : value >= 0x0ffffff8 { return nil }
+        try validCluster(value)
+        return value
+    }
+    /// The raw (masked) FAT entry for `cluster`; 0 means the cluster is free.
+    func fatEntry(_ cluster: UInt32) async throws -> UInt32 {
         try validCluster(cluster)
         let position = Int64(cluster) * 4
         guard position <= fatBytes - 4 else { throw ScanError.malformed("FAT index outside table.") }
@@ -216,10 +228,7 @@ actor FATVolume {
             fatPage = try await read(checkedAdd(fatOffset, pageOffset), Int(min(65536, fatBytes - pageOffset)))
             fatPageOffset = pageOffset
         }
-        let value = UInt32(try fatPage.number(Int(position - pageOffset), 4)) & (exfat ? 0xffffffff : 0x0fffffff)
-        if exfat ? value == 0xffffffff : value >= 0x0ffffff8 { return nil }
-        try validCluster(value)
-        return value
+        return UInt32(try fatPage.number(Int(position - pageOffset), 4)) & (exfat ? 0xffffffff : 0x0fffffff)
     }
     func validateFile(_ cluster: UInt32, length: Int64, contiguous: Bool, owner: String) async throws {
         if length == 0 { return }
@@ -246,6 +255,8 @@ actor FATVolume {
         var current: UInt32? = first, seen: Set<UInt32> = []
         var children: [(UInt32, String, Int64?, Bool)] = []
         var lfn: [Data] = [], entries: [Data] = [], entryOffset: Int64 = 0
+        // Deleted metadata is collected separately: it is validated per entry and never aborts the scan.
+        var deletedLfn: [Data] = [], deletedSet: [Data] = [], deletedOffset: Int64 = 0
         var bytes: Int64 = 0
         while let cluster = current {
             guard seen.insert(cluster).inserted, Int64(seen.count) <= clusterCount else { throw ScanError.malformed("Directory allocation cycle.") }
@@ -267,6 +278,19 @@ actor FATVolume {
                         return children
                     }
                     if exfat {
+                        if !deletedSet.isEmpty && entries.isEmpty {
+                            if type & 0x80 == 0 && type != 0x05 {
+                                deletedSet.append(entry)
+                                if deletedSet.count == Int(deletedSet[0][1]) + 1 {
+                                    try await deletedExfatEntry(deletedSet, at: deletedOffset, path: path)
+                                    deletedSet = []
+                                }
+                                continue
+                            }
+                            // A live entry (or a new deleted primary) overwrote the rest of this set;
+                            // drop it and process this entry normally.
+                            deletedSet = []
+                        }
                         if !entries.isEmpty {
                             entries.append(entry)
                             let needed = Int(entries[0][1]) + 1
@@ -277,13 +301,25 @@ actor FATVolume {
                         } else if type == 0x85 {
                             guard entry[1] >= 2 else { throw ScanError.malformed("Missing exFAT secondary entries.") }
                             entries = [entry]; entryOffset = location
+                        } else if type == 0x05 {
+                            if entry[1] >= 2 { deletedSet = [entry]; deletedOffset = location }
                         } else if type & 0x80 != 0 && type & 0x20 == 0 && ![0x81,0x82,0x83].contains(type) {
                             throw ScanError.malformed("Unsupported critical exFAT entry.")
                         }
                     } else {
-                        // Deleted (0xE5) slots reset any run without error: deleted LFN slots
+                        // Deleted (0xE5) slots reset any live run without error: deleted LFN slots
                         // legitimately precede their deleted short entry.
-                        if type == 0xe5 { lfn = []; continue }
+                        if type == 0xe5 {
+                            lfn = []
+                            if entry[11] == 0x0f {
+                                deletedLfn.append(entry); if deletedLfn.count > 20 { deletedLfn.removeFirst() }
+                                continue
+                            }
+                            let slots = deletedLfn; deletedLfn = []
+                            try await deletedFatEntry(entry, long: slots, at: location, path: path)
+                            continue
+                        }
+                        deletedLfn = []
                         if entry[11] == 0x0f { lfn.append(entry); if lfn.count > 20 { lfn = [] }; continue }
                         defer { lfn = [] }
                         // A live LFN run must be owned by a live short entry, never a volume label or dot entry.
@@ -305,6 +341,7 @@ actor FATVolume {
                         } else {
                             try await validateFile(cluster, length: size, contiguous: false, owner: "file:\(location)")
                             try await emit(RecoveredFile(name: name, path: fullPath, sizeBytes: size,
+                                modified: Self.fatTimestamp(entry),
                                 sourceMetadata: SourceMetadata(filesystem: .fat32, volumeOffset: extent.offset,
                                     recordOffset: location, allocationStart: UInt64(cluster), contiguous: false,
                                     rawRecord: lfn.reduce(Data(), +) + entry)))
@@ -336,21 +373,29 @@ actor FATVolume {
         for byte in entry.prefix(11) { checksum = ((checksum & 1) << 7) &+ (checksum >> 1) &+ byte }
         if !long.isEmpty, long.count <= 20, long[0][0] == UInt8(long.count) | 0x40,
            long.enumerated().allSatisfy({ index, data in
-               data[0] == UInt8(long.count - index) | (index == 0 ? 0x40 : 0) && data[13] == checksum &&
-               data[12] == 0 && data[26] == 0 && data[27] == 0
-           }) {
-            var units: [UInt16] = []
-            for data in long.reversed() {
-                for offset in [1,3,5,7,9,14,16,18,20,22,24,28,30] {
-                    if let value = try? data.number(offset, 2) { units.append(UInt16(value)) }
-                }
+               data[0] == UInt8(long.count - index) | (index == 0 ? 0x40 : 0) && data[13] == checksum
+           }), let name = lfnName(long) { return name }
+        return shortName(entry)
+    }
+    /// Decodes LFN slots given in on-disk order (last name part first). Ordinals are not checked here.
+    func lfnName(_ long: [Data]) -> String? {
+        guard !long.isEmpty, long.count <= 20, long.allSatisfy({
+            $0.count == 32 && $0[11] == 0x0f && $0[12] == 0 && $0[26] == 0 && $0[27] == 0
+        }) else { return nil }
+        var units: [UInt16] = []
+        for data in long.reversed() {
+            for offset in Self.lfnOffsets {
+                if let value = try? data.number(offset, 2) { units.append(UInt16(value)) }
             }
-            let end = units.firstIndex(of: 0) ?? units.count
-            let paddingValid = end == units.count || units.dropFirst(end + 1).allSatisfy { $0 == 0xffff }
-            let nameUnits = Array(units.prefix(end))
-            if paddingValid, !nameUnits.isEmpty, nameUnits.count <= 255, !nameUnits.contains(0xffff),
-               let name = strictUTF16(nameUnits) { return name }
         }
+        let end = units.firstIndex(of: 0) ?? units.count
+        let paddingValid = end == units.count || units.dropFirst(end + 1).allSatisfy { $0 == 0xffff }
+        let nameUnits = Array(units.prefix(end))
+        guard paddingValid, !nameUnits.isEmpty, nameUnits.count <= 255, !nameUnits.contains(0xffff) else { return nil }
+        return strictUTF16(nameUnits)
+    }
+    static let lfnOffsets = [1,3,5,7,9,14,16,18,20,22,24,28,30]
+    func shortName(_ entry: Data) -> String {
         var base = Array(entry.prefix(8)); if base[0] == 0x05 { base[0] = 0xe5 }
         var name = String(bytes: base, encoding: String.Encoding(rawValue: 0x80000400)) ?? String(decoding: base, as: UTF8.self)
         name = name.trimmingCharacters(in: .whitespaces)
@@ -359,13 +404,18 @@ actor FATVolume {
         if entry[12] & 8 != 0 { name = name.lowercased() }; if entry[12] & 16 != 0 { ext = ext.lowercased() }
         return name + (ext.isEmpty ? "" : "." + ext)
     }
-    func exfatEntry(_ entries: [Data], at location: Int64, path: String) async throws -> (UInt32, String, Int64?, Bool)? {
+    struct ExfatSet {
+        let name: String, sizeBytes: Int64, validBytes: Int64, cluster: UInt32
+        let contiguous: Bool, isDirectory: Bool, modified: Date?
+    }
+    /// Validates and decodes a file entry set. Entries must carry their in-use bits.
+    func parseExfatSet(_ entries: [Data]) throws -> ExfatSet {
         let raw = entries.reduce(Data(), +)
         var checksum: UInt16 = 0
         for (index, byte) in raw.enumerated() where index != 2 && index != 3 {
             checksum = ((checksum & 1) << 15) &+ (checksum >> 1) &+ UInt16(byte)
         }
-        guard UInt64(checksum) == (try entries[0].number(2, 2)), entries[1][0] == 0xc0,
+        guard entries.count >= 2, UInt64(checksum) == (try entries[0].number(2, 2)), entries[1][0] == 0xc0,
               entries.dropFirst(2).allSatisfy({ $0[0] == 0xc1 || $0[0] & 0xe0 == 0xe0 }) else {
             throw ScanError.malformed("Invalid exFAT file entry set.")
         }
@@ -383,17 +433,152 @@ actor FATVolume {
         try validName(name)
         let size = try signed(stream.number(24, 8)), valid = try signed(stream.number(8, 8))
         guard valid <= size else { throw ScanError.malformed("Invalid exFAT valid data length.") }
-        let cluster = UInt32(try stream.number(20, 4)), contiguous = stream[1] & 2 != 0
-        let fullPath = path + "/" + name
-        if try entries[0].number(4, 2) & 0x10 != 0 {
-            guard size > 0, size % clusterBytes == 0, valid == size else { throw ScanError.malformed("Invalid exFAT directory size.") }
+        let primary = entries[0]
+        return ExfatSet(name: name, sizeBytes: size, validBytes: valid, cluster: UInt32(try stream.number(20, 4)),
+                        contiguous: stream[1] & 2 != 0, isDirectory: try primary.number(4, 2) & 0x10 != 0,
+                        modified: Self.exfatTimestamp(UInt32(try primary.number(12, 4)),
+                                                      tenMs: primary[21], utcOffset: primary[23]))
+    }
+    func exfatEntry(_ entries: [Data], at location: Int64, path: String) async throws -> (UInt32, String, Int64?, Bool)? {
+        let raw = entries.reduce(Data(), +)
+        let set = try parseExfatSet(entries)
+        let size = set.sizeBytes, cluster = set.cluster, contiguous = set.contiguous
+        let fullPath = path + "/" + set.name
+        if set.isDirectory {
+            guard size > 0, size % clusterBytes == 0, set.validBytes == size else { throw ScanError.malformed("Invalid exFAT directory size.") }
             try validCluster(cluster)
             return (cluster, fullPath, size, contiguous)
         }
         try await validateFile(cluster, length: size, contiguous: contiguous, owner: "file:\(location)")
-        try await emit(RecoveredFile(name: name, path: fullPath, sizeBytes: size,
+        try await emit(RecoveredFile(name: set.name, path: fullPath, sizeBytes: size, modified: set.modified,
              sourceMetadata: SourceMetadata(filesystem: .exfat, volumeOffset: extent.offset,
                 recordOffset: location, allocationStart: UInt64(cluster), contiguous: contiguous, rawRecord: raw)))
         return nil
+    }
+
+    // MARK: Deleted entries
+    //
+    // Deleted metadata is expected to be partly stale. Each entry is validated on its own and
+    // skipped (never thrown) when implausible. Deleted entries never claim() clusters, so they
+    // can't raise cross-links against live files or cause live files to be rejected.
+
+    /// True when `required` clusters starting at `first` lie inside the heap and are all free in
+    /// the active FAT (FAT32) or the active allocation bitmap (exFAT).
+    func freeRun(from first: UInt32, required: Int64) async throws -> Bool {
+        guard (try? validCluster(first)) != nil, required > 0,
+              required <= clusterCount - (Int64(first) - 2) else { return false }
+        for offset in 0..<required {
+            if offset % 4096 == 0 { try Task.checkCancellation() }
+            let cluster = first + UInt32(offset)
+            let free = exfat ? !(try await allocatedInBitmap(cluster)) : try await fatEntry(cluster) == 0
+            guard free else { return false }
+        }
+        return true
+    }
+    func deletedFatEntry(_ entry: Data, long: [Data], at location: Int64, path: String) async throws {
+        // Volume labels and deleted directories are not reported; directories aren't descended into.
+        guard entry[11] & 0x18 == 0 else { return }
+        var used: [Data] = []
+        var name = recoverDeletedLongName(entry, slots: long, used: &used)
+        if name == nil {
+            var short = entry; short[0] = UInt8(ascii: "_")
+            name = shortName(short); used = []
+        }
+        guard let name, (try? validName(name)) != nil else { return }
+        let cluster = UInt32(try entry.number(20, 2)) << 16 | UInt32(try entry.number(26, 2))
+        let size = try signed(entry.number(28, 4))
+        // Deletion zeroes the chain, so assume a contiguous run from the first cluster.
+        if size > 0 {
+            guard try await freeRun(from: cluster, required: (size - 1) / clusterBytes + 1) else { return }
+        }
+        try await emit(RecoveredFile(name: name, path: path + "/" + name, sizeBytes: size,
+            modified: Self.fatTimestamp(entry), isDeleted: true,
+            sourceMetadata: SourceMetadata(filesystem: .fat32, volumeOffset: extent.offset,
+                recordOffset: location, allocationStart: UInt64(cluster), contiguous: true,
+                rawRecord: used.reduce(Data(), +) + entry)))
+    }
+    /// Rebuilds a deleted long name. Ordinals are overwritten with 0xE5, so the run is identified by
+    /// position (the slots immediately preceding the short entry) and a shared checksum.
+    ///
+    /// The short name's first byte is lost too, and the checksum is a bijection in that byte, so
+    /// "some byte matches" proves nothing. Instead the byte is derived from the recovered long name
+    /// the way short names are generated (its first character uppercased, or `_` for one that is
+    /// not valid in 8.3), and the checksum must match with one of those candidates.
+    func recoverDeletedLongName(_ entry: Data, slots: [Data], used: inout [Data]) -> String? {
+        guard let last = slots.last else { return nil }
+        let checksum = last[13]
+        var run = Array(slots.reversed().prefix { $0[13] == checksum }.reversed())
+        // The on-disk first slot of a run holds the name terminator; drop stale slots before it.
+        if let start = run.lastIndex(where: { slot in Self.lfnOffsets.contains { (try? slot.number($0, 2)) == 0 } }) {
+            run = Array(run[start...])
+        }
+        guard let name = lfnName(run) else { return nil }
+        var candidates: [UInt8] = [UInt8(ascii: "_")]
+        if let first = name.unicodeScalars.first(where: { $0 != "." && $0 != " " }), first.isASCII {
+            let byte = UInt8(first.value)
+            candidates.append((0x61...0x7a).contains(byte) ? byte - 0x20 : byte)
+        }
+        let tail = entry.dropFirst().prefix(10)
+        let matches = candidates.contains { first in
+            var sum: UInt8 = first
+            for byte in tail { sum = ((sum & 1) << 7) &+ (sum >> 1) &+ byte }
+            return sum == checksum
+        }
+        guard matches else { return nil }
+        used = run
+        return name
+    }
+    func deletedExfatEntry(_ entries: [Data], at location: Int64, path: String) async throws {
+        // The set checksum covers the in-use bits, so validate with them restored.
+        let restored = entries.map { entry -> Data in var copy = entry; copy[copy.startIndex] |= 0x80; return copy }
+        guard let set = try? parseExfatSet(restored), !set.isDirectory else { return }
+        if set.sizeBytes > 0 {
+            let required = (set.sizeBytes - 1) / clusterBytes + 1
+            // A FAT-chained (possibly fragmented) deleted file can't be followed reliably.
+            guard set.contiguous || required == 1 else { return }
+            guard try await freeRun(from: set.cluster, required: required) else { return }
+        }
+        try await emit(RecoveredFile(name: set.name, path: path + "/" + set.name, sizeBytes: set.sizeBytes,
+            modified: set.modified, isDeleted: true,
+            sourceMetadata: SourceMetadata(filesystem: .exfat, volumeOffset: extent.offset,
+                recordOffset: location, allocationStart: UInt64(set.cluster), contiguous: true,
+                rawRecord: entries.reduce(Data(), +))))
+    }
+
+    // MARK: Timestamps
+
+    /// FAT32 write date/time (offsets 24 and 22): local time, 2-second resolution.
+    static func fatTimestamp(_ entry: Data) -> Date? {
+        guard let time = try? entry.number(22, 2), let date = try? entry.number(24, 2) else { return nil }
+        return timestamp(date: Int(date), time: Int(time), centiseconds: 0, utcOffsetMinutes: nil)
+    }
+    /// exFAT last-modified timestamp with its 10 ms increment, in the recorded UTC offset when that
+    /// offset is valid and in local time otherwise.
+    static func exfatTimestamp(_ stamp: UInt32, tenMs: UInt8, utcOffset: UInt8) -> Date? {
+        guard tenMs <= 199 else { return nil }
+        var offset: Int?
+        if utcOffset & 0x80 != 0 {
+            let raw = Int(utcOffset & 0x7f), quarters = raw >= 64 ? raw - 128 : raw
+            if (-48...56).contains(quarters) { offset = quarters * 15 }
+        }
+        return timestamp(date: Int(stamp >> 16), time: Int(stamp & 0xffff), centiseconds: Int(tenMs), utcOffsetMinutes: offset)
+    }
+    /// DOS date/time fields; any out-of-range component yields nil rather than a normalized date.
+    static func timestamp(date: Int, time: Int, centiseconds: Int, utcOffsetMinutes: Int?) -> Date? {
+        let day = date & 31, month = (date >> 5) & 15, year = 1980 + (date >> 9)
+        let second = (time & 31) * 2, minute = (time >> 5) & 63, hour = time >> 11
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+        let days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        guard (1...12).contains(month), (1...days[month - 1]).contains(day),
+              hour <= 23, minute <= 59, second <= 58 else { return nil }
+        var calendar = Calendar(identifier: .gregorian)
+        if let utcOffsetMinutes {
+            guard let zone = TimeZone(secondsFromGMT: utcOffsetMinutes * 60) else { return nil }
+            calendar.timeZone = zone
+        } else {
+            calendar.timeZone = .current
+        }
+        let components = DateComponents(year: year, month: month, day: day, hour: hour, minute: minute, second: second)
+        return calendar.date(from: components)?.addingTimeInterval(Double(centiseconds) / 100)
     }
 }
