@@ -102,14 +102,14 @@ context:
    - The request dictionary must have exactly 5 keys.
 6. **How the approval error is represented without editing Core.** It is `ScanError.io(PrivilegedHelperApproval.guidance)`, recognised by exact equality through `PrivilegedHelperApproval.isApprovalRequired`. `ScanViewModel` already carries any `ScanError` through unchanged. If Core later gains a dedicated case, only `PrivilegedOpenClient.swift` and that predicate change.
 7. **When registration happens.** The client calls `SMAppService.register()` lazily, on the first EACCES, if the status is `.notRegistered`. Every non-`enabled` status ends in guidance and never in a connection attempt. A registration that fails and stays unregistered (typical for an unsigned build) gives the "component missing" message. The guidance text is tested for having no jargon (XPC, daemon, helper, root, …).
-8. **The helper doesn't exit when idle** after launch. Requests are rare and launchd starts it on demand. It holds no state, logs nothing (so it can never log file contents), and has no `os_log`. The built binary's undefined symbols were inspected: there is no spawn, socket, connect, mount or write API.
+8. **Idle exit (superseded by the security-review patch below):** the helper now exits after 60 s with no open connection. It holds no state, logs nothing (so it can never log file contents), and has no `os_log`. The built binary's undefined symbols were inspected: there is no spawn, socket, connect, mount or write API.
 9. **The helper fd path suspends** between the actor's identity check and the open, unlike the direct path. The helper's own registry ID, `st_rdev` and mount checks cover that window, and `prepare` already re-validates identity after the open.
 
 ### Manual end-to-end verification (needs a Developer ID / Apple Development team; NOT done here)
 
 Nothing was installed, registered or run on the build machine. To verify on a Mac you control:
 
-1. In Xcode, open `Salvage.xcodeproj` and set the **same Team** for the `Salvage` and `SalvageHelper` targets (Signing & Capabilities). Build and Run the `Salvage` scheme (Debug is fine; Apple Development certs satisfy `anchor apple generic`). Then copy the built `Salvage.app` to `/Applications`, because SMAppService daemons are most reliable from there, and launch that copy.
+1. In Xcode, open `Salvage.xcodeproj` and set the **same Team** for the `Salvage` and `SalvageHelper` targets (Signing & Capabilities). Build and Run the `Salvage` scheme **in Debug**: only Debug builds accept Apple Development certificates (see "Security-review patch", item 3). A Release build must be signed with Developer ID Application, or the helper and app refuse each other. Then copy the built `Salvage.app` to `/Applications`, because SMAppService daemons are most reliable from there, and launch that copy.
 2. Check the signatures:
    - `codesign -dv --verbose=4 /Applications/Salvage.app/Contents/MacOS/SalvageHelper` should show `Identifier=dev.hsmith.Salvage.Helper`, the same `TeamIdentifier` as the app, and `flags=…runtime`.
    - `codesign --verify --deep --strict /Applications/Salvage.app` should pass.
@@ -135,7 +135,57 @@ Nothing was installed, registered or run on the build machine. To verify on a Ma
 - `xcodebuild … CODE_SIGNING_ALLOWED=NO -only-testing:SalvageTests test`: `Test run with 50 tests in 7 suites passed`, `** TEST SUCCEEDED **`.
 - `xcodebuild … CODE_SIGNING_ALLOWED=NO build`: `** BUILD SUCCEEDED **`, with no warnings from the new code. The bundle contains `Contents/MacOS/SalvageHelper` and `Contents/Library/LaunchDaemons/dev.hsmith.Salvage.Helper.plist`.
 
+### Security-review patch (branch `p2-helper`)
+
+1. **Cross-user disclosure (medium).** `serve` is now `servePrivilegedOpen` in `HelperShared/PrivilegedOpenProtocol.swift`: a pure core over an injectable `PrivilegedOpenSystem` (IORegistry, getfsstat, lstat, open, fstat, close). The live implementation is `LivePrivilegedOpenSystem` in `PrivilegedDiskQueries.swift`. `main.swift` only decodes, passes `xpc_connection_get_euid(peer)`, and replies.
+   - The node must be owned by root, both at `lstat` before the open and at `fstat` after it. Every physical-disk node is `root:operator 0640`. A non-root node gets the new refusal `notRootOwned`.
+   - Disk-image media is refused with the new `diskImage`. Media counts as a disk image when any IOService ancestor, or the media itself, matches one of these. Erring towards "image" only ever refuses.
+     - a disk-image driver class: `AppleDiskImageDevice`, `AppleDiskImagesController` or the `IOHDIX*` family;
+     - `Protocol Characteristics` with `Physical Interconnect` = "Disk Image", or `Physical Interconnect Location` = "File";
+     - `Device Characteristics` with `Product Name` = "Disk Image".
+   - On this machine (macOS 27.2) images show `AppleDiskImageDevice` with "Virtual Interface"/"File", or `IOHDIXHDDriveInKernel`. APFS containers synthesized from an image inherit the flag through the ancestor walk.
+   - The peer euid is passed into the core and documented there, but not compared. Root-only ownership already makes the answer independent of the caller.
+   - Wire decoding (`decodePrivilegedOpenRequest`) now requires every key with its exact XPC type. Before, a wrong-typed `deviceNumber` was read as 0, and a wrong-typed `registryID` or `version` as 0.
+   - Both new refusals map to one plain-language `unsafeTarget` message (`PrivilegedOpenClient.otherUsersDeviceReason`).
+   - Order: decode → media lookup → boot → whole → identity → disk image → mounts → lstat (char device, rdev, root) → open → fstat (same checks) → registry re-check (ID, not an image).
+2. **APFS-layered mounts (medium).** `isMounted(_:sources:ancestorWholeDisks:)` (shared) also counts a disk as mounted when any mount source's media has it as an IORegistry ancestor. For example, disk4 is in use while disk5s1 is mounted from the container synthesized on disk4s1.
+   - Mount sources are parsed strictly: `/dev/[r]diskN[sM...]`, a bare name, or `snapshot@/dev/...`. NFS and SMB sources are never looked up.
+   - A disk-node source whose ancestry can't be resolved counts as mounted (fail closed). A live test asserts that every mount on the test machine resolves.
+   - The ancestor walk is the existing one, generalised (`registryAncestry`), exposed as `registryAncestorWholeDisks(ofMediaNamed:)`.
+   - It is applied in the helper and in both of RawBlockReader's pre-open checks (`prepare` and `NativeRawDeviceOperations.openReadOnly`), through a new `RawDeviceOperations.ancestorWholeDisks(ofMediaNamed:)`.
+   - Side effect: selecting a disk image whose APFS volumes are still mounted is now refused with "mounted again". DiskArbitration's whole-disk unmount of disk4 doesn't unmount disk5's volumes.
+3. **Developer ID only in Release (medium/low).** `codeSigningRequirement(identifier:teamID:allowDevelopmentCertificates:)` has two modes.
+   - Strict: `anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "<TEAM>" and identifier "<id>"`.
+   - Development: the previous requirement.
+   - Both sides (the helper checking the app, the app checking the helper) use `PrivilegedOpenProtocol.allowsDevelopmentSigning`, which is true only when:
+     - the helper target is built with `SALVAGE_HELPER_ALLOW_DEVELOPMENT`, which project.yml sets for Debug only;
+     - or the SalvageDiskIO package is built with `SWIFT_PACKAGE && DEBUG`. The package can't see app-target settings, and Package.swift was out of scope. Xcode and SwiftPM set `DEBUG` only in the debug configuration.
+   - Verified in the build logs: Release compiles SalvageDiskIO with `-DSWIFT_PACKAGE` and no `-DDEBUG`, and the helper's Release conditions are empty.
+   - **Manual-test implications:**
+     - A Debug build signed with Apple Development works end to end, as before.
+     - A Release build signed with anything other than Developer ID Application fails closed. That includes Apple Development, Apple Distribution and Mac App Store certificates: the helper drops the app's connection, and the app shows "didn't respond". This is intended.
+     - Test Release only with a Developer ID-signed build, such as the release workflow's artifact.
+     - Don't mix a Debug app with a Release helper: both halves come from one build anyway.
+4. **Access mode (low).** `validateRawDescriptor` checks `fcntl(F_GETFL) & O_ACCMODE == O_RDONLY` first. Otherwise it closes the fd and throws `unsafeTarget(RawBlockReader.writableDescriptorReason)`.
+5. **SpawnConstraint (low).**
+   - The source plist pins `SpawnConstraint` = `{signing-identifier: dev.hsmith.Salvage.Helper}`.
+   - The Team ID isn't in the source plist, because it is never hardcoded. Instead a post-build script on the `Salvage` target (project.yml, "Pin helper SpawnConstraint team") adds `team-identifier` from `DEVELOPMENT_TEAM` to the *bundled* copy. It runs before the app is sealed, and only when `DEVELOPMENT_TEAM` is a valid 10-character Team ID.
+   - `DEVELOPMENT_TEAM` comes from Xcode's team picker locally, and `release.yml` already passes it.
+   - Unsigned CI builds keep the identifier-only constraint, and their helper can't serve anyway.
+   - Verified by building with `DEVELOPMENT_TEAM=ABCDE12345`: the bundled plist got the team and the source plist was unchanged.
+   - **Release follow-up:** after the first signed release, confirm on a real Mac that launchd spawns the helper (`sudo launchctl print system/dev.hsmith.Salvage.Helper`). If launchd rejects the constraint, `log show --predicate 'subsystem == "com.apple.xpc.launchd"'` will say so. Optionally have `release.yml` assert `plutil -extract SpawnConstraint.team-identifier raw` equals the app's team (release.yml was out of scope for this patch).
+6. **Idle exit (low).** `HelperIdleTracker` (shared, pure) counts open peer connections and the last activity. A dispatch timer on the helper's serial queue is re-armed on every connection open, close and message. When it fires with no connection open and 60 s idle, the helper calls `exit(EXIT_SUCCESS)`, and launchd relaunches it on demand. Each peer is counted closed exactly once, on its first error event.
+7. **Tests.**
+   - New suites cover the serve core's refusal ordering (wrong-typed and missing keys included), request decoding over real XPC dictionaries, and idle exit.
+   - `refusalsMapToScanErrors` now runs on a table of literal expected `ScanError`s.
+   - The APFS-layered mounted case is tested in the helper core, the shared rule and `RawBlockReader.prepare`.
+8. **Flaky fd-closed checks.**
+   - Before: `helperDescriptorForTheWrongNodeIsClosedAndRefused` and `…WrongDeviceNumber…` used `fcntl(F_GETFD)`, which can't tell "closed" from "closed and the number reused by a parallel test".
+   - The wrong-node fake now hands out a pipe's read end and probes the kept write end. Writing gets EPIPE only when our read end was closed.
+   - The /dev/null fake opens with `O_NONBLOCK`, a per-open-file-description flag. "Closed" means the number is gone, or now refers to something without that flag or isn't /dev/null.
+   - The suite is `.serialized`. Production checks are unchanged.
+
 ### Not done / follow-ups
 
-- No end-to-end run with a real signed helper (see the manual steps above).
+- No end-to-end run with a real signed helper (see the manual steps above). That includes the security-review patch: Developer ID enforcement, SpawnConstraint and idle exit are untested on a live launchd.
 - `check-core-boundary.sh` doesn't yet assert that `HelperShared/` stays free of `SalvageCore`, `DiskArbitration` and `Process`. If any of those crept in, the helper target build would fail on the first two, but not on `Process`. A narrow follow-up check would be worthwhile.

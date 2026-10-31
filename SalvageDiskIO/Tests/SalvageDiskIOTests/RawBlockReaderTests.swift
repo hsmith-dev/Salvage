@@ -13,13 +13,16 @@ actor PreparationFake: RawDeviceOperations {
     let suspendUnmount: Bool
     let blockSize: Int
     let mounts: [String]
+    let ancestry: [String: Set<String>]
     var unmountWaiter: CheckedContinuation<Void, Never>?
     var unmounted = false
     var unmountStarted = false
     var opened = 0
     var closed = 0
-    init(_ failure: Failure = .none, suspendUnmount: Bool = false, blockSize: Int = 512, mounts: [String] = []) {
+    init(_ failure: Failure = .none, suspendUnmount: Bool = false, blockSize: Int = 512, mounts: [String] = [],
+         ancestry: [String: Set<String>] = [:]) {
         self.failure = failure; self.suspendUnmount = suspendUnmount; self.blockSize = blockSize; self.mounts = mounts
+        self.ancestry = ancestry
     }
     func protectedDisks() async throws -> Set<String> {
         if failure == .protection { throw ScanError.unsafeTarget("Unknown startup disk") }
@@ -31,6 +34,8 @@ actor PreparationFake: RawDeviceOperations {
         return RawDeviceIdentity(registryID: changed ? 8 : 7, sizeBytes: 65536, blockSize: blockSize, deviceNumber: 42)
     }
     func mountSources() async throws -> [String] { mounts }
+    /// Unlisted media have no ancestors; listed ones get the injected ancestry.
+    nonisolated func ancestorWholeDisks(ofMediaNamed name: String) -> Set<String>? { ancestry[name] ?? [] }
     func unmount(_ name: String) async throws {
         if failure == .unmount { throw ScanError.io("Busy") }
         if failure == .hangingUnmount { unmountStarted = true; try await Task.sleep(for: .seconds(600)) }
@@ -114,6 +119,24 @@ struct RawBlockReaderTests {
         await reader.close()
         #expect(!(await registry.isReserved("disk42")))
     }
+    /// Finding 2: disk42 is still in use while disk43s1, an APFS volume of a container
+    /// synthesized from disk42s1, is mounted; no mount source names disk42 itself.
+    @Test func apfsVolumeOnASynthesizedContainerRefusesPreparation() async {
+        let fake = PreparationFake(mounts: ["/dev/disk0s1", "/dev/disk43s1"], ancestry: ["disk43s1": ["disk43", "disk42"]])
+        let registry = DeviceReadReservations()
+        await #expect(throws: ScanError.io("The device was mounted again. Close files on it and retry.")) {
+            _ = try await RawBlockReader.prepare(device: scanDevice, operations: fake, reservations: registry)
+        }
+        let (opens, closes) = await fake.counts(); #expect(opens == 0 && closes == 0)
+        #expect(!(await registry.isReserved("disk42")))
+    }
+    @Test func unresolvableMountAncestryRefusesPreparation() async {
+        let fake = PreparationFake(mounts: ["/dev/disk43s1"], ancestry: [:])
+        let failing = FailingAncestry(fake)
+        await #expect(throws: ScanError.io("The device was mounted again. Close files on it and retry.")) {
+            _ = try await RawBlockReader.prepare(device: scanDevice, operations: failing, reservations: DeviceReadReservations())
+        }
+    }
     @Test func staleSelectionIdentityRefusesBeforeUnmount() async {
         let fake = PreparationFake(), registry = DeviceReadReservations()
         let stale = BlockDevice(bsdName: "disk42", displayName: "Stale", sizeBytes: 65536,
@@ -195,6 +218,67 @@ struct RawBlockReaderTests {
     }
 }
 
+/// Wraps PreparationFake with an ancestry lookup that always fails.
+private struct FailingAncestry: RawDeviceOperations {
+    let base: PreparationFake
+    init(_ base: PreparationFake) { self.base = base }
+    func protectedDisks() async throws -> Set<String> { try await base.protectedDisks() }
+    func identity(_ name: String) async throws -> RawDeviceIdentity { try await base.identity(name) }
+    func mountSources() async throws -> [String] { try await base.mountSources() }
+    func ancestorWholeDisks(ofMediaNamed name: String) -> Set<String>? { nil }
+    func unmount(_ name: String) async throws { try await base.unmount(name) }
+    func openReadOnly(_ name: String, expected: RawDeviceIdentity) async throws -> Int32 { try await base.openReadOnly(name, expected: expected) }
+    func closeDescriptor(_ descriptor: Int32) async { await base.closeDescriptor(descriptor) }
+}
+
+@Suite("Raw descriptor validation")
+struct RawDescriptorValidationTests {
+    private static func nullIdentity() -> RawDeviceIdentity {
+        var node = stat()
+        _ = stat("/dev/null", &node)
+        return RawDeviceIdentity(registryID: 77, sizeBytes: 65536, blockSize: 512, deviceNumber: node.st_rdev)
+    }
+    private static let writable = ScanError.unsafeTarget("Salvage only reads drives, and this drive wasn't opened read-only. The scan was refused.")
+
+    @Test func readOnlyCharacterDeviceIsAccepted() throws {
+        let fd = open("/dev/null", O_RDONLY | O_CLOEXEC)
+        defer { close(fd) }
+        try validateRawDescriptor(fd, expected: Self.nullIdentity())
+        #expect(fcntl(fd, F_GETFL) & O_ACCMODE == O_RDONLY)
+    }
+
+    /// Finding 4: a writable descriptor is refused first, before the node checks, even for a
+    /// regular temp file (which would otherwise only fail as "device changed").
+    @Test func writableTempFileIsRefusedAsWritable() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("salvage-rw-\(UUID().uuidString)")
+        try Data([1, 2, 3]).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let fd = open(url.path, O_RDWR | O_CLOEXEC | O_NONBLOCK)
+        try #require(fd >= 0)
+        var ours = stat()
+        try #require(fstat(fd, &ours) == 0)
+        #expect(throws: Self.writable) { try validateRawDescriptor(fd, expected: Self.nullIdentity()) }
+        // Closed: the number is free, or reused by an open that isn't ours (another file, or
+        // without our O_NONBLOCK status flag).
+        var now = stat()
+        let flags = fcntl(fd, F_GETFL)
+        #expect(flags == -1 || flags & O_NONBLOCK == 0 || fstat(fd, &now) != 0
+                || now.st_ino != ours.st_ino || now.st_dev != ours.st_dev)
+    }
+
+    /// Finding 4: a writable handle to the *expected* character device (which passes every node
+    /// check) is refused.
+    @Test(arguments: [O_RDWR, O_WRONLY])
+    func writableHandleToTheExpectedDeviceIsRefused(_ mode: Int32) throws {
+        let fd = open("/dev/null", mode | O_CLOEXEC)
+        try #require(fd >= 0)
+        var closedByValidation = false
+        defer { if !closedByValidation { close(fd) } }
+        #expect(throws: Self.writable) { try validateRawDescriptor(fd, expected: Self.nullIdentity()) }
+        closedByValidation = true
+    }
+}
+
 @Suite("One-shot OS callback bridging")
 struct OneShotCompletionTests {
     @Test func callbackResultIsDelivered() async throws {
@@ -255,6 +339,7 @@ private actor FileDescriptorOperations: RawDeviceOperations {
         RawDeviceIdentity(registryID: 7, sizeBytes: 4096, blockSize: 512, deviceNumber: 42)
     }
     func mountSources() async throws -> [String] { [] }
+    nonisolated func ancestorWholeDisks(ofMediaNamed name: String) -> Set<String>? { [] }
     func unmount(_ name: String) async throws { }
     func openReadOnly(_ name: String, expected: RawDeviceIdentity) async throws -> Int32 {
         let fd = Darwin.open(url.path, O_RDONLY | O_CLOEXEC)
