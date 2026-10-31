@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Salvage — Device Picker</title>
+<style>
+/* Illustrates: DESIGN.md Components (device-row), EXPERIENCE.md Information Architecture (Device Picker),
+   Component Patterns (Device row), State Patterns (Boot volume present, FileVault locked). */
+:root{
+  --surface-base:#F5F5F7; --surface-raised:#FFFFFF; --sidebar:#ECECEF;
+  --ink-primary:#1D1D1F; --ink-secondary:#6E6E73; --ink-tertiary:#A1A1A6;
+  --border:#D8D8DC; --accent:#2E6E6E; --accent-on:#FFFFFF; --radius-sm:6px; --radius-md:10px;
+}
+*{box-sizing:border-box;}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",sans-serif;background:var(--surface-base);color:var(--ink-primary);}
+.window{display:flex;height:100vh;}
+.sidebar{width:220px;background:var(--sidebar);padding:24px 16px;border-right:1px solid var(--border);}
+.sidebar h2{font-size:11px;text-transform:none;letter-spacing:0;color:var(--ink-secondary);font-weight:600;margin:0 0 12px 4px;}
+.sidebar .nav-item{padding:6px 8px;border-radius:var(--radius-sm);font-size:13px;color:var(--ink-primary);margin-bottom:2px;}
+.sidebar .nav-item.active{background:var(--accent);color:var(--accent-on);}
+.content{flex:1;padding:40px 48px;overflow-y:auto;}
+.content h1{font-size:26px;font-weight:600;margin:0 0 4px;}
+.content p.sub{color:var(--ink-secondary);font-size:14px;margin:0 0 28px;}
+.device-list{display:flex;flex-direction:column;gap:8px;max-width:640px;}
+.device-row{display:flex;align-items:center;justify-content:space-between;background:var(--surface-raised);border-radius:var(--radius-sm);padding:12px 16px;border:1px solid var(--border);}
+.device-row .meta{display:flex;flex-direction:column;}
+.device-row .name{font-size:14px;font-weight:600;}
+.device-row .sub{font-size:12px;color:var(--ink-secondary);margin-top:2px;}
+.device-row.unsupported{opacity:0.55;}
+.device-row.unsupported .name{color:var(--ink-tertiary);font-weight:500;}
+.lock{font-size:13px;color:var(--ink-secondary);}
+.reason{font-size:12px;color:var(--ink-tertiary);max-width:220px;text-align:right;}
+</style>
+</head>
+<body>
+<div class="window">
+  <div class="sidebar">
+    <h2>STORAGE DEVICES</h2>
+    <div class="nav-item active">Select a device</div>
+  </div>
+  <div class="content">
+    <h1>Select a device to scan</h1>
+    <p class="sub">Internal and external drives appear together. Click a device to begin.</p>
+    <div class="device-list">
+      <div class="device-row">
+        <div class="meta"><span class="name">Macintosh HD</span><span class="sub">Internal — APFS — 245 GB</span></div>
+        <div class="reason" aria-hidden="true"></div>
+      </div>
+      <div class="device-row unsupported" role="group" aria-label="Macintosh HD — boot volume, unsupported">
+        <div class="meta"><span class="name">Macintosh HD (this boot volume)</span><span class="sub">Internal — APFS — currently running macOS</span></div>
+        <div class="reason">Can't be scanned while your Mac is running from it</div>
+      </div>
+      <div class="device-row">
+        <div class="meta"><span class="name">Kingston DataTraveler 3.0</span><span class="sub">External — exFAT — 31 GB</span></div>
+      </div>
+      <div class="device-row" role="group" aria-label="SanDisk Extreme — locked with FileVault">
+        <div class="meta"><span class="name">SanDisk Extreme SSD</span><span class="sub">External — APFS — 1 TB</span></div>
+        <div class="lock">🔒 Locked</div>
+      </div>
+      <div class="device-row">
+        <div class="meta"><span class="name">NEW VOLUME</span><span class="sub">External — FAT32 — 23.1 GB</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

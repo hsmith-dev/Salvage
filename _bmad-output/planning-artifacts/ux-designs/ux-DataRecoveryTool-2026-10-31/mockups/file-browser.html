@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Salvage — File Browser &amp; Preview</title>
+<style>
+/* Illustrates: DESIGN.md Components (confidence-label, preview-pane, primary-button),
+   EXPERIENCE.md Component Patterns (Confidence label, Preview pane, Multi-select + Recover),
+   State Patterns (Carved/reconstructed results, Partial/corrupted carve). */
+:root{
+  --surface-base:#F5F5F7; --surface-raised:#FFFFFF; --sidebar:#ECECEF;
+  --ink-primary:#1D1D1F; --ink-secondary:#6E6E73; --ink-tertiary:#A1A1A6;
+  --border:#D8D8DC; --accent:#2E6E6E; --accent-on:#FFFFFF; --radius-sm:6px; --radius-lg:12px;
+}
+*{box-sizing:border-box;}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",sans-serif;background:var(--surface-base);color:var(--ink-primary);}
+.window{display:flex;height:100vh;}
+.sidebar{width:200px;background:var(--sidebar);padding:24px 16px;border-right:1px solid var(--border);font-size:13px;}
+.sidebar .crumb{color:var(--ink-secondary);margin-bottom:16px;}
+.sidebar .crumb b{color:var(--ink-primary);display:block;}
+.list{flex:1.3;padding:24px;overflow-y:auto;border-right:1px solid var(--border);}
+.toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;}
+.toolbar h1{font-size:18px;font-weight:600;margin:0;}
+.recover-btn{background:var(--accent);color:var(--accent-on);border:none;border-radius:var(--radius-sm);padding:8px 16px;font-size:13px;font-weight:600;}
+.row{display:flex;align-items:center;gap:12px;padding:10px 8px;border-bottom:1px solid var(--border);}
+.row input{accent-color:var(--accent);}
+.row .name{flex:1;font-size:13px;}
+.row .name .reconstructed-tag{display:block;font-size:11px;color:var(--ink-tertiary);margin-top:2px;}
+.conf-high{font-family:inherit;font-size:14px;font-weight:600;color:var(--ink-primary);}
+.conf-medium{font-family:inherit;font-size:13px;font-weight:400;color:var(--ink-secondary);}
+.conf-low{font-family:inherit;font-size:11px;font-weight:400;color:var(--ink-tertiary);}
+.preview{flex:1;padding:24px;display:flex;flex-direction:column;align-items:center;}
+.preview-box{width:100%;max-width:320px;height:280px;background:var(--surface-raised);border:1px solid var(--border);border-radius:var(--radius-lg);display:flex;align-items:center;justify-content:center;color:var(--ink-tertiary);font-size:13px;margin-bottom:16px;}
+.preview-meta{align-self:flex-start;max-width:320px;width:100%;}
+.preview-meta .fname{font-size:14px;font-weight:600;}
+.preview-meta .sub{font-size:12px;color:var(--ink-secondary);margin-top:4px;line-height:1.5;}
+</style>
+</head>
+<body>
+<div class="window">
+  <div class="sidebar">
+    <div class="crumb">Kingston DataTraveler 3.0 ▸ Reconstructed ▸ <b>Pictures</b></div>
+  </div>
+  <div class="list">
+    <div class="toolbar"><h1>Pictures — 196 files</h1><button class="recover-btn">Recover (3 selected)</button></div>
+    <div class="row"><input type="checkbox"><span class="name">marina in monaco.jpg</span><span class="conf-high">High</span></div>
+    <div class="row"><input type="checkbox" checked><span class="name">cat on the windowsill.jpg</span><span class="conf-high">High</span></div>
+    <div class="row"><input type="checkbox" checked><span class="name">Julian portrait.jpg</span><span class="conf-high">High</span></div>
+    <div class="row"><input type="checkbox" checked><span class="name">file_3268x5810_000027.jpg<span class="reconstructed-tag">Reconstructed — no original name</span></span><span class="conf-medium">Medium</span></div>
+    <div class="row"><input type="checkbox"><span class="name">file_3375x6000_000028.jpg<span class="reconstructed-tag">Reconstructed — partial, may be incomplete</span></span><span class="conf-low">Low</span></div>
+  </div>
+  <div class="preview">
+    <div class="preview-box">[ image preview ]</div>
+    <div class="preview-meta">
+      <div class="fname">file_3375x6000_000028.jpg</div>
+      <div class="sub">JPEG image — 1.3 MB<br>Recovered via signature-based carving — no original filename, path, or timestamp available.<br>Recovery confidence: <strong>Low</strong></div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Salvage — FileVault Unlock Sheet</title>
+<style>
+/* Illustrates: DESIGN.md Components (FileVault unlock sheet), EXPERIENCE.md Component Patterns
+   (FileVault unlock sheet), Voice and Tone (wrong-password vs tool-failure distinction),
+   Accessibility Floor (sheets trap focus). Two states shown side by side: idle entry, wrong-password error. */
+:root{
+  --surface-base:#F5F5F7; --surface-raised:#FFFFFF;
+  --ink-primary:#1D1D1F; --ink-secondary:#6E6E73;
+  --border:#D8D8DC; --accent:#2E6E6E; --accent-on:#FFFFFF; --radius-md:10px; --radius-sm:6px;
+}
+*{box-sizing:border-box;}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",sans-serif;background:#2B2B2D;color:var(--ink-primary);padding:48px;display:flex;gap:48px;justify-content:center;}
+.sheet{width:340px;background:var(--surface-raised);border-radius:var(--radius-md);padding:28px;box-shadow:0 20px 60px rgba(0,0,0,0.4);}
+.sheet h2{font-size:15px;font-weight:600;margin:0 0 6px;}
+.sheet p.sub{font-size:12px;color:var(--ink-secondary);margin:0 0 20px;line-height:1.5;}
+.sheet label{display:block;font-size:12px;color:var(--ink-secondary);margin-bottom:6px;}
+.sheet input{width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;margin-bottom:8px;}
+.sheet input.error{border-color:#D64545;}
+.error-text{font-size:12px;color:#D64545;margin:0 0 16px;}
+.sheet .buttons{display:flex;justify-content:flex-end;gap:8px;margin-top:20px;}
+.btn-plain{background:none;border:1px solid var(--border);border-radius:var(--radius-sm);padding:7px 14px;font-size:13px;}
+.btn-primary{background:var(--accent);color:var(--accent-on);border:none;border-radius:var(--radius-sm);padding:7px 14px;font-size:13px;font-weight:600;}
+.caption{color:#aaa;font-size:11px;text-align:center;margin-top:12px;}
+</style>
+</head>
+<body>
+<div>
+  <div class="sheet">
+    <h2>Unlock "SanDisk Extreme SSD"</h2>
+    <p class="sub">This volume is protected by FileVault. Enter your password or recovery key to continue.</p>
+    <label for="pw1">Password</label>
+    <input id="pw1" type="password" placeholder="">
+    <div class="buttons"><button class="btn-plain">Cancel</button><button class="btn-primary">Unlock</button></div>
+  </div>
+  <div class="caption">State: idle entry</div>
+</div>
+<div>
+  <div class="sheet">
+    <h2>Unlock "SanDisk Extreme SSD"</h2>
+    <p class="sub">This volume is protected by FileVault. Enter your password or recovery key to continue.</p>
+    <label for="pw2">Password</label>
+    <input id="pw2" type="password" class="error" value="••••••••">
+    <p class="error-text">Wrong password.</p>
+    <div class="buttons"><button class="btn-plain">Cancel</button><button class="btn-primary">Unlock</button></div>
+  </div>
+  <div class="caption">State: wrong password (distinct from tool/version failure text)</div>
+</div>
+</body>
+</html>
