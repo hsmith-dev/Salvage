@@ -122,7 +122,27 @@ So that I can recover files from the media I actually lost them on.
 A user can scan and recover from APFS- or HFS+-formatted drives — internal (non-boot) and external — including FileVault-encrypted volumes, unlocked safely via `diskutil apfs unlockVolume -nomount` with credentials held only transiently, and with the same confidence-indicator and recovery flow Epic 1 established. This is where the project's single biggest engineering risk lives: an original, MIT-licensed, from-scratch APFS parser (AD-2, still flagged `[ASSUMPTION]` pending explicit confirmation). A timeboxed technical spike against a read-only, unencrypted APFS volume is recommended before committing to full-epic scope.
 **FRs covered:** FR-5 (APFS/HFS+), FR-6
 
-### Epic 3: Recover from Severely Damaged or Unmountable Media
+#### Story 2.5: Read an Unlocked FileVault Volume
+
+As a user,
+I want Salvage to actually recover files from a FileVault volume after I unlock it,
+So that encryption does not leave me stuck.
+
+**Acceptance Criteria:**
+
+**Given** the Story 2.4 spike finding (user-space raw reads of an unlocked APFS volume node fail with EACCES)
+**When** this story starts
+**Then** it first tests whether the signed root helper (AD-13) can read the unlocked volume node, and records the result
+
+**Given** the helper path is refused too
+**When** the approach is chosen
+**Then** Salvage decrypts the volume in `SalvageCore` from the container's raw bytes using the APFS keybag (PBKDF2 → KEK → VEK, AES-XTS per block, per Apple's APFS Reference), with the credential held only in memory and zeroed after use, and the APFS parser reads the decrypted blocks through the same `BlockReader` port
+
+**Given** either path
+**When** a file is recovered from an encrypted volume
+**Then** it goes through the same browse/preview/recover flow, no mount ever occurs, and the password is never persisted
+
+## Epic 3: Recover from Severely Damaged or Unmountable Media
 A user whose drive won't mount at all, or is too corrupted for normal undelete, can still get files back: signature-based carving reconstructs files from raw bytes when filesystem metadata is gone, and lost-partition detection finds and recovers from a filesystem signature hiding in unallocated space — the "nothing else worked" safety net, using the declarative, community-extensible signature format (AD-6) and graduated confidence evidence (AD-7). This epic reuses Epic 1's results browser, confidence indicator, and recovery flow almost entirely; the work here is concentrated in `SalvageCore`, not new UI surfaces.
 **FRs covered:** FR-7, FR-8, FR-9, FR-10
 

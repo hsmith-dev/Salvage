@@ -51,6 +51,7 @@ graph TD
 - **Binds:** FR-6, FR-15
 - **Prevents:** the FR-6/FR-15 tension the PRD flagged as Open Question 10.
 - **Rule:** FileVault volumes are unlocked via `diskutil apfs unlockVolume <device> -nomount`. Salvage never mounts a source volume through the normal Finder/OS path, encrypted or not. After unlock, the decrypted block device is read through the same raw-read path as any other device (AD-4) — no FileVault-specific exception to the read-only guarantee is needed. The password/recovery key is held only transiently in memory for the duration of the unlock call, never persisted, and zeroized immediately after — standard practice, stated explicitly given how central trust is to this product.
+- **Revision (spike, 2026-10-31, Story 2.4):** the second half of this rule does not hold on current macOS. After `unlockVolume -nomount` succeeds, `read()` on the volume's own raw node (`/dev/rdiskNsM`) fails with EACCES from user space, unlocked or not; only the container (`/dev/rdiskN`), which holds ciphertext, is readable. Unlock, the credential handling and the locked-device state are built; reading the decrypted volume is not. Options, to be decided in Story 2.5: (a) decrypt in `SalvageCore` from the container's raw bytes using the volume's keybag (PBKDF2 → KEK → VEK, AES-XTS per block), which keeps every guarantee of AD-4 and is documented in Apple's APFS Reference; (b) test whether the root helper (AD-13) can read the volume node once unlocked; (c) a read-only mount, which conflicts with this rule and FR-15. Until then the app does not ask for a FileVault password it cannot use.
 
 ### AD-4 — Raw read path, with read-only enforced at the type level
 
@@ -185,6 +186,7 @@ A `ScanSession` targets either a whole `BlockDevice` (normal scan, which discove
 
 ## Deferred
 
+- **FileVault decrypted read path** (AD-3 revision) — Story 2.5 decides between in-Core decryption and a root-helper read; neither is built.
 - **CLI companion** (PRD Open Question 6) — architecture already supports it for free (Core/DiskIO have no SwiftUI dependency), but no CLI target is built in v1.
 - **Linux/Windows DiskIO adapters** — `BlockReader` is designed for this; no second adapter exists yet (v1 is macOS-only per PRD Non-Goals).
 - **Exact FDA/TCC requirement at the raw-device level:** *resolved 2026-10-31 by spike, see AD-13.* POSIX ownership (`root:operator`), not TCC, is the first gate for physical drives. Whether TCC additionally gates a root helper's raw open is to be confirmed when the helper is first built (Story 1.12). FSKit targets implementing filesystems, not raw block reads, and is not used.
