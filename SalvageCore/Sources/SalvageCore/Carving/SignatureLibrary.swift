@@ -17,10 +17,28 @@ import Foundation
 /// 3. `footer` — a byte pattern searched after the header; `footerMode` picks the first or the
 ///    last occurrence, `footerLength` / `footerSizeField` say how many bytes the footer record
 ///    spans (a ZIP end-of-central-directory record carries its own comment length).
-/// 4. Otherwise the carve runs until `maxBytes`, the next header, a claimed run or the end of
+/// 4. `structure` — a format walker built into the engine, for record layouts the declarative
+///    `segments` walk can't express (`"gif"`: logical screen, color tables, extension and image
+///    blocks with their sub-blocks, ended by the trailer at a block boundary).
+/// 5. Otherwise the carve runs until `maxBytes`, the next header, a claimed run or the end of
 ///    the extent, and is reported as partial.
+///
+/// How a header found while another carve is open is treated: `embeds` lists the signature ids
+/// that may legitimately sit inside this format (a JPEG thumbnail inside a JPEG's APP1, cover art
+/// inside an MP4's boxes, MP3 frames inside an ID3-tagged MP3); `cutsOthers: false` marks a weak
+/// header (MP3 frame sync, gzip) that never ends a carve that still has an end rule to find.
+/// `validate` names a structural check run before a header counts as a match (`"mpegFrames"`:
+/// two consecutive valid MPEG audio frame headers). `trustedMaxBytes` is the largest size a size
+/// field or record walk may claim and still count as validated: larger claims usually mean a
+/// fragmented file or a garbage field, so such carves are partial.
 public struct FileSignature: Sendable, Equatable {
     public static let currentSchemaVersion = 1
+    /// Most bytes past a candidate position any rule may read (header, size fields, record
+    /// headers, footer records, validators). Larger values would make every chunk's carry window
+    /// that large, so a signature exceeding it is skipped.
+    public static let maxReach = 64 * 1024
+    /// Largest `maxBytes` / `trustedMaxBytes` a signature may declare (64 GiB).
+    public static let maxBytesCap: Int64 = 64 << 30
 
     public struct Pattern: Sendable, Equatable {
         public let bytes: [UInt8]
@@ -80,13 +98,25 @@ public struct FileSignature: Sendable, Equatable {
         }
         /// Record types that hand over to the footer search (JPEG's start-of-scan).
         public let stopAt: [Pattern]
+        /// A padding byte skipped before a record when the byte after it is the same value
+        /// (JPEG allows any number of `FF` fill bytes before a marker).
+        public let fillByte: UInt8?
+        /// A record whose raw size field is 0 extends to the end of the file (ISO-BMFF). The walk
+        /// then has no validated end: the carve runs to a limit and is partial.
+        public let zeroSizeToEnd: Bool
         var reach: Int {
             var reach = max(size.reach, typeOffset + typeLength)
             if let largeSize { reach = max(reach, largeSize.offset + largeSize.width) }
             for pattern in stopAt { reach = max(reach, typeOffset + pattern.count) }
+            if fillByte != nil { reach = max(reach, 2) }
             return reach
         }
     }
+
+    /// Engine-built walkers for formats the declarative rules can't describe.
+    public enum Structure: String, Sendable { case gif }
+    /// Engine-built header checks.
+    public enum Validation: String, Sendable { case mpegFrames }
 
     public let id: String
     public let `extension`: String
@@ -100,22 +130,42 @@ public struct FileSignature: Sendable, Equatable {
     public let maxBytes: Int64?
     public let sizeFields: [SizeField]
     public let segments: Segments?
+    /// Fields read relative to a footer match whose sum must equal the footer's offset from the
+    /// file start; a footer failing the check belongs to another (nested) file and is skipped.
+    /// ZIP: central directory offset + size == offset of the end-of-central-directory record.
+    public let footerOffsetCheck: [SizeField]
+    public let structure: Structure?
+    public let validation: Validation?
+    /// Signature ids whose headers may legitimately appear inside this format.
+    public let embeds: Set<String>
+    /// False for weak headers that must not end a carve that still has an end rule to find.
+    public let cutsOthers: Bool
+    /// Largest size-field or record-walk size reported as validated; nil uses the engine default.
+    public let trustedMaxBytes: Int64?
 
     /// Bytes from the header start the engine must see before it can evaluate a match.
     var headerReach: Int {
         var reach = headerOffset + (headers.map(\.count).max() ?? 0)
         for field in sizeFields { reach = max(reach, field.reach) }
         if let segments { reach = max(reach, segments.start + segments.reach) }
+        if structure == .gif { reach = max(reach, 13) }
+        if validation == .mpegFrames { reach = max(reach, Self.mpegFramesReach) }
         return reach
     }
 
     /// Bytes from a footer match the engine must see before it can finish the file.
     var footerReach: Int {
         guard let footer else { return 0 }
-        return max(footer.count, footerLength, footerSizeField?.reach ?? 0)
+        var reach = max(footer.count, footerLength, footerSizeField?.reach ?? 0)
+        for field in footerOffsetCheck { reach = max(reach, field.reach) }
+        return reach
     }
 
-    var hasKnownEnd: Bool { !sizeFields.isEmpty || segments != nil || footer != nil }
+    /// Two MPEG audio frame headers: the longest frame (MPEG-2.5 Layer II, 160 kbps at 8 kHz,
+    /// padded) is 2881 bytes, plus the second header.
+    static let mpegFramesReach = 2881 + 4
+
+    var hasKnownEnd: Bool { !sizeFields.isEmpty || segments != nil || footer != nil || structure != nil }
 }
 
 public enum SignatureError: Error, Sendable, Equatable, CustomStringConvertible {
@@ -149,19 +199,52 @@ public struct SignatureLibrary: Sendable {
         self.signatures = signatures; self.skipped = skipped
     }
 
+    static let resourceBundleName = "SalvageCore_SalvageCore.bundle"
+
     /// The signatures shipped in the package's `Carving/Signatures` resources, loaded once. Files
     /// that fail validation are listed in `skipped` and reported through `NSLog` so the reason is
-    /// visible in the console, never silently dropped.
+    /// visible in the console, never silently dropped. A missing resource bundle gives an empty
+    /// library with a skipped reason; it never traps (SwiftPM's generated `Bundle.module` calls
+    /// `fatalError` when the bundle is absent, so it is not used).
     public static let bundled: SignatureLibrary = {
-        guard let directory = Bundle.module.url(forResource: "Signatures", withExtension: nil) else {
-            NSLog("SalvageCore: no bundled carving signatures found")
-            return SignatureLibrary(signatures: [])
-        }
-        let library = load(directory: directory)
+        let library = bundled(searching: resourceBundleCandidates())
         for skipped in library.skipped { NSLog("SalvageCore: skipped carving signature %@: %@", skipped.file, skipped.reason) }
         return library
     }()
 
+    /// Loads the `Signatures` directory of the first `SalvageCore_SalvageCore.bundle` found in one
+    /// of `directories`.
+    static func bundled(searching directories: [URL]) -> SignatureLibrary {
+        for directory in directories {
+            let url = directory.appendingPathComponent(resourceBundleName)
+            guard let bundle = Bundle(url: url) else { continue }
+            if let signatures = bundle.url(forResource: "Signatures", withExtension: nil) { return load(directory: signatures) }
+            let flat = url.appendingPathComponent("Signatures")
+            if FileManager.default.fileExists(atPath: flat.path) { return load(directory: flat) }
+        }
+        return SignatureLibrary(signatures: [], skipped: [Skipped(
+            file: "Signatures", reason: "resource bundle \(resourceBundleName) not found; carving is disabled")])
+    }
+
+    /// Where SwiftPM places a package's resource bundle: beside an app's resources, a framework's
+    /// or test bundle's resources, or a command-line tool.
+    static func resourceBundleCandidates() -> [URL] {
+        var candidates: [URL?] = []
+        #if DEBUG
+        if let path = ProcessInfo.processInfo.environment["PACKAGE_RESOURCE_BUNDLE_PATH"] {
+            candidates.append(URL(fileURLWithPath: path).deletingLastPathComponent())
+        }
+        #endif
+        let own = Bundle(for: BundleToken.self)
+        candidates += [Bundle.main.resourceURL, own.resourceURL, Bundle.main.bundleURL,
+                       own.bundleURL.deletingLastPathComponent()]
+        return candidates.compactMap { $0 }
+    }
+}
+
+private final class BundleToken {}
+
+extension SignatureLibrary {
     /// Loads every `*.json` file in `directory`, in name order.
     public static func load(directory: URL) -> SignatureLibrary {
         let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
@@ -229,9 +312,39 @@ extension FileSignature {
 
         if let maxBytes = try decoder.optionalInt64("maxBytes") {
             guard maxBytes > 0 else { throw SignatureError.invalidField("maxBytes", "must be positive") }
+            guard maxBytes <= Self.maxBytesCap else { throw SignatureError.invalidField("maxBytes", "must be at most \(Self.maxBytesCap)") }
             self.maxBytes = maxBytes
         } else {
             maxBytes = nil
+        }
+        if let trusted = try decoder.optionalInt64("trustedMaxBytes") {
+            guard trusted > 0, trusted <= Self.maxBytesCap else {
+                throw SignatureError.invalidField("trustedMaxBytes", "must be 1...\(Self.maxBytesCap)")
+            }
+            trustedMaxBytes = trusted
+        } else {
+            trustedMaxBytes = nil
+        }
+        embeds = Set(try decoder.optionalStringArray("embeds"))
+        cutsOthers = try decoder.optionalBool("cutsOthers") ?? true
+        if let name = try decoder.optionalString("structure") {
+            guard let structure = Structure(rawValue: name) else { throw SignatureError.invalidField("structure", "must be 'gif'") }
+            self.structure = structure
+        } else {
+            structure = nil
+        }
+        if let name = try decoder.optionalString("validate") {
+            guard let validation = Validation(rawValue: name) else { throw SignatureError.invalidField("validate", "must be 'mpegFrames'") }
+            self.validation = validation
+        } else {
+            validation = nil
+        }
+        if let raw = decoder.fields["footerOffsetCheck"] {
+            guard let list = raw as? [Any], !list.isEmpty else { throw SignatureError.invalidField("footerOffsetCheck", "must be a non-empty array") }
+            footerOffsetCheck = try list.enumerated().map { try SizeField(any: $1, field: "footerOffsetCheck[\($0)]") }
+            guard footer != nil else { throw SignatureError.invalidField("footer", "footerOffsetCheck needs a footer") }
+        } else {
+            footerOffsetCheck = []
         }
 
         if let raw = decoder.fields["sizeField"] {
@@ -253,6 +366,13 @@ extension FileSignature {
         }
         if !sizeFields.isEmpty, segments != nil {
             throw SignatureError.invalidField("segments", "cannot be combined with sizeField")
+        }
+        if structure != nil, !sizeFields.isEmpty || segments != nil || footer != nil {
+            throw SignatureError.invalidField("structure", "cannot be combined with sizeField, segments or footer")
+        }
+        let reach = max(headerReach, footerReach)
+        guard reach <= Self.maxReach else {
+            throw SignatureError.invalidField("reach", "rules read \(reach) bytes past a match; the cap is \(Self.maxReach)")
         }
     }
 }
@@ -327,6 +447,13 @@ extension FileSignature.Segments {
             try FileSignature.Pattern(hex: $1, field: decoder.path + "stopAt[\($0)]")
         }
         guard stopAt.allSatisfy({ $0.count > 0 }) else { throw SignatureError.invalidField(decoder.path + "stopAt", "patterns must not be empty") }
+        if let fill = try decoder.optionalPattern("fillByte") {
+            guard fill.count == 1, fill.mask == [0xFF] else { throw SignatureError.invalidField(decoder.path + "fillByte", "must be one hex byte") }
+            fillByte = fill.bytes[0]
+        } else {
+            fillByte = nil
+        }
+        zeroSizeToEnd = try decoder.optionalBool("zeroSizeToEnd") ?? false
     }
 }
 

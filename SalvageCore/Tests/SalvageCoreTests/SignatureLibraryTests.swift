@@ -20,10 +20,56 @@ struct SignatureLibraryTests {
         for signature in library.signatures {
             // The folder a carved file lands in must agree with the bucket its extension gives it.
             #expect(FileCategory.classify(fileName: "x.\(signature.extension)") == signature.category, Comment(rawValue: signature.id))
-            #expect(signature.headerReach <= 64 && signature.footerReach <= 64, Comment(rawValue: signature.id))
+            #expect(signature.headerReach <= FileSignature.maxReach && signature.footerReach <= FileSignature.maxReach, Comment(rawValue: signature.id))
             #expect(signature.maxBytes ?? 1 > 0, Comment(rawValue: signature.id))
         }
         #expect(library.signatures.filter { !$0.hasKnownEnd }.map(\.id).sorted() == ["gzip", "mp3", "mp3", "ole", "rar5"])
+        // Review fixes: weak headers, embedding, structural checks and trusted sizes.
+        #expect(library.signatures.filter { !$0.cutsOthers }.map(\.id).sorted() == ["gzip", "mp3"])
+        #expect(library.signatures.first { $0.id == "jpeg" }?.embeds == ["jpeg"])
+        #expect(library.signatures.first { $0.id == "gif" }?.structure == .gif)
+        #expect(library.signatures.first { $0.id == "gif" }?.footer == nil)
+        #expect(library.signatures.filter { $0.validation == .mpegFrames }.count == 1)
+        for id in ["mp4", "mov", "m4a", "heic", "wav", "avi"] {
+            #expect(library.signatures.first { $0.id == id }?.trustedMaxBytes == 64 << 20, Comment(rawValue: id))
+        }
+    }
+
+    @Test func reachAndSizeBoundsAreCappedWithAReason() throws {
+        let base = """
+        {"schemaVersion": 1, "id": "x", "extension": "x", "category": "other", "header": "AABB"}
+        """
+        func with(_ field: String) -> String { base.replacingOccurrences(of: "\"header\"", with: field + ", \"header\"") }
+        #expect(error(with("\"headerOffset\": 2000000"))?.description.contains("cap is 65536") == true)
+        #expect(error(with("\"sizeField\": {\"offset\": 2000000, \"width\": 4}")) != nil)
+        #expect(error(with("\"footer\": \"CC\", \"footerSizeField\": {\"offset\": 70000, \"width\": 2}")) != nil)
+        #expect(error(with("\"headerOffset\": 60000")) == nil)
+        #expect(error(with("\"maxBytes\": 68719476737")) == .invalidField("maxBytes", "must be at most 68719476736"))
+        #expect(error(with("\"maxBytes\": 68719476736")) == nil)
+        #expect(error(with("\"trustedMaxBytes\": 0")) != nil)
+        #expect(error(with("\"structure\": \"png\"")) == .invalidField("structure", "must be 'gif'"))
+        #expect(error(with("\"validate\": \"crc\"")) == .invalidField("validate", "must be 'mpegFrames'"))
+        #expect(error(with("\"cutsOthers\": \"no\"")) == .invalidField("cutsOthers", "must be true or false"))
+        #expect(error(with("\"structure\": \"gif\", \"footer\": \"3B\"")) != nil)
+
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("salvage-signatures-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data(with("\"headerOffset\": 2000000").utf8).write(to: directory.appendingPathComponent("far.json"))
+        try Data(base.utf8).write(to: directory.appendingPathComponent("ok.json"))
+        let library = SignatureLibrary.load(directory: directory)
+        #expect(library.signatures.map(\.id) == ["x"])
+        #expect(library.skipped.map(\.file) == ["far.json"])
+        #expect(library.skipped.first?.reason.contains("2000002 bytes") == true)
+    }
+
+    @Test func missingResourceBundleGivesAnEmptyLibraryWithAReason() {
+        let nowhere = FileManager.default.temporaryDirectory.appendingPathComponent("salvage-no-bundle-\(UUID().uuidString)")
+        let library = SignatureLibrary.bundled(searching: [nowhere])
+        #expect(library.signatures.isEmpty)
+        #expect(library.skipped.count == 1 && library.skipped.first?.reason.contains("not found") == true)
+        // The real lookup finds the package's bundle.
+        #expect(SignatureLibrary.bundled(searching: SignatureLibrary.resourceBundleCandidates()).signatures.count == 19)
     }
 
     @Test func wrongSchemaVersionIsSkippedWithAReason() throws {

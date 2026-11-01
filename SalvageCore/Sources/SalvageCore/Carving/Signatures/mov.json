@@ -7,12 +7,26 @@
   "header": "6674797071742020",
   "segments": {
     "start": 0,
-    "size": { "offset": 0, "width": 4, "endian": "big" },
+    "size": {
+      "offset": 0,
+      "width": 4,
+      "endian": "big"
+    },
     "minimum": 8,
     "typeOffset": 4,
     "typeLength": 4,
     "typePrintable": true,
-    "largeSize": { "ifValue": 1, "offset": 8, "width": 8 }
+    "largeSize": {
+      "ifValue": 1,
+      "offset": 8,
+      "width": 8
+    },
+    "zeroSizeToEnd": true
   },
-  "maxBytes": 17179869184
+  "maxBytes": 17179869184,
+  "embeds": [
+    "jpeg",
+    "png"
+  ],
+  "trustedMaxBytes": 67108864
 }

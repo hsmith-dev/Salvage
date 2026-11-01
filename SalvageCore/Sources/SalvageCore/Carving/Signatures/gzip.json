@@ -4,5 +4,7 @@
   "extension": "gz",
   "category": "archives",
   "header": "1F8B08",
-  "maxBytes": 1073741824
+  "cutsOthers": false,
+  "maxBytes": 1073741824,
+  "notes": "Three header bytes are a weak signal (gzip streams are often stored inside other archives), so a gzip header never ends a carve that still has an end rule to find."
 }
