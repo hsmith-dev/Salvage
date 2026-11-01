@@ -110,6 +110,7 @@ with a SHA-256 checksum. If no release is listed there yet, build from source.
   and how to test a new one.
 - [Architecture overview](docs/ARCHITECTURE.md): the modules and their rules, with links to the
   planning documents.
+- [Releasing](docs/RELEASING.md): the signing secrets, tagging a release, and verifying a download.
 
 ## Not yet verified
 

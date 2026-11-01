@@ -127,3 +127,44 @@ The self-test packages an unsigned Debug build in dry-run mode. It then mounts t
 - `xcodebuild -project Salvage.xcodeproj -scheme Salvage -configuration Debug -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO -only-testing:SalvageTests test`
 - `xcodebuild -project Salvage.xcodeproj -scheme Salvage -configuration Release -destination 'platform=macOS' CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO build`
 - Workflow YAML must parse (`python3 -c "import yaml; yaml.safe_load(open(f))"`).
+
+## Implementation Notes — E
+
+**Built.**
+- `scripts/package-release.sh (--dry-run | --release) [--identity NAME] [--keychain PATH] <Salvage.app> <version> <outdir>`. Exactly one mode is required, so a release can't happen by accident. It:
+  - checks the layout as ci.yml does: `Contents/MacOS/SalvageHelper` is executable, the launchd plist lints, and `BundleProgram` = `Contents/MacOS/SalvageHelper`. It also checks `Info.plist` and the main executable;
+  - checks the version is `X.Y.Z[-suffix]`, without a leading `v`;
+  - builds the image in a temp work dir: `ditto` the app into staging, add an `Applications -> /Applications` symlink, then `hdiutil create -format UDZO -fs HFS+ -volname "Salvage <version>"` and `hdiutil verify`;
+  - writes `Salvage-<version>.dmg` and `SHA256SUMS` (`shasum -a 256` format) only at the end. It refuses to overwrite either file.
+- `--release` only:
+  - it first checks `DEVELOPMENT_TEAM` and `NOTARIZATION_API_KEY` (the existing secret names) and names every one that's missing;
+  - it requires the app to pass `codesign --verify --deep --strict`, to be signed by `DEVELOPMENT_TEAM`, to be stapled, and to have `CFBundleShortVersionString` equal to `<version>`;
+  - it then signs the DMG with Developer ID (`--timestamp`, optional `--keychain`), checks the DMG's Team ID, runs `notarytool submit --wait` (the API key is parsed exactly like release.yml does, and the `.p8` is decoded into the temp dir, which is always deleted), then `stapler staple` and `stapler validate`. The checksum is computed after stapling.
+- `--dry-run` skips signing and notarization and prints the commands instead. A version mismatch is only a warning in this mode.
+- Exit codes: 0 OK, 1 a check failed, 2 usage.
+- `release.yml`:
+  - The old "Package release artifact (zip)" step is replaced by "Package, sign, and notarize the release disk image" (the script with `--release --keychain "$KEYCHAIN_PATH"`).
+  - A new step, "Verify the release disk image", runs the checksum check, `codesign --verify --strict`, `stapler validate` and `spctl --assess --type open --context context:primary-signature`.
+  - Publish now uploads the DMG and `SHA256SUMS`.
+  - Every earlier step is unchanged: secrets check, keychain, signed build, signature and helper checks, the helper-team check, app notarization and staple, and keychain cleanup.
+- `scripts/test-package-release.sh [app]` (25 scenarios):
+  - fail-closed cases on stand-in bundles: no mode or both modes, `v`-prefixed or slash version, missing app, helper, plist, wrong BundleProgram, `--release` with no or malformed credentials. None of these creates an output folder;
+  - a `--dry-run` package of a real unsigned Debug build. The outdir must hold exactly the DMG and `SHA256SUMS`, the checksum must verify, the format must be UDZO, and an existing DMG must be refused;
+  - a read-only `-nobrowse` mount at a temp mount point. It checks the volume name, that the top level is exactly `Applications` and `Salvage.app`, that the symlink target is `/Applications`, that the helper and plist are present, and that `diff -r` against the source app is empty. Then it detaches;
+  - a modified copy must fail the checksum.
+  - The mount is also detached in the EXIT trap. Without an app argument (or `SALVAGE_APP`), it builds one into its temp dir.
+- `docs/RELEASING.md` covers the secrets and how to make each value, tagging, each workflow step, how to try it locally, how to verify a download (shasum, `spctl` on the DMG and the app, `codesign --verify --deep --strict`, the helper identifier and team), and the 1.12 manual signed-helper end-to-end check (with the SpawnConstraint, `launchctl print` and idle-exit steps). In `docs/ARCHITECTURE.md`, the one-paragraph release.yml description now mentions the DMG and links RELEASING.md.
+
+**Verified locally (dry-run only, nothing signed, notarized or sent).**
+- The self-test passed all 25 scenarios against an unsigned Debug build (`CODE_SIGNING_ALLOWED=NO`).
+- A sample `--dry-run ... 1.0.0` gave `Salvage-1.0.0.dmg` (3,096,653 bytes; volume "Salvage 1.0.0"; HFS+).
+  - Top level: `Applications -> /Applications` and `Salvage.app`.
+  - Inside the app: `Contents/MacOS/{Salvage, SalvageHelper, Salvage.debug.dylib, __preview.dylib}`, `Contents/Library/LaunchDaemons/dev.hsmith.Salvage.Helper.plist`, and `Resources/SalvageCore_SalvageCore.bundle`.
+  - It was detached and deleted afterwards, and `hdiutil info` shows no image left.
+- Both workflow YAML files parse with `yaml.safe_load`. `check-no-network.sh` passes. shellcheck is clean on `package-release.sh`. On the test script it reports only info/style notes (`A && B || C` reporting, `ls`), the same style as the other `test-check-*` scripts.
+
+**Not done / follow-ups.**
+- The `--release` path (signing, `notarytool`, `stapler`, the new release.yml steps) has never run. It needs the real secrets on the release runner, and the first tagged release is its test. The same goes for the 1.12 manual check in RELEASING.md §5.
+- The DMG bytes are not reproducible: `hdiutil` embeds timestamps, so the checksum changes from build to build (two runs gave different sums). Only the volume name and contents are deterministic, which is what the spec asks for.
+- The release no longer publishes the `.zip` and `.sha256`. It publishes the DMG and `SHA256SUMS` instead.
+- `test-package-release.sh` is not in ci.yml: §E doesn't own ci.yml, and A and C each own one step there. Suggested step: `./scripts/test-package-release.sh "$RUNNER_TEMP/DerivedData/Build/Products/Debug/Salvage.app"`, after the "Verify the helper is embedded" step. README doesn't link RELEASING.md (README isn't §E's).

@@ -134,6 +134,11 @@ jobs:
           plutil -lint "$plist"
           test "$(plutil -extract BundleProgram raw "$plist")" = "Contents/MacOS/SalvageHelper"
 
+      # Release packaging self-test: builds the distributable DMG from this unsigned Debug app in
+      # dry-run mode, mounts it read-only, and checks its contents and SHA256SUMS.
+      - name: Test release packaging (dry run)
+        run: ./scripts/test-package-release.sh "$RUNNER_TEMP/DerivedData/Build/Products/Debug/Salvage.app"
+
       - name: Run app view-model tests
         run: |
           xcodebuild \
