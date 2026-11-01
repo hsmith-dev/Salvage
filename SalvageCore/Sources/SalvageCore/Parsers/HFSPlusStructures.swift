@@ -32,12 +32,16 @@ enum HFSPlus {
         seconds == 0 ? nil : Date(timeIntervalSince1970: Double(seconds) - epochOffset)
     }
 
-    /// Decodes an HFS Unicode name (UTF-16BE, decomposed) as precomposed text. Nil when the units
-    /// are not valid UTF-16 or contain "/", which the catalog never stores (it keeps ":" instead).
+    /// Decodes an HFS Unicode name (UTF-16BE, decomposed) as precomposed POSIX text. The catalog
+    /// stores a POSIX ":" as "/" (Carbon's separator is ":"), so "/" is shown as ":" before any
+    /// path is joined. A ":" in the catalog can't be produced through POSIX and is kept as is. Nil
+    /// when the units are not valid UTF-16 or contain NUL; the only name allowed NULs is the
+    /// private-data folder's.
     static func name(_ units: [UInt16]) -> String? {
+        guard units == privateDataFolderName || !units.contains(0) else { return nil }
         let decoded = String(decoding: units, as: UTF16.self)
-        guard Array(decoded.utf16) == units, !decoded.contains("/") else { return nil }
-        return decoded.precomposedStringWithCanonicalMapping
+        guard Array(decoded.utf16) == units else { return nil }
+        return decoded.replacingOccurrences(of: "/", with: ":").precomposedStringWithCanonicalMapping
     }
 
     /// The number in an indirect-node file name ("iNode123"), or nil for any other name.
@@ -104,10 +108,16 @@ struct HFSPlusVolumeHeader: Sendable {
     var catalogFile = HFSPlusForkData()
     var attributesFile = HFSPlusForkData()
 
-    static let journaledBit: UInt32 = 1 << 13
+    static let unmountedBit: UInt32 = 1 << 8
+    static let inconsistentBit: UInt32 = 1 << 11
     static let catalogNodeIDsReusedBit: UInt32 = 1 << 12
+    static let journaledBit: UInt32 = 1 << 13
     var isJournaled: Bool { attributes & Self.journaledBit != 0 }
     var catalogNodeIDsReused: Bool { attributes & Self.catalogNodeIDsReusedBit != 0 }
+    /// kHFSVolumeUnmountedBit: set when the volume was last unmounted cleanly.
+    var wasCleanlyUnmounted: Bool { attributes & Self.unmountedBit != 0 }
+    /// kHFSVolumeInconsistentBit: set when the volume needs repair.
+    var isMarkedInconsistent: Bool { attributes & Self.inconsistentBit != 0 }
     var volumeBytes: Int64 { Int64(totalBlocks) * blockSize }
 
     static func parse(_ data: Data, volumeLength: Int64) throws -> HFSPlusVolumeHeader {
@@ -227,6 +237,14 @@ struct HFSPlusForkMap: Sendable {
         }
         return nil
     }
+
+    /// The logical offset of `count` volume-contiguous bytes at `volume` when all of them lie
+    /// inside this fork, in one logical run; else nil.
+    func logicalRange(ofVolumeOffset volume: Int64, count: Int64) -> Int64? {
+        guard count > 0, let first = logicalOffset(ofVolumeOffset: volume),
+              let last = logicalOffset(ofVolumeOffset: volume + count - 1), last - first == count - 1 else { return nil }
+        return first
+    }
 }
 
 /// B-tree header record (node 0, offset 14).
@@ -319,22 +337,34 @@ struct HFSPlusNode: Sendable {
     var slack: Range<Int> { offsets[numRecords]..<(data.count - 2 * (numRecords + 1)) }
 }
 
-/// Fixed-size bitmap of visited node numbers.
+/// Sparse set of visited node numbers: its memory grows with the nodes actually read, never
+/// with a header's (possibly crafted) `totalNodes`.
 struct HFSPlusNodeSet: Sendable {
-    private var words: [UInt64]
-    init(count: UInt32) { words = [UInt64](repeating: 0, count: (Int(count) + 63) / 64) }
-    func contains(_ node: UInt32) -> Bool {
-        let index = Int(node / 64)
-        return index < words.count && words[index] & (1 << UInt64(node % 64)) != 0
+    private var nodes: Set<UInt32> = []
+    var count: Int { nodes.count }
+    func contains(_ node: UInt32) -> Bool { nodes.contains(node) }
+    /// Returns false when the node was already present.
+    mutating func insert(_ node: UInt32) -> Bool { nodes.insert(node).inserted }
+}
+
+/// HFSPlusExtentKey ordering: file ID, then fork type, then first logical block.
+struct HFSPlusExtentKey: Sendable, Comparable {
+    let fileID: UInt32
+    let forkType: UInt8
+    let startBlock: UInt32
+
+    /// Parses the 12-byte key (keyLength 10, forkType, pad, fileID, startBlock) at a record start.
+    init(_ record: Data) throws {
+        guard try record.hfsNumber(0, 2) == 10 else { throw ScanError.malformed("Invalid extents overflow key.") }
+        forkType = UInt8(try record.hfsNumber(2, 1))
+        fileID = UInt32(try record.hfsNumber(4, 4))
+        startBlock = UInt32(try record.hfsNumber(8, 4))
     }
-    /// Returns false when the node was already present (or out of range).
-    mutating func insert(_ node: UInt32) -> Bool {
-        let index = Int(node / 64)
-        guard index < words.count else { return false }
-        let bit: UInt64 = 1 << UInt64(node % 64)
-        guard words[index] & bit == 0 else { return false }
-        words[index] |= bit
-        return true
+    init(fileID: UInt32, forkType: UInt8, startBlock: UInt32) {
+        self.fileID = fileID; self.forkType = forkType; self.startBlock = startBlock
+    }
+    static func < (a: Self, b: Self) -> Bool {
+        (a.fileID, a.forkType, a.startBlock) < (b.fileID, b.forkType, b.startBlock)
     }
 }
 
@@ -370,12 +400,18 @@ enum HFSPlusCatalogRecordType {
 struct HFSPlusCatalogFolder: Sendable {
     static let size = 88
     let folderID: UInt32
+    let contentModDate: UInt32
+    let attributeModDate: UInt32
     init(_ record: Data, at offset: Int) throws {
         guard try record.hfsNumber(offset, 2) == HFSPlusCatalogRecordType.folder, offset + Self.size <= record.count else {
             throw ScanError.malformed("Truncated catalog folder record.")
         }
         folderID = UInt32(try record.hfsNumber(offset + 8, 4))
+        contentModDate = UInt32(try record.hfsNumber(offset + 16, 4))
+        attributeModDate = UInt32(try record.hfsNumber(offset + 20, 4))
     }
+    /// The folder's latest modification: a rename touches only `attributeModDate`.
+    var modified: UInt32 { max(contentModDate, attributeModDate) }
 }
 
 /// HFSPlusCatalogFile (248 bytes); only the fields the scan needs.
@@ -423,6 +459,14 @@ struct HFSPlusCatalogFile: Sendable, Equatable {
 /// A folder known to the scan: its parent and precomposed name.
 struct HFSPlusFolderEntry: Sendable { let parent: UInt32; let name: String }
 
+/// A folder seen only in stale copies: the latest copy by modification date. Copies with the same
+/// date that disagree on name or parent make the folder unresolvable.
+struct HFSPlusStaleFolder: Sendable {
+    var entry: HFSPlusFolderEntry
+    var modified: UInt32
+    var ambiguous = false
+}
+
 enum HFSPlusCandidateSource: Sendable { case journal, staleNode, slack }
 
 /// A catalog file record found outside the live tree (journal, unlinked node, node slack).
@@ -434,7 +478,19 @@ struct HFSPlusCandidate: Sendable {
     let recordOffset: Int64
     let raw: Data
     let source: HFSPlusCandidateSource
+    /// Sequence number of the journal transaction the record came from (journal only).
+    var sequence: UInt32? = nil
     var conflicted = false
+
+    /// Whether this copy is newer than `other`: by transaction sequence when both come from
+    /// different journal transactions, else by content modification time. Nil when undecidable.
+    func isNewer(than other: HFSPlusCandidate) -> Bool? {
+        if let mine = sequence, let theirs = other.sequence, mine != theirs {
+            return Int32(bitPattern: mine &- theirs) > 0
+        }
+        if file.contentModDate != other.file.contentModDate { return file.contentModDate > other.file.contentModDate }
+        return nil
+    }
 
     /// Two copies describe the same final state of the file.
     func agrees(with other: HFSPlusCandidate) -> Bool {
@@ -443,8 +499,9 @@ struct HFSPlusCandidate: Sendable {
     }
 }
 
-/// A physical block range [start, end) claimed by an accepted deleted candidate.
-struct HFSPlusClaim: Sendable { let start: UInt64; let end: UInt64; let owner: Int }
+/// A physical block range [start, end) named by a deleted-file record (any plausible version),
+/// owned by its file ID.
+struct HFSPlusClaim: Sendable { let start: UInt64; let end: UInt64; let owner: UInt32 }
 
 struct HFSPlusWorkBudgetExhausted: Error {}
 
@@ -455,7 +512,8 @@ struct HFSPlusLimits: Sendable {
     /// Total raw record bytes kept across deleted candidates.
     var maxCandidateBytes = 64 << 20
     var maxStaleFolders = 200_000
-    var maxOverflowRecords = 2_000_000
+    /// Extents overflow nodes kept in the lookup cache.
+    var maxOverflowCachedNodes = 32
     var maxExtentsPerFile = 1 << 20
     var maxCompressedEntries = 2_000_000
     /// Physical ranges kept for the deleted-candidate overlap check.
@@ -469,11 +527,17 @@ struct HFSPlusLimits: Sendable {
 struct HFSPlusScanStats: Sendable {
     var journal = "not scanned"
     var journalTransactions = 0
+    /// Stale transactions whose span contains the journal's `end` (possibly half overwritten).
+    var journalTornTransactions = 0
+    /// Transactions with a block whose per-block checksum does not match.
+    var journalChecksumFailures = 0
     var candidatesFound = 0
     var candidatesDropped = 0
     var staleNodesExamined = 0
     var compressedFiles = 0
     var unresolvedHardLinks = 0
+    /// Largest visited-node set built by a leaf walk.
+    var largestNodeSet = 0
     var deletedWorkSpent: UInt64 = 0
     var deletedBudgetExhausted = false
     var deletedRecoveryDisabled: String? = nil

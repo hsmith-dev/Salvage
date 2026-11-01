@@ -25,6 +25,8 @@ struct HFSImage {
     var nextCatalogID: UInt64 = 100
     var hasJournal = false
     var hasAttributes = false
+    /// Where the extents overflow tree lives (first block, block count).
+    var extentsTree = (block: HFSImage.extentsBlock, blocks: 2)
 
     init(blocks: Int = 256) {
         self.blocks = blocks
@@ -43,7 +45,7 @@ struct HFSImage {
         result.putBigEndian(h + 40, UInt64(Self.blockSize), 4); result.putBigEndian(h + 44, UInt64(blocks), 4)
         result.putBigEndian(h + 64, nextCatalogID, 4)
         Self.fork(&result, at: h + 112, size: UInt64(Self.blockSize), extents: [(1, 1)])
-        Self.fork(&result, at: h + 192, size: 2 * UInt64(Self.blockSize), extents: [(Self.extentsBlock, 2)])
+        Self.fork(&result, at: h + 192, size: UInt64(extentsTree.blocks * Self.blockSize), extents: [(extentsTree.block, extentsTree.blocks)])
         Self.fork(&result, at: h + 272, size: UInt64(Self.catalogNodes * Self.blockSize), extents: [(Self.catalogBlock, Self.catalogNodes)])
         if hasAttributes { Self.fork(&result, at: h + 352, size: 4 * UInt64(Self.blockSize), extents: [(Self.attributesBlock, 4)]) }
         return result
@@ -95,6 +97,28 @@ struct HFSImage {
         return node
     }
 
+    /// An index node (height `height`) whose records are (12-byte extents key, child node).
+    static func extentsIndexNode(_ records: [(UInt32, UInt32, UInt32)], height: UInt8 = 2) -> Data {
+        var node = leafNode(records.map { fileID, startBlock, child -> Data in
+            var record = Data(repeating: 0, count: 16)
+            record.putBigEndian(0, 10, 2); record.putBigEndian(4, UInt64(fileID), 4); record.putBigEndian(8, UInt64(startBlock), 4)
+            record.putBigEndian(12, UInt64(child), 4)
+            return record
+        })
+        node[8] = 0; node[9] = height
+        return node
+    }
+
+    /// One extents overflow leaf record: (fileID, startBlock, extents).
+    static func overflowRecord(_ fileID: UInt32, _ startBlock: UInt32, _ extents: [(Int, Int)]) -> Data {
+        var record = Data(repeating: 0, count: 12 + 64)
+        record.putBigEndian(0, 10, 2); record.putBigEndian(4, UInt64(fileID), 4); record.putBigEndian(8, UInt64(startBlock), 4)
+        for (index, extent) in extents.enumerated() {
+            record.putBigEndian(12 + index * 8, UInt64(extent.0), 4); record.putBigEndian(16 + index * 8, UInt64(extent.1), 4)
+        }
+        return record
+    }
+
     mutating func writeNode(tree block: Int, _ node: Int, _ bytes: Data) {
         let offset = (block + node) * Self.blockSize
         data.replaceSubrange(offset..<offset + Self.nodeSize, with: bytes)
@@ -120,15 +144,7 @@ struct HFSImage {
     /// Writes an extents overflow tree with one leaf of (fileID, startBlock, extents) records.
     mutating func overflow(_ records: [(UInt32, UInt32, [(Int, Int)])]) {
         writeNode(tree: Self.extentsBlock, 0, Self.headerNode(totalNodes: 2, root: 1, firstLeaf: 1, lastLeaf: 1, depth: 1))
-        let leaf = records.map { fileID, startBlock, extents -> Data in
-            var record = Data(repeating: 0, count: 12 + 64)
-            record.putBigEndian(0, 10, 2); record.putBigEndian(4, UInt64(fileID), 4); record.putBigEndian(8, UInt64(startBlock), 4)
-            for (index, extent) in extents.enumerated() {
-                record.putBigEndian(12 + index * 8, UInt64(extent.0), 4); record.putBigEndian(16 + index * 8, UInt64(extent.1), 4)
-            }
-            return record
-        }
-        writeNode(tree: Self.extentsBlock, 1, Self.leafNode(leaf))
+        writeNode(tree: Self.extentsBlock, 1, Self.leafNode(records.map { Self.overflowRecord($0.0, $0.1, $0.2) }))
     }
 
     /// Writes an attributes tree holding inline decmpfs headers (file ID → uncompressed size).
@@ -159,9 +175,10 @@ struct HFSImage {
         for (index, unit) in units.enumerated() { key.putBigEndian(8 + index * 2, UInt64(unit), 2) }
         return key
     }
-    static func folder(_ id: UInt32) -> Data {
+    static func folder(_ id: UInt32, contentModDate: UInt64 = 0, attributeModDate: UInt64 = 0) -> Data {
         var record = Data(repeating: 0, count: 88)
         record.putBigEndian(0, 1, 2); record.putBigEndian(8, UInt64(id), 4); record.putBigEndian(42, 0o40755, 2)
+        record.putBigEndian(16, contentModDate, 4); record.putBigEndian(20, attributeModDate, 4)
         return record
     }
     static func thread(file: Bool, parent: UInt32, name: String) -> Data {
@@ -216,9 +233,28 @@ struct HFSImage {
         return ~sum
     }
 
+    /// One journal transaction for `journalTransactions`.
+    struct JournalTransaction {
+        var blocks: [(Int64, Data)]
+        /// Buffer offset of the block list header; nil places it right after the previous one.
+        var position: Int? = nil
+        /// Sequence number in `binfo[0]`; nil numbers transactions 1, 2, 3...
+        var sequence: UInt32? = nil
+        /// Sets BLHDR_CHECK_CHECKSUMS and fills per-block checksums, as macOS does.
+        var checksums = true
+        /// Index of a block whose checksum is written wrong.
+        var corruptBlock: Int? = nil
+    }
+
     /// Writes a journal whose buffer holds `transactions`, each a list of (sector number, bytes).
     /// `dirty` leaves `start != end` as an unreplayed journal would.
     mutating func journal(_ transactions: [[(Int64, Data)]], bigEndian: Bool = false, dirty: Bool = false) {
+        journalTransactions(transactions.map { JournalTransaction(blocks: $0) }, bigEndian: bigEndian, dirty: dirty)
+    }
+
+    /// Writes transactions at chosen buffer positions (data wraps past the buffer's end to just
+    /// after the journal header) and sets `end` (default: where the last transaction ends).
+    mutating func journalTransactions(_ transactions: [JournalTransaction], end: Int? = nil, bigEndian: Bool = false, dirty: Bool = false) {
         hasJournal = true
         let info = Self.journalInfoBlock * Self.blockSize
         let base = Self.journalBlock * Self.blockSize, size = Self.journalBlocks * Self.blockSize
@@ -227,26 +263,38 @@ struct HFSImage {
             if bigEndian { data.putBigEndian(offset, value, width) } else { data.put(offset, value, width) }
         }
         let blhdrSize = 4096, sectorSize = 512
+        func ring(_ position: Int) -> Int { position >= size ? sectorSize + (position - size) : position }
         var position = sectorSize
-        for (sequence, blocks) in transactions.enumerated() {
+        for (index, transaction) in transactions.enumerated() {
+            position = transaction.position ?? position
+            let blocks = transaction.blocks
             let header = base + position
+            data.replaceSubrange(header..<header + blhdrSize, with: Data(repeating: 0, count: blhdrSize))
             put(header, UInt64(blhdrSize / 16 - 1), 2); put(header + 2, UInt64(blocks.count + 1), 2)
             put(header + 4, UInt64(blhdrSize + blocks.reduce(0) { $0 + $1.1.count }), 4)
-            put(header + 16 + 12, UInt64(sequence + 1), 4)
-            var cursor = header + blhdrSize
-            for (index, block) in blocks.enumerated() {
-                put(header + 16 + (index + 1) * 16, UInt64(bitPattern: block.0), 8)
-                put(header + 16 + (index + 1) * 16 + 8, UInt64(block.1.count), 4)
-                data.replaceSubrange(cursor..<cursor + block.1.count, with: block.1)
-                cursor += block.1.count
+            put(header + 12, transaction.checksums ? 3 : 2, 4)
+            put(header + 16 + 12, UInt64(transaction.sequence ?? UInt32(index + 1)), 4)
+            var cursor = ring(position + blhdrSize)
+            for (number, block) in blocks.enumerated() {
+                put(header + 16 + (number + 1) * 16, UInt64(bitPattern: block.0), 8)
+                put(header + 16 + (number + 1) * 16 + 8, UInt64(block.1.count), 4)
+                if transaction.checksums {
+                    let checksum = Self.journalChecksum(block.1) ^ (transaction.corruptBlock == number ? 1 : 0)
+                    put(header + 16 + (number + 1) * 16 + 12, UInt64(checksum), 4)
+                }
+                for (offset, byte) in block.1.enumerated() { data[base + ring(cursor + offset)] = byte }
+                cursor = ring(cursor + block.1.count)
             }
             let checksum = Self.journalChecksum(data.subdata(in: header..<header + 32))
             put(header + 8, UInt64(checksum), 4)
-            position = cursor - base
+            position = cursor
         }
+        let endPosition = end ?? position
         put(base, 0x4A4E_4C78, 4); put(base + 4, 0x1234_5678, 4)
-        put(base + 8, UInt64(dirty ? sectorSize : position), 8); put(base + 16, UInt64(position), 8)
-        put(base + 24, UInt64(size), 8); put(base + 32, UInt64(blhdrSize), 4); put(base + 40, UInt64(sectorSize), 4)
+        put(base + 8, UInt64(dirty ? sectorSize : endPosition), 8); put(base + 16, UInt64(endPosition), 8)
+        put(base + 24, UInt64(size), 8); put(base + 32, UInt64(blhdrSize), 4); put(base + 36, 0, 4); put(base + 40, UInt64(sectorSize), 4)
+        put(base + 44, UInt64(transactions.count), 4)
+        put(base + 36, UInt64(Self.journalChecksum(data.subdata(in: base..<base + 44))), 4)
     }
     /// Sector number of catalog node `node`, as a journal block list names it.
     static func catalogSector(_ node: Int) -> Int64 { Int64((catalogBlock + node) * blockSize / 512) }
@@ -267,6 +315,19 @@ func runHFS(_ reader: any BlockReader, limits: HFSPlusLimits = HFSPlusLimits()) 
 func runHFS(_ image: HFSImage, limits: HFSPlusLimits = HFSPlusLimits()) async
     -> (files: [RecoveredFile], error: (any Error)?, volume: HFSPlusVolume) {
     await runHFS(ImageReader(data: image.image), limits: limits)
+}
+
+/// Throws an injected error for any read that overlaps one of `faults`.
+private struct FaultyReader: BlockReader {
+    let data: Data
+    let faults: [Range<Int64>]
+    var error: ScanError = .io("injected fault")
+    var sizeBytes: Int64 { Int64(data.count) }
+    func read(at offset: Int64, count: Int) async throws -> Data {
+        guard offset >= 0, Int64(count) <= sizeBytes - offset else { throw ScanError.io("Out of bounds") }
+        if faults.contains(where: { $0.overlaps(offset..<offset + Int64(count)) }) { throw error }
+        return data.subdata(in: Int(offset)..<Int(offset) + count)
+    }
 }
 
 private func found(_ events: [ScanEvent]) -> [RecoveredFile] {
@@ -478,16 +539,24 @@ struct HFSPlusVolumeTests {
 
     @Test func namesAreValidatedAndPrecomposed() async {
         var image = HFSImage()
-        // "café.txt" stored decomposed (e + U+0301), and a name keeping its catalog colon.
+        // "café.txt" stored decomposed (e + U+0301); "a/b" is how the catalog stores the POSIX
+        // name "a:b" (also inside a folder, so the path separator is never confused with it);
+        // a literal catalog ":" can't come from POSIX and is kept.
         let decomposed: [UInt16] = Array("caf".utf16) + [0x65, 0x0301] + Array(".txt".utf16)
         image.catalog([HFSImage.root() + [
             HFSImage.key(2, decomposed) + HFSImage.file(30, size: 0, extents: []),
-            HFSImage.key(2, "a:b") + HFSImage.file(31, size: 0, extents: []),
+            HFSImage.key(2, "a/b") + HFSImage.file(31, size: 0, extents: []),
+            HFSImage.key(2, "c:d") + HFSImage.file(32, size: 0, extents: []),
+            HFSImage.key(2, "12/00") + HFSImage.folder(20),
+            HFSImage.key(20, "x/y.log") + HFSImage.file(33, size: 0, extents: []),
         ]])
         let result = await runHFS(image)
         #expect(result.error == nil)
-        #expect(result.files.map(\.name) == ["café.txt", "a:b"])
-        #expect(result.files.map(\.path) == ["/café.txt", "/a:b"])
+        #expect(result.files.map(\.name) == ["café.txt", "a:b", "c:d", "x:y.log"])
+        #expect(result.files.map(\.path) == ["/café.txt", "/a:b", "/c:d", "/12:00/x:y.log"])
+        var nul = HFSImage()
+        nul.catalog([HFSImage.root() + [HFSImage.key(2, [0x41, 0, 0x42]) + HFSImage.file(30, size: 0, extents: [])]])
+        #expect(isMalformed(await runHFS(nul).error))
         var surrogate = HFSImage()
         surrogate.catalog([HFSImage.root() + [HFSImage.key(2, [0xD800, 0x41]) + HFSImage.file(30, size: 0, extents: [])]])
         #expect(isMalformed(await runHFS(surrogate).error))
@@ -683,11 +752,20 @@ struct HFSPlusVolumeTests {
         #expect(HFSPlusLimits().maxCandidates == 100_000 && HFSPlusLimits().maxPathDepth == 2048)
     }
 
-    @Test func overlapDetectionFlagsEveryOverlappingOwner() {
-        let claims = [HFSPlusClaim(start: 0, end: 10, owner: 0), HFSPlusClaim(start: 2, end: 3, owner: 1),
-                      HFSPlusClaim(start: 5, end: 20, owner: 2), HFSPlusClaim(start: 20, end: 21, owner: 3),
-                      HFSPlusClaim(start: 30, end: 31, owner: 4), HFSPlusClaim(start: 30, end: 32, owner: 4)]
-        #expect(HFSPlusVolume.overlappingOwners(claims, owners: 5) == [true, true, true, false, true])
+    @Test func overlapDetectionFlagsAcceptedRangesOverlappingAnotherOwner() {
+        func claim(_ start: UInt64, _ end: UInt64, _ owner: UInt32) -> HFSPlusClaim { HFSPlusClaim(start: start, end: end, owner: owner) }
+        let evidence = [claim(0, 10, 0), claim(2, 3, 1), claim(5, 20, 2), claim(20, 21, 3),
+                        claim(30, 31, 4), claim(30, 32, 4), claim(40, 50, 5), claim(41, 45, 6), claim(46, 47, 5),
+                        claim(105, 106, 12), claim(100, 110, 11)]
+        // 0 overlaps 1 and 2; 3 only touches 2; 4's versions share blocks; 5's accepted range
+        // overlaps only its own older version; 6 sits inside 5's older version; 11 contains 12.
+        let accepted = [claim(0, 10, 0), claim(20, 21, 3), claim(30, 32, 4), claim(46, 47, 5), claim(41, 45, 6), claim(100, 110, 11)]
+        #expect(HFSPlusVolume.overlappingOwners(accepted: accepted, evidence: evidence) == [0, 6, 11])
+        // Owner 7's reach hides owner 8's shorter one; both overlaps are still found.
+        let nested = [claim(0, 10, 7), claim(1, 3, 8), claim(2, 4, 7)]
+        #expect(HFSPlusVolume.overlappingOwners(accepted: [claim(2, 4, 7), claim(1, 3, 8)], evidence: nested) == [7, 8])
+        let adjacent = [claim(0, 1, 9), claim(1, 2, 10)]
+        #expect(HFSPlusVolume.overlappingOwners(accepted: adjacent, evidence: adjacent).isEmpty)
     }
 
     @Test func helpersMatchTheSpecification() {
@@ -697,10 +775,323 @@ struct HFSPlusVolumeTests {
         #expect(HFSPlus.indirectNodeNumber(Array("iNode".utf16)) == nil)
         #expect(HFSPlus.indirectNodeNumber(Array("iNodex".utf16)) == nil)
         #expect(HFSPlus.name([0xD800]) == nil)
-        #expect(HFSPlus.name(Array("a/b".utf16)) == nil)
+        #expect(HFSPlus.name(Array("a/b".utf16)) == "a:b")
+        #expect(HFSPlus.name(Array("a:b".utf16)) == "a:b")
+        #expect(HFSPlus.name([0x61, 0]) == nil)
+        #expect(HFSPlus.name(HFSPlus.privateDataFolderName) != nil)
         // TN1150's block list checksum, as the inspected real journal confirmed.
         #expect(HFSPlusJournal.checksum(Data()) == 0xFFFF_FFFF)
     }
+    // MARK: Deleted-file work is best effort
+
+    /// live.txt; gone.txt in node 1's slack (block 90); other.bin in a journal copy of node 1
+    /// (block 91); stale.bin in freed catalog node 5 (block 92).
+    func threeSourceImage() -> HFSImage {
+        var image = HFSImage()
+        image.fill([90, 91, 92])
+        let live = liveRecords(&image)
+        image.catalog([live])
+        image.writeNode(tree: HFSImage.catalogBlock, 1, HFSImage.leafNode(live, slack: staleRecord()))
+        image.writeNode(tree: HFSImage.catalogBlock, 5, HFSImage.leafNode([staleRecord(id: 33, name: "stale.bin", extents: [(92, 1)])]))
+        image.journal([[(HFSImage.catalogSector(1), HFSImage.leafNode(live + [staleRecord(id: 32, name: "other.bin", extents: [(91, 1)])]))]])
+        return image
+    }
+    func blocks(_ range: Range<Int>) -> Range<Int64> { Int64(range.lowerBound * 4096)..<Int64(range.upperBound * 4096) }
+
+    @Test func readErrorsInDeletedFileSourcesNeverBlockLiveFiles() async throws {
+        let bytes = threeSourceImage().image
+        let healthy = await runHFS(ImageReader(data: bytes))
+        #expect(healthy.error == nil)
+        #expect(healthy.files.map(\.path) == ["/live.txt", "/gone.txt", "/other.bin", "/stale.bin"])
+        // The journal's transactions are unreadable but its header reads: only the journal is skipped.
+        let journalBuffer = blocks(HFSImage.journalBlock..<HFSImage.journalBlock + HFSImage.journalBlocks)
+        let transactions = await runHFS(FaultyReader(data: bytes, faults: [journalBuffer.lowerBound + 512..<journalBuffer.upperBound]))
+        #expect(transactions.error == nil)
+        #expect(transactions.files.map(\.path) == ["/live.txt", "/gone.txt", "/stale.bin"])
+        #expect(await transactions.volume.stats.notes.contains { $0.contains("journal") })
+        // The whole buffer is unreadable, header included: unreplayed transactions can't be ruled
+        // out, so deleted recovery is off, yet every live file is still emitted.
+        let wholeJournal = await runHFS(FaultyReader(data: bytes, faults: [journalBuffer]))
+        #expect(wholeJournal.error == nil)
+        #expect(wholeJournal.files.map(\.path) == ["/live.txt"])
+        #expect(await wholeJournal.volume.stats.deletedRecoveryDisabled != nil)
+        // Freed catalog nodes unreadable: the other sources still work.
+        let staleNodes = await runHFS(FaultyReader(data: bytes, faults: [blocks(HFSImage.catalogBlock + 5..<HFSImage.catalogBlock + 6)]))
+        #expect(staleNodes.error == nil)
+        #expect(staleNodes.files.map(\.path) == ["/live.txt", "/gone.txt", "/other.bin"])
+        // The allocation bitmap unreadable: nothing deleted can be confirmed free, the scan completes.
+        let bitmap = await runHFS(FaultyReader(data: bytes, faults: [blocks(1..<2)]))
+        #expect(bitmap.error == nil)
+        #expect(bitmap.files.map(\.path) == ["/live.txt"])
+        #expect(await bitmap.volume.stats.notes.contains { $0.contains("bitmap") })
+        // Other errors (here: a vanished device) still end the scan.
+        let gone = await runHFS(FaultyReader(data: bytes, faults: [blocks(1..<2)], error: .deviceChanged))
+        #expect(gone.error as? ScanError == .deviceChanged)
+    }
+
+    // MARK: Block reuse evidence
+
+    @Test func blocksNamedByRejectedRecordsAreNotRecovered() async {
+        // X (gone.txt) freed block 90; Y then took 90-91 and was deleted; live Z reuses 91. Y is
+        // rejected (block 91 is used) but still proves block 90 was overwritten after X.
+        var image = HFSImage()
+        let live = liveRecords(&image) + [image.file(2, "z.bin", id: 34, size: 100, extents: [(91, 1)])]
+        image.catalog([live])
+        image.writeNode(tree: HFSImage.catalogBlock, 1, HFSImage.leafNode(live, slack:
+            staleRecord() + staleRecord(id: 32, name: "y.bin", size: 8000, extents: [(90, 2)], mtime: 3_860_000_000)))
+        let result = await runHFS(image)
+        #expect(result.error == nil)
+        #expect(result.files.map(\.path) == ["/live.txt", "/z.bin"])
+        // A deleted record whose parent can't be resolved is evidence too.
+        var orphan = HFSImage()
+        let records = liveRecords(&orphan)
+        orphan.catalog([records])
+        orphan.writeNode(tree: HFSImage.catalogBlock, 1, HFSImage.leafNode(records, slack:
+            staleRecord() + staleRecord(id: 32, name: "lost.bin", parent: 77, extents: [(90, 1)])))
+        #expect((await runHFS(orphan)).files.map(\.path) == ["/live.txt"])
+        // So is an older version of a live file.
+        var older = HFSImage()
+        let current = liveRecords(&older)
+        older.catalog([current])
+        older.writeNode(tree: HFSImage.catalogBlock, 1, HFSImage.leafNode(current, slack:
+            staleRecord() + staleRecord(id: 30, name: "live.txt", extents: [(90, 1)])))
+        #expect((await runHFS(older)).files.map(\.path) == ["/live.txt"])
+    }
+
+    @Test func supersededVersionsStillClaimTheirBlocks() async {
+        // W once lived at block 90 and now (newer) at 95; deleted X also names block 90. Either
+        // order of discovery: the superseded copy is evidence, the newest copy is still emitted.
+        let older = staleRecord(id: 32, name: "w.bin", extents: [(90, 1)], mtime: 1)
+        let newer = staleRecord(id: 32, name: "w.bin", extents: [(95, 1)], mtime: 2)
+        for versions in [older + newer, newer + older] {
+            var image = HFSImage()
+            let live = liveRecords(&image)
+            image.catalog([live])
+            image.writeNode(tree: HFSImage.catalogBlock, 1, HFSImage.leafNode(live, slack: staleRecord() + versions))
+            let result = await runHFS(image)
+            #expect(result.error == nil)
+            #expect(result.files.map(\.path) == ["/live.txt", "/w.bin"])
+            #expect(result.files.last?.content == .runs([DataRun(deviceOffset: 95 * 4096, length: 600)]))
+        }
+    }
+
+    // MARK: Journal transactions
+
+    @Test func journalTransactionsThatWrapAroundTheBufferAreHarvested() async throws {
+        var image = HFSImage()
+        let gone = image.fill([90]).prefix(600)
+        let live = liveRecords(&image)
+        image.catalog([live])
+        // The block list header fills the buffer's last 4 KiB, so the node copy wraps to offset 512.
+        let size = HFSImage.journalBlocks * 4096
+        image.journalTransactions([.init(blocks: [(HFSImage.catalogSector(1), HFSImage.leafNode(live + [staleRecord()]))],
+                                         position: size - 4096)], end: 512 + 4096)
+        let bytes = image.image
+        let result = await runHFS(ImageReader(data: bytes))
+        #expect(result.error == nil)
+        #expect(result.files.map(\.path) == ["/live.txt", "/gone.txt"])
+        #expect(try await readBack(result.files.last, from: bytes) == gone)
+        #expect(await result.volume.stats.journalTransactions == 1)
+    }
+
+    @Test func tornWrappedJournalTransactionIsIgnored() async {
+        var image = HFSImage()
+        image.fill([90])
+        let live = liveRecords(&image)
+        image.catalog([live])
+        // `end` falls inside the wrapped part: newer transactions were overwriting this one.
+        let size = HFSImage.journalBlocks * 4096
+        image.journalTransactions([.init(blocks: [(HFSImage.catalogSector(1), HFSImage.leafNode(live + [staleRecord()]))],
+                                         position: size - 4096)], end: 2560)
+        let result = await runHFS(image)
+        #expect(result.error == nil)
+        #expect(result.files.map(\.path) == ["/live.txt"])
+        #expect(await result.volume.stats.journalTornTransactions == 1)
+    }
+
+    @Test func staleTransactionsPastTheJournalEndAreHarvested() async {
+        var image = HFSImage()
+        image.fill([90])
+        let live = liveRecords(&image)
+        image.catalog([live])
+        // The current lap ends right after the first transaction; an older lap's transaction
+        // further on still holds gone.txt.
+        image.journalTransactions([
+            .init(blocks: [(2, Data(repeating: 0, count: 512))], position: 512, sequence: 7),
+            .init(blocks: [(HFSImage.catalogSector(1), HFSImage.leafNode(live + [staleRecord()]))], position: 65536, sequence: 3),
+        ], end: 512 + 4096 + 512)
+        let result = await runHFS(image)
+        #expect(result.error == nil)
+        #expect(result.files.map(\.path) == ["/live.txt", "/gone.txt"])
+        #expect(await result.volume.stats.journalTransactions == 2)
+    }
+
+    @Test func laterJournalTransactionsWinOverEarlierCopies() async {
+        // gone.txt was renamed (same modification time) before being deleted: the copy from the
+        // later transaction names it, even though it sits earlier in the buffer.
+        var image = HFSImage()
+        image.fill([90])
+        let live = liveRecords(&image)
+        image.catalog([live])
+        image.journalTransactions([
+            .init(blocks: [(HFSImage.catalogSector(1), HFSImage.leafNode(live + [staleRecord(name: "new.txt")]))], position: 512, sequence: 10),
+            .init(blocks: [(HFSImage.catalogSector(1), HFSImage.leafNode(live + [staleRecord(name: "old.txt")]))], position: 65536, sequence: 9),
+        ], end: 512 + 8192)
+        let result = await runHFS(image)
+        #expect(result.files.map(\.path) == ["/live.txt", "/new.txt"])
+    }
+
+    @Test func journalBlocksWithBadChecksumsAreIgnored() async {
+        var image = HFSImage()
+        image.fill([90])
+        let live = liveRecords(&image)
+        image.catalog([live])
+        image.journalTransactions([.init(blocks: [(HFSImage.catalogSector(1), HFSImage.leafNode(live + [staleRecord()]))], corruptBlock: 0)])
+        let result = await runHFS(image)
+        #expect(result.error == nil)
+        #expect(result.files.map(\.path) == ["/live.txt"])
+        #expect(await result.volume.stats.journalChecksumFailures == 1)
+        // Without BLHDR_CHECK_CHECKSUMS the per-block slots aren't checked.
+        var unchecked = HFSImage()
+        unchecked.fill([90])
+        let records = liveRecords(&unchecked)
+        unchecked.catalog([records])
+        unchecked.journalTransactions([.init(blocks: [(HFSImage.catalogSector(1), HFSImage.leafNode(records + [staleRecord()]))], checksums: false)])
+        #expect((await runHFS(unchecked)).files.map(\.path) == ["/live.txt", "/gone.txt"])
+    }
+
+    @Test func onlyCatalogNodesOfAMultiNodeJournalBlockAreHarvested() async {
+        var image = HFSImage()
+        image.fill([90])
+        let live = liveRecords(&image)
+        image.catalog([live])
+        // Catalog node 7 is the catalog's last; the block's second node is the attributes file's
+        // first block, so a leaf there is not a catalog node.
+        image.journal([[(HFSImage.catalogSector(7), HFSImage.leafNode(live) + HFSImage.leafNode([staleRecord()]))]])
+        let outside = await runHFS(image)
+        #expect(outside.error == nil)
+        #expect(outside.files.map(\.path) == ["/live.txt"])
+        // Nodes 2 and 3 are both catalog nodes: the second one is harvested.
+        var inside = HFSImage()
+        inside.fill([90])
+        let records = liveRecords(&inside)
+        inside.catalog([records])
+        inside.journal([[(HFSImage.catalogSector(2), HFSImage.leafNode([]) + HFSImage.leafNode([staleRecord()]))]])
+        #expect((await runHFS(inside)).files.map(\.path) == ["/live.txt", "/gone.txt"])
+    }
+
+    // MARK: Volume state
+
+    @Test func uncleanVolumesAndUnusableJournalsDisableDeletedRecovery() async {
+        func slackImage(_ prepare: (inout HFSImage) -> Void = { _ in }) -> HFSImage {
+            var image = HFSImage()
+            image.fill([90])
+            let live = liveRecords(&image)
+            image.catalog([live])
+            image.writeNode(tree: HFSImage.catalogBlock, 1, HFSImage.leafNode(live, slack: staleRecord()))
+            prepare(&image)
+            return image
+        }
+        func journaled(_ image: inout HFSImage) { image.journal([[(2, Data(repeating: 0, count: 512))]]) }
+        let info = HFSImage.journalInfoBlock * 4096, journalBase = HFSImage.journalBlock * 4096
+        // Sanity: both a clean plain volume and a clean journaled one recover gone.txt; a
+        // journaled volume relies on its journal, not on the unmounted bit.
+        for image in [slackImage(), slackImage { journaled(&$0) }, slackImage { journaled(&$0); $0.attributes = 0 }] {
+            #expect((await runHFS(image)).files.map(\.path) == ["/live.txt", "/gone.txt"])
+        }
+        let cases: [(String, Data)] = [
+            ("not cleanly unmounted", slackImage { $0.attributes = 0 }.image),
+            ("inconsistent", slackImage { $0.attributes = 1 << 8 | 1 << 11 }.image),
+            ("external", slackImage { journaled(&$0); $0.data.putBigEndian(info, 0, 4) }.image),
+            ("outside volume", slackImage { journaled(&$0); $0.data.putBigEndian(info + 36, 1 << 40, 8) }.image),
+            ("bad header checksum", slackImage { journaled(&$0); $0.data[journalBase + 36] ^= 1 }.image),
+            ("bad magic", slackImage { journaled(&$0); $0.data[journalBase] ^= 1 }.image),
+            ("info block outside volume", { var bytes = slackImage { journaled(&$0) }.image; bytes.putBigEndian(1024 + 12, 0, 4); return bytes }()),
+        ]
+        for (reason, bytes) in cases {
+            let result = await runHFS(ImageReader(data: bytes))
+            #expect(result.error == nil, "\(reason)")
+            #expect(result.files.map(\.path) == ["/live.txt"], "\(reason)")
+            let disabled = await result.volume.stats.deletedRecoveryDisabled
+            #expect(disabled != nil, "\(reason)")
+            let note = (disabled ?? "") + " " + (await result.volume.stats.journal)
+            #expect(note.contains(reason), "\(reason): \(note)")
+        }
+    }
+
+    // MARK: Stale folders
+
+    @Test func staleFolderCopiesResolveToTheLatestAndTiesAreUnresolvable() async throws {
+        func renamed(first: UInt64, second: UInt64, secondName: String = "new") -> HFSImage {
+            var image = HFSImage()
+            image.fill([91])
+            image.catalog([liveRecords(&image)])
+            // Two freed leaves: the older copy of folder 40 is seen first.
+            image.writeNode(tree: HFSImage.catalogBlock, 3, HFSImage.leafNode([
+                HFSImage.key(2, "old") + HFSImage.folder(40, contentModDate: 50, attributeModDate: first),
+                staleRecord(id: 41, name: "inside.bin", parent: 40, size: 2000, extents: [(91, 1)]),
+            ]))
+            image.writeNode(tree: HFSImage.catalogBlock, 4, HFSImage.leafNode([
+                HFSImage.key(2, secondName) + HFSImage.folder(40, contentModDate: 50, attributeModDate: second),
+            ]))
+            return image
+        }
+        #expect((await runHFS(renamed(first: 100, second: 200))).files.map(\.path) == ["/live.txt", "/new/inside.bin"])
+        #expect((await runHFS(renamed(first: 200, second: 100))).files.map(\.path) == ["/live.txt", "/old/inside.bin"])
+        // Same date, different names: the folder can't be placed, so its file is skipped.
+        #expect((await runHFS(renamed(first: 100, second: 100))).files.map(\.path) == ["/live.txt"])
+        // Same date and same name and parent: identical copies agree.
+        #expect((await runHFS(renamed(first: 100, second: 100, secondName: "old"))).files.map(\.path) == ["/live.txt", "/old/inside.bin"])
+    }
+
+    // MARK: Memory bounds
+
+    @Test func hugeTotalNodesDoesNotAllocateProportionally() async {
+        // A catalog claiming 2^31 nodes (8 TiB) on a sparse device; only one leaf is real.
+        let (image, _, _) = basicImage()
+        var bytes = image.image
+        let totalNodes: UInt64 = 1 << 31, allocationBlocks: UInt64 = 1 << 17
+        let totalBlocks = totalNodes + (1 << 18)
+        let h = 1024
+        bytes.putBigEndian(h + 44, totalBlocks, 4)
+        bytes.putBigEndian(h + 112, allocationBlocks * 4096, 8); bytes.putBigEndian(h + 112 + 12, allocationBlocks, 4)
+        bytes.putBigEndian(h + 112 + 16, totalBlocks - allocationBlocks, 4); bytes.putBigEndian(h + 112 + 20, allocationBlocks, 4)
+        bytes.putBigEndian(h + 272, totalNodes * 4096, 8); bytes.putBigEndian(h + 272 + 12, totalNodes, 4)
+        bytes.putBigEndian(h + 272 + 20, totalNodes, 4)
+        let catalogHeader = HFSImage.catalogBlock * 4096
+        bytes.putBigEndian(catalogHeader + 36, totalNodes, 4); bytes.putBigEndian(catalogHeader + 40, totalNodes - 2, 4)
+        var limits = HFSPlusLimits(); limits.deletedWorkBudget = 600
+        let result = await runHFS(SparseReader(sizeBytes: Int64(totalBlocks) * 4096, regions: [(0, bytes)]), limits: limits)
+        #expect(result.error == nil)
+        #expect(result.files.map(\.path) == ["/hello.txt", "/docs/inner/nested.txt"])
+        // The visited set holds the one leaf read, not a bit per node the header claims.
+        #expect(await result.volume.stats.largestNodeSet == 1)
+        #expect(await result.volume.stats.deletedBudgetExhausted)
+    }
+
+    @Test func overflowExtentsAreFoundThroughIndexNodes() async throws {
+        var image = HFSImage()
+        image.extentsTree = (block: 50, blocks: 4)
+        let a = (0..<10).map { (80 + 2 * $0, 1) }, b = (0..<9).map { (101 + 2 * $0, 1) }
+        let expectedA = image.fill(a.map(\.0)).prefix(9 * 4096 + 1)
+        let expectedB = image.fill(b.map(\.0)).prefix(9 * 4096)
+        image.catalog([HFSImage.root() + [
+            image.file(2, "a.bin", id: 30, size: 9 * 4096 + 1, extents: a),
+            image.file(2, "b.bin", id: 31, size: 9 * 4096, extents: b),
+        ]])
+        // Root index node 1 (height 2) points to leaf 2 (file 30) and leaf 3 (file 31).
+        image.writeNode(tree: 50, 0, HFSImage.headerNode(totalNodes: 4, root: 1, firstLeaf: 2, lastLeaf: 3, depth: 2))
+        image.writeNode(tree: 50, 1, HFSImage.extentsIndexNode([(1, 0, 2), (31, 0, 3)]))
+        image.writeNode(tree: 50, 2, HFSImage.leafNode([HFSImage.overflowRecord(30, 8, [(96, 1), (98, 1)])], fLink: 3))
+        image.writeNode(tree: 50, 3, HFSImage.leafNode([HFSImage.overflowRecord(31, 8, [(117, 1)])], bLink: 2))
+        let bytes = image.image
+        let result = await runHFS(ImageReader(data: bytes))
+        #expect(result.error == nil)
+        #expect(result.files.map(\.path) == ["/a.bin", "/b.bin"])
+        #expect(try await readBack(result.files.first, from: bytes) == expectedA)
+        #expect(try await readBack(result.files.last, from: bytes) == expectedB)
+    }
+
 }
 
 // MARK: - Real images built with hdiutil
@@ -710,11 +1101,18 @@ struct HFSPlusVolumeTests {
 enum HDIUtil {
     static let path = "/usr/bin/hdiutil"
 
-    /// True when hdiutil can create and attach an image here; otherwise the real-image tests skip.
-    static let available: Bool = {
-        guard FileManager.default.isExecutableFile(atPath: path) else { return false }
-        return (try? image(sizeMiB: 4, journaled: false) { _ in }) != nil
+    /// Why hdiutil can't create and attach an image here (the real-image tests then skip), or
+    /// nil when it can.
+    static let unavailableReason: String? = {
+        guard FileManager.default.isExecutableFile(atPath: path) else { return "\(path) is not executable" }
+        do {
+            _ = try image(sizeMiB: 4, journaled: false) { _ in }
+            return nil
+        } catch {
+            return "hdiutil could not create and attach a test image: \(error)"
+        }
     }()
+    static var available: Bool { unavailableReason == nil }
 
     @discardableResult
     static func run(_ arguments: [String]) throws -> String {
@@ -750,14 +1148,80 @@ enum HDIUtil {
     }
 
     static func write(_ bytes: Data, to url: URL) throws { try bytes.write(to: url) }
+
+    /// Copies `source` to `destination` with `ditto --hfsCompression` (decmpfs-compressed).
+    static func dittoCompressed(_ source: URL, to destination: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        process.arguments = ["--hfsCompression", source.path, destination.path]
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { throw ScanError.io("ditto --hfsCompression failed") }
+    }
     static func random(_ count: Int) -> Data { Data((0..<count).map { _ in UInt8.random(in: 0...255) }) }
     static func modificationDate(_ url: URL) throws -> Date? {
         try FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date
     }
 }
 
-@Suite("HFS+ scanning of real hdiutil images", .enabled(if: HDIUtil.available), .serialized)
+@Suite("HFS+ real-image availability")
+struct HFSPlusRealImageAvailabilityTests {
+    /// Says explicitly when the real-image suite below is skipped, and fails the run instead when
+    /// SALVAGE_REQUIRE_HDIUTIL=1 (as on a machine that must exercise it).
+    @Test func realImageSuiteReportsWhyItIsSkipped() {
+        guard let reason = HDIUtil.unavailableReason else { return }
+        print("HFS+ real-image tests skipped: \(reason)")
+        if ProcessInfo.processInfo.environment["SALVAGE_REQUIRE_HDIUTIL"] == "1" {
+            Issue.record("SALVAGE_REQUIRE_HDIUTIL=1 but the HFS+ real-image tests can't run: \(reason)")
+        }
+    }
+}
+
+@Suite("HFS+ scanning of real hdiutil images", .enabled(if: HDIUtil.available, "hdiutil can't create and attach images here"), .serialized)
 struct HFSPlusRealImageTests {
+    @Test func colonInANameIsShownAsAColon() async throws {
+        let log = Data("lunch".utf8), inner = Data("inner".utf8)
+        let image = try HDIUtil.image(sizeMiB: 8, journaled: false) { root in
+            try HDIUtil.write(log, to: root.appendingPathComponent("12:30.log"))
+            try FileManager.default.createDirectory(at: root.appendingPathComponent("a:b"), withIntermediateDirectories: true)
+            try HDIUtil.write(inner, to: root.appendingPathComponent("a:b/c:d.txt"))
+        }
+        // The catalog stores the POSIX ":" as "/".
+        #expect(image.range(of: Data("12/30.log".utf16.flatMap { [UInt8($0 >> 8), UInt8($0 & 0xFF)] })) != nil)
+        let result = await runHFS(ImageReader(data: image))
+        #expect(result.error == nil)
+        let files = result.files.filter { !$0.name.hasPrefix(".") }
+        #expect(Set(files.map(\.path)) == ["/12:30.log", "/a:b/c:d.txt"])
+        #expect(files.first { $0.path == "/12:30.log" }?.name == "12:30.log")
+        #expect(try await readBack(files.first { $0.path == "/12:30.log" }, from: image) == log)
+        #expect(try await readBack(files.first { $0.path == "/a:b/c:d.txt" }, from: image) == inner)
+    }
+
+    @Test func decmpfsCompressedFileIsUnmappedWithItsRealSize() async throws {
+        let text = Data(String(repeating: "salvage compresses well. ", count: 8000).utf8)
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("salvage-ditto-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let source = scratch.appendingPathComponent("source.txt")
+        try HDIUtil.write(text, to: source)
+        var compressed = false
+        let image = try HDIUtil.image(sizeMiB: 8, journaled: true) { root in
+            let destination = root.appendingPathComponent("comp.txt")
+            try HDIUtil.dittoCompressed(source, to: destination)
+            let values = try destination.resourceValues(forKeys: [.fileAllocatedSizeKey])
+            compressed = (values.fileAllocatedSize ?? Int.max) < text.count
+            try HDIUtil.write(Data("plain".utf8), to: root.appendingPathComponent("plain.txt"))
+        }
+        #expect(compressed, "ditto did not compress the file")
+        let result = await runHFS(ImageReader(data: image))
+        #expect(result.error == nil)
+        let file = result.files.first { $0.path == "/comp.txt" }
+        #expect(file?.sizeBytes == Int64(text.count))
+        #expect(file?.content == .unmapped)
+        #expect(await result.volume.stats.compressedFiles >= 1)
+        #expect(try await readBack(result.files.first { $0.path == "/plain.txt" }, from: image) == Data("plain".utf8))
+    }
+
     @Test func liveFilesReadBackByteIdentical() async throws {
         let hello = Data("hello hfs".utf8), nested = HDIUtil.random(5000)
         var mtime: Date? = nil
