@@ -730,6 +730,29 @@ struct ScanEventBatchingTests {
         #expect(model.filePublications >= 1 && model.filePublications < 100)
     }
 
+    @Test func progressListShowsOnlyTheNewestFiles() async throws {
+        let few = (0..<3).map { Self.file($0) }
+        let many = (0..<(ScanViewModel.recentFileLimit + 50)).map { Self.file($0) }
+        for files in [few, many] {
+            let model = ScanViewModel { _, events in
+                for file in files { try await events.send(.found(file)) }
+                try await events.send(.completed)
+            }
+            model.start(device)
+            try await waitUntil { !model.isActive }
+            #expect(Array(model.recentFiles) == Array(files.suffix(ScanViewModel.recentFileLimit)))
+            #expect(model.files.count == files.count)
+        }
+        let model = ScanViewModel { _, events in
+            for file in many { try await events.send(.found(file)) }
+            try await events.send(.completed)
+        }
+        #expect(model.recentFilesNote == nil)
+        model.start(device)
+        try await waitUntil { !model.isActive }
+        #expect(model.recentFilesNote == "Showing the latest 200 of 250 files.")
+    }
+
     @Test func filesFoundBeforeAnotherEventAreShownWithIt() async throws {
         let first = Self.file(1), second = Self.file(2)
         let lost = LostPartitionCandidate(offset: 4096, sizeBytes: 4096, formatName: "FAT32")

@@ -494,6 +494,16 @@ final class ScanViewModel {
     /// "Volume 1", "Volume 2"… by volume offset when the files span several volumes. Read on every
     /// redraw of the progress view, so it comes from the offsets kept as files arrive rather than
     /// from a pass over `files`.
+    /// The progress screen lists at most this many files: the most recently found.
+    static let recentFileLimit = 200
+    /// The newest `recentFileLimit` files, oldest first.
+    var recentFiles: ArraySlice<RecoveredFile> { files.suffix(Self.recentFileLimit) }
+    /// "Showing the latest 200 of 12,345 files." once the list is cut; nil while every file shows.
+    var recentFilesNote: String? {
+        guard files.count > Self.recentFileLimit else { return nil }
+        return "Showing the latest \(Self.recentFileLimit.formatted()) of \(files.count.formatted()) files."
+    }
+
     var sourceVolumeLabels: [Int64: String] { Self.volumeLabels(forOffsets: volumeOffsets) }
     static func volumeLabels(for files: [RecoveredFile]) -> [Int64: String] {
         volumeLabels(forOffsets: Set(files.lazy.map { $0.sourceMetadata.volumeOffset }))

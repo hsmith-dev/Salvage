@@ -96,7 +96,9 @@ on the host and the read-ahead.
    MFT record. Non-resident files now keep only the bytes in use, which still includes every
    attribute. Resident files keep the whole record, because a saved scan locates their data
    inside it. The copy is a real copy: a `Data` slice of the record would have kept the 1 KiB
-   buffer alive.
+   buffer alive. Nothing else reads a non-resident file's record: saved scans (v2) store
+   no record bytes, `NTFSResidentData.revalidate` re-reads the full record from the drive, and
+   File details reads `rawRecord` only for carved files.
 5. **Recovery flushes the drive once per batch, not once per file** (`RecoveryEngine`, and
    re-copied into the CLI). Each file is written under its `.partial` name and `fsync`ed, then
    one `F_FULLFSYNC` makes the whole batch durable (at most 32 files or 64 MiB), and only then
@@ -120,6 +122,10 @@ The tests are in `NTFSVolumeTests` (`scatteredDeletedFilesReadTheBitmapOnce`,
 
 ## What was checked and is fine
 
+- **The progress view's file list** now shows only the 200 most recently found files, with a
+  "Showing the latest 200 of N files" line; the total count stays above it. Before, it listed
+  every file and diffed all of them on each update (13–18 ms at 500,000 in the stand-in).
+
 - **Carving memory on a 320 GB span.** The carver keeps only byte ranges: the merged runs
   claimed by files found through metadata (a few MB for 500,000 files), at most 64 open carves,
   and the names already used. File bodies are never buffered. A drive with more than 250,000
@@ -130,11 +136,6 @@ The tests are in `NTFSVolumeTests` (`scatteredDeletedFilesReadTheBitmapOnce`,
 
 ## Remaining risks
 
-- **The progress view's file list.** `ScanProgressView` shows `List(model.files)`. It now
-  redraws only about 4 times a second, but each redraw still diffs every row: about 13–18 ms at
-  500,000 rows in the stand-in, and likely more in real SwiftUI. Showing only the most recent
-  few hundred files there would remove this. That is a one-line change in a file another change
-  was editing during this pass, so it was left alone.
 - **JPEG-heavy free space is limited by the CPU.** On this Mac the carver decodes JPEG data at
   about 150 MB/s on one core. A slower Mac may decode at 80–100 MB/s. With the read-ahead,
   this only matters on a USB 3 drive whose free space is full of old photos. There, carving
