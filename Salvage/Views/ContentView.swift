@@ -68,7 +68,8 @@ struct ContentView: View {
             }
         }
         // Closing the window stops the scan but keeps its checkpoint; only Cancel scan discards it.
-        .onDisappear { scan.stopForTeardown() }
+        // The unlock flow's keys go with the window (the session's own are dropped as it closes).
+        .onDisappear { scan.stopForTeardown(); unlock.tearDown() }
         .toolbar {
             Button("What Salvage reads and writes", systemImage: "info.circle") { showsTrust = true }
         }
@@ -79,8 +80,8 @@ struct ContentView: View {
         .frame(minWidth: 760, minHeight: 480)
     }
 
-    /// A credential check still in flight (e.g. Cancel pressed during "Unlocking…") finishes
-    /// before any scan starts.
+    /// A credential check still in flight (e.g. Cancel pressed during "Unlocking…", which cancels
+    /// it) finishes before any scan starts.
     private func startAfterPendingUnlock(_ device: BlockDevice) {
         Task {
             await unlock.waitForPendingUnlock()

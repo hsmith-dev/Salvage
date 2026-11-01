@@ -260,11 +260,85 @@ struct UnlockViewModelTests {
         #expect(UnlockViewModel.pickerNote(for: bootLocked, sheetEnabled: false) == nil)
     }
 
+    /// The message names the credential that was checked, even if the toggle moved afterwards.
+    @Test func wrongCredentialMessageFollowsTheSubmittedKindNotTheToggle() async {
+        let fake = VerifyFake([.failure(.wrongPassword), .failure(.wrongPassword)]), vm = model(fake)
+        #expect(vm.offerBeforeScan(locked))
+        vm.credentialKind = .recoveryKey
+        vm.secret = "ABCD-EFGH"
+        vm.submit()
+        await vm.waitForPendingUnlock()
+        vm.credentialKind = .password
+        #expect(vm.failureMessage == UnlockViewModel.Copy.wrongRecoveryKey)
+        vm.secret = "a password"
+        vm.submit()
+        await vm.waitForPendingUnlock()
+        vm.credentialKind = .recoveryKey
+        #expect(vm.failureMessage == UnlockViewModel.Copy.wrongPassword)
+    }
+
+    /// A right credential whose volume's file list is damaged has its own message, not "tied to
+    /// another Mac".
+    @Test func damagedVolumeHasItsOwnMessage() async {
+        let vm = model(VerifyFake([.failure(.damaged)]))
+        #expect(vm.offerBeforeScan(locked))
+        vm.secret = "right"
+        vm.submit()
+        await vm.waitForPendingUnlock()
+        #expect(vm.phase == .failed(.damaged))
+        #expect(vm.failureMessage == UnlockViewModel.Copy.damaged)
+        #expect(vm.failureMessage != UnlockViewModel.Copy.unsupported)
+        #expect(UnlockViewModel.Copy.damaged.hasPrefix("Salvage unlocked this volume but its file list is damaged"))
+    }
+
+    /// Cancel cancels the check itself: a slow key derivation that stops on cancellation lets
+    /// `waitForPendingUnlock()` return at once instead of after the whole derivation.
+    @Test func cancelCancelsTheCheckSoTheWaitingScanStartsPromptly() async {
+        let sawCancel = CountSignal()
+        let vm = UnlockViewModel(presentsSheet: true, verify: { _, _ in
+            // A stand-in for many expensive PBKDF2 records, checking cancellation between them.
+            for _ in 0..<3000 {
+                if Task.isCancelled { sawCancel.increment(); return .failure(.toolFailure) }
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            return .failure(.wrongPassword)
+        })
+        #expect(vm.offerBeforeScan(locked))
+        vm.secret = "pw"
+        vm.submit()
+        #expect(vm.phase == .unlocking)
+        let clock = ContinuousClock(), started = clock.now
+        #expect(vm.resolve() == locked)
+        await vm.waitForPendingUnlock()
+        #expect(clock.now - started < .seconds(5))
+        #expect(sawCancel.value == 1)
+        #expect(vm.request == nil && vm.phase == .entering)
+    }
+
+    /// Window teardown drops the flow: no unlocked credential (and so no volume key) stays
+    /// reachable from the model, and a check in flight is cancelled.
+    @Test func teardownDropsTheFlowsKeys() async throws {
+        let fake = VerifyFake([.success(())]), vm = model(fake)
+        let second = plain.requiringUnlock(volumeUUID: otherUUID, volumeName: "Other")
+        vm.offer(fromScan: [locked, second])
+        vm.secret = "one"
+        vm.submit()
+        await vm.waitForPendingUnlock()
+        let credential = try #require(vm.unlockedCredentials[secretUUID])
+        #expect(vm.request?.volumeUUID == otherUUID)
+        vm.tearDown()
+        #expect(vm.unlockedCredentials.isEmpty)
+        #expect(credential.decryptor == nil && credential.isZeroed)
+        #expect(vm.request == nil)
+        vm.offer(fromScan: [])
+        #expect(vm.request == nil)
+    }
+
     @Test func copyMatchesExperienceAndHasNoJargon() {
         #expect(UnlockViewModel.Copy.wrongPassword == "Wrong password.")
         #expect(UnlockViewModel.Copy.toolFailure == "Couldn't unlock this volume — try again or use your recovery key.")
         #expect(UnlockViewModel.Copy.unsupported != UnlockViewModel.Copy.wrongPassword)
-        for text in [UnlockViewModel.Copy.subtitle, UnlockViewModel.Copy.unsupported, UnlockViewModel.Copy.encryptedNotSupported] {
+        for text in [UnlockViewModel.Copy.subtitle, UnlockViewModel.Copy.unsupported, UnlockViewModel.Copy.damaged, UnlockViewModel.Copy.encryptedNotSupported] {
             for jargon in ["diskutil", "APFS", "EACCES", "rdisk", "stdin", "plist", "APSB", "slice", "BSD", "T2", "XTS", "keybag", "KEK"] {
                 #expect(!text.localizedCaseInsensitiveContains(jargon), "jargon \(jargon) in: \(text)")
             }
@@ -280,6 +354,26 @@ struct SourceSessionDecryptorTests {
         #expect(session.content.decryptors.keys.contains(secretUUID))
         #expect(SourceSession(device: plain, reader: EmptyBlockReader(), close: {}).content.decryptors.isEmpty)
     }
+
+    /// Closing the session drops its volume keys: nothing keeps the decryptor alive afterwards.
+    @Test func closingTheSessionDropsItsDecryptors() async {
+        weak var released: ClassDecryptor?
+        var session: SourceSession? = {
+            let decryptor = ClassDecryptor()
+            released = decryptor
+            return SourceSession(device: plain, reader: EmptyBlockReader(), decryptors: [secretUUID: decryptor], close: {})
+        }()
+        #expect(released != nil)
+        await session?.close()
+        #expect(session?.decryptors.isEmpty == true)
+        #expect(session?.content.decryptors.isEmpty == true)
+        #expect(released == nil)
+        session = nil
+    }
+}
+
+private final class ClassDecryptor: ContentDecryptor, @unchecked Sendable {
+    func decrypt(_ ciphertext: Data, firstDataUnit: UInt64) throws -> Data { ciphertext }
 }
 
 private struct EmptyBlockReader: BlockReader {

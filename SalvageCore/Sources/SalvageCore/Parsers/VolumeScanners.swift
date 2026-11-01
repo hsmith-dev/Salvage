@@ -46,7 +46,7 @@ func scanVolume(_ extent: VolumeExtent, reader: any BlockReader, device: BlockDe
         await reportSkipped(volume, notice: notice)
     case .ntfs: try await NTFSVolume(reader: reader, extent: extent, emit: found).scan()
     case .ext: try await EXTVolume(reader: reader, extent: extent, emit: found).scan()
-    case .apfs: try await APFSContainer(reader: reader, extent: extent, device: device, credentials: credentials, emit: emit).scan()
+    case .apfs: try await APFSContainer(reader: reader, extent: extent, device: device, credentials: credentials, notice: notice, emit: emit).scan()
     case .hfsPlus: try await HFSPlusVolume(reader: reader, extent: extent, emit: found).scan()
     case .raw: break
     }
