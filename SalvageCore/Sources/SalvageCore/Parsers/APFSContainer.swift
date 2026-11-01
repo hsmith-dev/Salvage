@@ -29,6 +29,11 @@ actor APFSContainer {
 
     var blockSize: Int64 = APFS.minBlockSize
     var blockCount: Int64 = 0
+    /// True when the extent is a bare volume device (APSB at block 0), which is read as plaintext.
+    var isBareVolume = false
+    /// The chosen checkpoint's transaction and `nx_block_count`.
+    var currentXID: UInt64 = 0
+    var containerBlockCount: Int64 = 0
     var nodeCache: [Int64: APFSBTreeNode] = [:]
     var nodesVisited = 0
     /// While set, node visits and bitmap checks are charged to the deleted-file budget.
@@ -48,8 +53,12 @@ actor APFSContainer {
     var deletedRecoverySkippedReason: String?
 
     let liveDirectories = APFSDirectoryIndex()
+    /// Deleted candidates from every volume; overlaps are resolved container-wide before emitting.
     var deletedCandidates: [APFSDeletedCandidate] = []
+    /// Inode ids already collected for the volume being walked (ids are per volume).
     var candidateIDs: Set<UInt64> = []
+    /// Remaining deleted-file budget per volume index.
+    var volumeBudgets: [Int: Int64] = [:]
 
     init(reader: any BlockReader, extent: VolumeExtent, device: BlockDevice?,
          emit: @escaping @Sendable (ScanEvent) async throws -> Void) {
@@ -115,18 +124,24 @@ actor APFSContainer {
             }
         }
         guard let (superblock, omapTree) = chosen else { throw ScanError.malformed("No valid APFS checkpoint.") }
+        currentXID = superblock.header.xid
+        containerBlockCount = superblock.blockCount
         try await loadCheckpointMappings(superblock)
         try await loadSpaceManager(superblock)
         let older = candidates.filter { $0.header.xid < superblock.header.xid }
-        for fsOID in superblock.fsOIDs {
+        deletedCandidates = []; volumeBudgets = [:]
+        for (volumeIndex, fsOID) in superblock.fsOIDs.enumerated() {
             guard let volume = try await volumeSuperblock(fsOID: fsOID, omapTree: omapTree, xid: superblock.header.xid) else {
                 throw ScanError.malformed("APFS volume \(fsOID) is missing from the object map.")
             }
             if volume.isEncrypted { try await emit(.unlockRequired(unlockDevice(volume))); continue }
             let context = try await volumeContext(volume, xid: superblock.header.xid)
             let liveNodes = try await scanLiveVolume(context)
-            try await recoverDeletedFiles(in: context, fsOID: fsOID, older: older, liveNodes: liveNodes)
+            try await collectDeletedCandidates(in: context, volume: volumeIndex, fsOID: fsOID, older: older, liveNodes: liveNodes)
         }
+        // Only once every volume's candidates are known can two of them be found claiming one block.
+        try await emitDeletedCandidates()
+        deletedCandidates = []; candidateIDs = []
     }
 
     /// A volume device read directly (Story 2.4's unlocked device): one volume, physical addresses
@@ -146,7 +161,9 @@ actor APFSContainer {
             size *= 2
         }
         guard let volume = found else { throw ScanError.malformed("APFS volume superblock checksum mismatch.") }
-        if volume.isEncrypted { try await emit(.unlockRequired(unlockDevice(volume))); return }
+        // An unlocked volume device read directly is already plaintext, whatever its superblock and
+        // object map say about encryption: parse it rather than asking for an unlock.
+        isBareVolume = true
         let context = try await volumeContext(volume, xid: volume.header.xid)
         _ = try await scanLiveVolume(context)
         deletedRecoverySkippedReason = "A bare volume has no space manager, so deleted files can't be verified free."
@@ -183,7 +200,9 @@ actor APFSContainer {
             let address = superblock.descriptorBase + (superblock.descriptorIndex + index) % superblock.descriptorBlocks
             let mappings: [APFSCheckpointMapping]? = try await attempt {
                 let block = try await self.object(at: address)
-                guard try APFSObjectHeader(block).type == APFS.ObjectType.checkpointMap else { return nil }
+                let header = try APFSObjectHeader(block)
+                // A map block left over from another checkpoint describes that checkpoint's objects.
+                guard header.type == APFS.ObjectType.checkpointMap, header.xid == superblock.header.xid else { return nil }
                 return try APFSCheckpointMapping.mappings(in: block).mappings
             } ?? nil
             for mapping in mappings ?? [] {
@@ -203,20 +222,29 @@ actor APFSContainer {
         let size = min(max(checkpointMappingSizes[superblock.spacemanOID] ?? blockSize, blockSize), Self.maxSpacemanBytes)
         let loaded: (APFSSpaceManager, [Int64])? = try await attempt {
             let data = try await self.object(at: address, blocks: (size + self.blockSize - 1) / self.blockSize)
-            let manager = try APFSSpaceManager(data, containerBlockSize: self.blockSize)
+            let manager = try APFSSpaceManager(data, containerBlockSize: self.blockSize, containerBlockCount: superblock.blockCount)
+            guard manager.header.oid == superblock.spacemanOID, manager.header.xid == superblock.header.xid else {
+                throw ScanError.malformed("APFS space manager doesn't belong to the chosen checkpoint.")
+            }
             guard manager.blockCount == superblock.blockCount, manager.tier2BlockCount == 0 else {
                 throw ScanError.unsupportedFilesystem
             }
             var cibs = manager.addresses
             if manager.cabCount > 0 {
+                guard Set(manager.addresses).count == manager.addresses.count else { throw ScanError.malformed("APFS chunk-info address blocks repeat.") }
                 cibs = []
                 for cab in manager.addresses {
                     let block = try await self.object(at: cab)
                     guard try APFSObjectHeader(block).type == APFS.ObjectType.spacemanCAB else { throw ScanError.malformed("APFS chunk-info address block has the wrong type.") }
-                    cibs += try APFSChunkInfo.cibAddresses(in: block)
+                    // Each block holds at most `cibsPerCAB` entries and the total at most `cibCount`,
+                    // checked before anything is appended.
+                    let limit = min(manager.cibsPerCAB, manager.cibCount - Int64(cibs.count))
+                    cibs += try APFSChunkInfo.cibAddresses(in: block, limit: limit)
                 }
             }
-            guard Int64(cibs.count) == manager.cibCount else { throw ScanError.malformed("APFS chunk-info block count mismatch.") }
+            guard Int64(cibs.count) == manager.cibCount, Set(cibs).count == cibs.count else {
+                throw ScanError.malformed("APFS chunk-info block list is inconsistent.")
+            }
             return (manager, cibs)
         }
         guard let (manager, cibs) = loaded else {
@@ -232,7 +260,8 @@ actor APFSContainer {
         freeQueue = []
         guard manager.mainFreeQueueCount > 0 else { return }
         guard let root = checkpointMappings[manager.mainFreeQueueTreeOID] else { return }
-        let tree = APFSTree(root: root, kind: .ephemeral(checkpointMappings), compare: compareAPFSPairKeys)
+        let tree = APFSTree(root: root, rootReference: APFSObjectReference(oid: manager.mainFreeQueueTreeOID, xid: nil),
+                            kind: .ephemeral(checkpointMappings), compare: compareAPFSPairKeys)
         let ranges: [APFSFreeRange]? = try await attempt {
             var result: [APFSFreeRange] = []
             var cursor = try await self.seek(nil, in: tree)
@@ -258,17 +287,23 @@ actor APFSContainer {
 
     /// Verifies an object map and its tree root, returning the root node's address.
     func objectMapTree(at address: Int64) async throws -> Int64 {
+        try await objectMap(at: address).treeAddress
+    }
+
+    /// Verifies an object map (a physical object, so its identifier is its address) and its tree root.
+    func objectMap(at address: Int64) async throws -> APFSObjectMap {
         let omap = try APFSObjectMap(try await object(at: address))
-        let root = try await node(at: omap.treeAddress, inheritedInfo: nil)
+        guard omap.header.oid == UInt64(address) else { throw ScanError.malformed("APFS object map at block \(address) doesn't match its reference.") }
+        let root = try await node(at: omap.treeAddress, expecting: .physical(omap.treeAddress), inheritedInfo: nil)
         guard root.isRoot, root.header.subtype == APFS.ObjectType.omap else { throw ScanError.malformed("APFS object map tree is invalid.") }
-        return omap.treeAddress
+        return omap
     }
 
     /// The mapping for `oid` with the greatest transaction not after `xid`.
     func omapLookup(oid: UInt64, xid: UInt64, tree: Int64) async throws -> APFSObjectMapEntry? {
         var key = Data(count: 16)
         for index in 0..<8 { key[index] = UInt8(truncatingIfNeeded: oid >> (index * 8)); key[8 + index] = UInt8(truncatingIfNeeded: xid >> (index * 8)) }
-        let omapTree = APFSTree(root: tree, kind: .physical, compare: compareAPFSPairKeys)
+        let omapTree = APFSTree(root: tree, rootReference: .physical(tree), kind: .physical, compare: compareAPFSPairKeys)
         guard let record = try await floorRecord(key, in: omapTree), record.key.count == 16, record.value.count >= 16,
               try record.key.number(0, 8) == oid else { return nil }
         let entry = APFSObjectMapEntry(xid: try record.key.number(8, 8), flags: UInt32(try record.value.number(0, 4)),
@@ -280,26 +315,37 @@ actor APFSContainer {
         guard let entry = try await omapLookup(oid: fsOID, xid: xid, tree: omapTree) else { return nil }
         guard entry.flags & (APFS.omapValueEncrypted | APFS.omapValueNoHeader) == 0 else { throw ScanError.unsupportedFilesystem }
         let volume = try APFSVolumeSuperblock(try await object(at: entry.address))
-        guard volume.header.oid == fsOID, volume.header.xid <= xid else { throw ScanError.malformed("APFS volume superblock doesn't match its object-map entry.") }
+        guard volume.header.oid == fsOID, volume.header.xid == entry.xid else { throw ScanError.malformed("APFS volume superblock doesn't match its object-map entry.") }
         return volume
     }
 
     /// Resolves a volume's object map and root tree at `xid`.
     func volumeContext(_ volume: APFSVolumeSuperblock, xid: UInt64) async throws -> APFSVolumeContext {
-        let omapTree = try await objectMapTree(at: volume.omapAddress)
-        return try await volumeContext(volume, xid: xid, omapTree: omapTree)
+        let omap = try await objectMap(at: volume.omapAddress)
+        let converting = omap.flags & (APFS.omapEncrypting | APFS.omapDecrypting) != 0
+        return try await volumeContext(volume, xid: xid, omapTree: omap.treeAddress, converting: converting)
     }
 
-    func volumeContext(_ volume: APFSVolumeSuperblock, xid: UInt64, omapTree: Int64) async throws -> APFSVolumeContext {
+    /// `converting` is the object map's encrypting/decrypting state (see `content(of:…)`).
+    func volumeContext(_ volume: APFSVolumeSuperblock, xid: UInt64, omapTree: Int64, converting: Bool) async throws -> APFSVolumeContext {
         guard let entry = try await omapLookup(oid: volume.rootTreeOID, xid: xid, tree: omapTree) else {
             throw ScanError.malformed("APFS root tree is missing from the volume's object map.")
         }
-        guard entry.flags & (APFS.omapValueEncrypted | APFS.omapValueNoHeader) == 0 else { throw ScanError.unsupportedFilesystem }
-        let root = try await node(at: entry.address, inheritedInfo: nil)
+        try checkEntryIsReadable(entry)
+        let reference = APFSObjectReference(oid: volume.rootTreeOID, xid: entry.xid)
+        let root = try await node(at: entry.address, expecting: reference, inheritedInfo: nil)
         guard root.isRoot, root.header.subtype == APFS.ObjectType.fsTree else { throw ScanError.malformed("APFS root tree is invalid.") }
         let compare = makeAPFSRecordKeyComparator(hashedDirectoryKeys: volume.hashedDirectoryKeys)
-        return APFSVolumeContext(superblock: volume, xid: xid, omapTree: omapTree, root: entry.address,
-                                 tree: APFSTree(root: entry.address, kind: .virtual(omapTree: omapTree, xid: xid), compare: compare))
+        return APFSVolumeContext(superblock: volume, xid: xid, omapTree: omapTree, root: entry.address, converting: converting,
+                                 tree: APFSTree(root: entry.address, rootReference: reference,
+                                                kind: .virtual(omapTree: omapTree, xid: xid), compare: compare))
+    }
+
+    /// An object-map entry flagged encrypted names a block of ciphertext in a container; on a bare
+    /// volume device (already unlocked) that flag is the normal case and the block reads as plaintext.
+    func checkEntryIsReadable(_ entry: APFSObjectMapEntry) throws {
+        guard entry.flags & APFS.omapValueNoHeader == 0 else { throw ScanError.unsupportedFilesystem }
+        guard isBareVolume || entry.flags & APFS.omapValueEncrypted == 0 else { throw ScanError.unsupportedFilesystem }
     }
 
     // MARK: - B-tree access
@@ -319,32 +365,44 @@ actor APFSContainer {
         deletedWorkRemaining -= units
     }
 
-    func node(at address: Int64, inheritedInfo: APFSBTreeInfo?) async throws -> APFSBTreeNode {
+    /// The node at `address`, which must be the object `reference` names: a block that checksums
+    /// but carries another identifier or transaction was reused and is never read as this node.
+    func node(at address: Int64, expecting reference: APFSObjectReference, inheritedInfo: APFSBTreeInfo?) async throws -> APFSBTreeNode {
         try charge()
-        if let cached = nodeCache[address] { return cached }
-        let node = try APFSBTreeNode(try await object(at: address), address: address, inheritedInfo: inheritedInfo)
-        if nodeCache.count >= Self.nodeCacheLimit { nodeCache.removeAll(keepingCapacity: true) }
-        nodeCache[address] = node
+        let node: APFSBTreeNode
+        if let cached = nodeCache[address] {
+            node = cached
+        } else {
+            node = try APFSBTreeNode(try await object(at: address), address: address, inheritedInfo: inheritedInfo)
+            if nodeCache.count >= Self.nodeCacheLimit { nodeCache.removeAll(keepingCapacity: true) }
+            nodeCache[address] = node
+        }
+        guard reference.matches(node.header) else {
+            throw ScanError.malformed("APFS B-tree node at block \(address) doesn't match its reference.")
+        }
         return node
     }
 
     func child(of parent: APFSBTreeNode, index: Int, in tree: APFSTree, rootInfo: APFSBTreeInfo?) async throws -> APFSBTreeNode {
         let identifier = try parent.childIdentifier(index)
-        let address: Int64
+        let address: Int64, reference: APFSObjectReference
         switch tree.kind {
         case .physical:
             address = try signed(identifier)
+            reference = .physical(address)
         case .virtual(let omapTree, let xid):
             guard let entry = try await omapLookup(oid: identifier, xid: xid, tree: omapTree) else {
                 throw ScanError.malformed("APFS B-tree node \(identifier) is missing from the object map.")
             }
-            guard entry.flags & (APFS.omapValueEncrypted | APFS.omapValueNoHeader) == 0 else { throw ScanError.unsupportedFilesystem }
+            try checkEntryIsReadable(entry)
             address = entry.address
+            reference = APFSObjectReference(oid: identifier, xid: entry.xid)
         case .ephemeral(let mappings):
             guard let mapped = mappings[identifier] else { throw ScanError.malformed("APFS ephemeral node \(identifier) isn't in the checkpoint maps.") }
             address = mapped
+            reference = APFSObjectReference(oid: identifier, xid: nil)
         }
-        let child = try await node(at: address, inheritedInfo: rootInfo)
+        let child = try await node(at: address, expecting: reference, inheritedInfo: rootInfo)
         // Levels strictly decrease toward the leaves, so no path can revisit a node.
         guard child.level == parent.level - 1, child.header.subtype == parent.header.subtype, !child.isRoot else {
             throw ScanError.malformed("APFS B-tree structure is inconsistent.")
@@ -364,7 +422,7 @@ actor APFSContainer {
 
     /// The record with the greatest key not greater than `key`, if any.
     func floorRecord(_ key: Data, in tree: APFSTree) async throws -> APFSRecord? {
-        var current = try await node(at: tree.root, inheritedInfo: nil)
+        var current = try await node(at: tree.root, expecting: tree.rootReference, inheritedInfo: nil)
         guard current.isRoot else { throw ScanError.malformed("APFS B-tree root isn't a root node.") }
         let info = current.info
         for _ in 0...APFS.maxTreeDepth {
@@ -383,7 +441,7 @@ actor APFSContainer {
     /// nil or below every key). Callers skip records before their range.
     func seek(_ key: Data?, in tree: APFSTree) async throws -> APFSTreeCursor {
         var cursor = APFSTreeCursor()
-        var current = try await node(at: tree.root, inheritedInfo: nil)
+        var current = try await node(at: tree.root, expecting: tree.rootReference, inheritedInfo: nil)
         guard current.isRoot else { throw ScanError.malformed("APFS B-tree root isn't a root node.") }
         let info = current.info
         for _ in 0...APFS.maxTreeDepth {
@@ -480,7 +538,7 @@ actor APFSContainer {
         guard let name = inode.name else { throw ScanError.malformed("APFS inode \(group.id) has no name.") }
         guard let directory = try await path(of: inode.parentID, in: context, index: liveDirectories, fallback: nil) else { return }
         let extents = try await extents(for: inode, group: group, in: context)
-        guard let content = try content(of: inode, extents: extents, deleted: false) else { return }
+        guard let content = try content(of: inode, extents: extents, deleted: false, converting: context.converting) else { return }
         try await emit(.found(file(name: name, path: directory + "/" + name, inode: inode, id: group.id,
                                    record: record, content: content, deleted: false)))
     }
@@ -552,11 +610,25 @@ actor APFSContainer {
 
     /// Device-absolute runs for the file's bytes. A live file's invalid extents are `malformed`;
     /// a deleted candidate's return nil (skip). Compressed files are left unmapped for now.
-    func content(of inode: APFSInode, extents: [APFSFileExtent]?, deleted: Bool) throws -> FileContent? {
-        if inode.isCompressed { return deleted ? nil : .unmapped }
+    ///
+    /// Bytes that may be ciphertext are never mapped: a live file is `.unmapped` (a deleted one is
+    /// skipped) when the volume's object map is mid-encryption or mid-decryption (`converting`:
+    /// either kind of block may be on disk, and nothing per extent says which), or, in a container,
+    /// when any extent has a non-zero `crypto_id` (its blocks are encrypted with that key). On a bare
+    /// volume device the platform has already unlocked the volume, so a `crypto_id` is expected
+    /// there and only `converting` applies.
+    ///
+    /// Holes are only accepted where the format declares them: an inode marked sparse, or an
+    /// extent with `phys_block_num == 0`. A gap or short tail in a non-sparse live file means the
+    /// extent list is incomplete, so its content is `.unmapped` rather than zero-filled.
+    func content(of inode: APFSInode, extents: [APFSFileExtent]?, deleted: Bool, converting: Bool) throws -> FileContent? {
+        let unmapped: FileContent? = deleted ? nil : .unmapped
+        if inode.isCompressed { return unmapped }
         let size = try signed(inode.size)
         if size == 0 { return .runs([]) }
-        guard let extents, inode.dataStream != nil else { return deleted ? nil : .unmapped }
+        guard let extents, inode.dataStream != nil else { return unmapped }
+        if converting { return unmapped }
+        if !isBareVolume, extents.contains(where: { $0.cryptoID != 0 }) { return unmapped }
         var runs: [DataRun] = [], cursor: Int64 = 0
         for extent in extents {
             let logical = try signed(extent.logicalAddress), length = try signed(extent.length), block = try signed(extent.physicalBlock)
@@ -566,8 +638,7 @@ actor APFSContainer {
                 throw ScanError.malformed("APFS file extent is invalid.")
             }
             if logical > cursor {
-                // An unwritten region reads as zeros; for a deleted file only a sparse inode may have one.
-                if deleted, !inode.isSparse { return nil }
+                guard inode.isSparse else { return unmapped }
                 runs.append(DataRun(deviceOffset: nil, length: logical - cursor))
             }
             let mapped = min(length, size - logical)
@@ -585,7 +656,7 @@ actor APFSContainer {
             cursor = try checkedAdd(logical, length)
         }
         if cursor < size {
-            if deleted, !inode.isSparse { return nil }
+            guard inode.isSparse else { return unmapped }
             runs.append(DataRun(deviceOffset: nil, length: size - cursor))
         }
         return .runs(Self.coalesce(runs))
@@ -625,41 +696,42 @@ actor APFSContainer {
 
     // MARK: - Deleted files
 
-    /// Files present in an older checkpoint or a snapshot but absent from the live tree, emitted
-    /// only when every block they need is provably not in use (free in the bitmaps, or pending in
-    /// the free queue since no earlier than the candidate's transaction).
-    func recoverDeletedFiles(in live: APFSVolumeContext, fsOID: UInt64, older: [APFSContainerSuperblock], liveNodes: Int) async throws {
+    /// Collects the volume's files present in an older checkpoint or a snapshot but absent from the
+    /// live tree. Nothing is emitted here: `emitDeletedCandidates` runs once for the container.
+    func collectDeletedCandidates(in live: APFSVolumeContext, volume: Int, fsOID: UInt64,
+                                  older: [APFSContainerSuperblock], liveNodes: Int) async throws {
         guard spaceman != nil else { return }
         deletedWorkRemaining = deletedWorkOverride ?? (100_000 + 4 * Int64(liveNodes))
-        deletedCandidates = []; candidateIDs = []
+        candidateIDs = []
         spending = true
-        defer { spending = false }
+        defer { spending = false; volumeBudgets[volume] = deletedWorkRemaining; candidateIDs = [] }
         do {
             for superblock in older.prefix(Self.maxOlderCheckpoints) {
                 try Task.checkCancellation()
-                _ = try await attempt { try await self.collectCandidates(fromCheckpoint: superblock, fsOID: fsOID, live: live) }
+                _ = try await attempt { try await self.collectCandidates(fromCheckpoint: superblock, fsOID: fsOID, live: live, volume: volume) }
             }
-            try await collectCandidatesFromSnapshots(live)
-            try await emitDeletedCandidates()
+            try await collectCandidatesFromSnapshots(live, volume: volume)
         } catch is APFSBudgetExhausted {
-            // The volume's budget is spent; whatever was emitted so far stands.
+            // The volume's budget is spent. What was collected still takes part in overlap checks,
+            // but with no budget left none of it is emitted.
+            deletedWorkRemaining = 0
         }
-        deletedCandidates = []; candidateIDs = []
     }
 
-    func collectCandidates(fromCheckpoint superblock: APFSContainerSuperblock, fsOID: UInt64, live: APFSVolumeContext) async throws {
+    func collectCandidates(fromCheckpoint superblock: APFSContainerSuperblock, fsOID: UInt64, live: APFSVolumeContext, volume index: Int) async throws {
         let omapTree = try await objectMapTree(at: superblock.omapAddress)
         guard let volume = try await volumeSuperblock(fsOID: fsOID, omapTree: omapTree, xid: superblock.header.xid),
               volume.uuid == live.superblock.uuid, !volume.isEncrypted else { return }
         let context = try await volumeContext(volume, xid: superblock.header.xid)
         // An unchanged root means an identical tree.
         guard context.root != live.root else { return }
-        try await collectCandidates(from: context, live: live)
+        try await collectCandidates(from: context, live: live, volume: index)
     }
 
-    func collectCandidatesFromSnapshots(_ live: APFSVolumeContext) async throws {
+    func collectCandidatesFromSnapshots(_ live: APFSVolumeContext, volume index: Int) async throws {
         guard live.superblock.snapMetaTreeAddress > 0 else { return }
-        let tree = APFSTree(root: live.superblock.snapMetaTreeAddress, kind: .physical, compare: live.tree.compare)
+        let tree = APFSTree(root: live.superblock.snapMetaTreeAddress, rootReference: .physical(live.superblock.snapMetaTreeAddress),
+                            kind: .physical, compare: live.tree.compare)
         let snapshots: [APFSSnapshot]? = try await attempt {
             var result: [APFSSnapshot] = []
             var cursor = try await self.seek(nil, in: tree)
@@ -676,31 +748,32 @@ actor APFSContainer {
                 let volume = try APFSVolumeSuperblock(try await self.object(at: snapshot.superblockAddress))
                 guard volume.uuid == live.superblock.uuid, !volume.isEncrypted, volume.header.xid <= snapshot.xid else { return }
                 // The snapshot's trees resolve through the current object map at the snapshot's transaction.
-                let context = try await self.volumeContext(volume, xid: snapshot.xid, omapTree: live.omapTree)
+                let context = try await self.volumeContext(volume, xid: snapshot.xid, omapTree: live.omapTree, converting: live.converting)
                 guard context.root != live.root else { return }
-                try await self.collectCandidates(from: context, live: live)
+                try await self.collectCandidates(from: context, live: live, volume: index)
             }
         }
     }
 
-    func collectCandidates(from old: APFSVolumeContext, live: APFSVolumeContext) async throws {
+    func collectCandidates(from old: APFSVolumeContext, live: APFSVolumeContext, volume: Int) async throws {
         let directories = APFSDirectoryIndex()
         var cursor = try await seek(nil, in: old.tree)
         var group: APFSRecordGroup?
         while let record = try await next(&cursor, in: old.tree) {
             let key = try APFSRecordKey(record.key)
             if let current = group, current.id != key.objectID {
-                try await considerCandidate(current, old: old, live: live, directories: directories)
+                try await considerCandidate(current, old: old, live: live, directories: directories, volume: volume)
                 group = nil
             }
             var current = group ?? APFSRecordGroup(id: key.objectID)
             try Self.accumulate(record, key, into: &current, strict: false)
             group = current
         }
-        if let current = group { try await considerCandidate(current, old: old, live: live, directories: directories) }
+        if let current = group { try await considerCandidate(current, old: old, live: live, directories: directories, volume: volume) }
     }
 
-    func considerCandidate(_ group: APFSRecordGroup, old: APFSVolumeContext, live: APFSVolumeContext, directories: APFSDirectoryIndex) async throws {
+    func considerCandidate(_ group: APFSRecordGroup, old: APFSVolumeContext, live: APFSVolumeContext,
+                           directories: APFSDirectoryIndex, volume: Int) async throws {
         guard let inode = group.inode, let record = group.record, inode.isRegularFile, group.id >= APFS.minUserInodeID,
               !inode.isCompressed, let name = inode.name, !candidateIDs.contains(group.id),
               deletedCandidates.count < Self.maxDeletedCandidates else { return }
@@ -709,25 +782,32 @@ actor APFSContainer {
         guard let extents = try await extents(for: inode, group: group, in: old) else { return }
         guard let directory = try await path(of: inode.parentID, in: old, index: directories, fallback: live) else { return }
         candidateIDs.insert(group.id)
-        deletedCandidates.append(APFSDeletedCandidate(id: group.id, inode: inode, record: record, name: name,
-                                                      path: directory + "/" + name, extents: extents, xid: old.xid))
+        deletedCandidates.append(APFSDeletedCandidate(id: group.id, volume: volume, inode: inode, record: record, name: name,
+                                                      path: directory + "/" + name, extents: extents, xid: old.xid,
+                                                      converting: old.converting || live.converting))
     }
 
+    /// Emits every candidate, from every volume, whose blocks are all provably still the
+    /// candidate's (see `blocksAreFree`) and which no other candidate claims.
     func emitDeletedCandidates() async throws {
         struct Claim { let start: Int64; let end: Int64; let owner: Int }
         var contents: [FileContent?] = [], claims: [Claim] = []
         for (owner, candidate) in deletedCandidates.enumerated() {
-            let content = try content(of: candidate.inode, extents: candidate.extents, deleted: true)
+            let content = try await attempt {
+                try self.content(of: candidate.inode, extents: candidate.extents, deleted: true, converting: candidate.converting)
+            } ?? nil
             contents.append(content)
             guard content != nil else { continue }
             let size = try signed(candidate.inode.size)
             for extent in candidate.extents where extent.logicalAddress < UInt64(size) {
+                // `content` has validated each extent: block-aligned, non-zero, inside the container.
                 let start = try signed(extent.physicalBlock)
-                let needed = (min(try signed(extent.length), size - Int64(extent.logicalAddress)) + blockSize - 1) / blockSize
-                claims.append(Claim(start: start, end: start + needed, owner: owner))
+                let needed = (try checkedAdd(min(try signed(extent.length), size - Int64(extent.logicalAddress)), blockSize - 1)) / blockSize
+                claims.append(Claim(start: start, end: try checkedAdd(start, needed), owner: owner))
             }
         }
-        // Two candidates claiming the same blocks can't both be right; neither is emitted.
+        // Two candidates claiming the same blocks can't both be right; neither is emitted. Claims
+        // come from every volume, since volumes share the container's blocks.
         var overlapping: Set<Int> = [], furthest: Claim?
         for claim in claims.sorted(by: { $0.start < $1.start }) {
             if let reach = furthest, claim.start < reach.end, claim.owner != reach.owner {
@@ -735,10 +815,18 @@ actor APFSContainer {
             }
             if furthest.map({ claim.end > $0.end }) ?? true { furthest = claim }
         }
+        spending = true
+        defer { spending = false }
         for (owner, candidate) in deletedCandidates.enumerated() where !overlapping.contains(owner) {
-            guard let content = contents[owner] else { continue }
+            guard let content = contents[owner], let budget = volumeBudgets[candidate.volume], budget > 0 else { continue }
             let ranges = claims.filter { $0.owner == owner }.map { ($0.start, $0.end) }
-            guard try await blocksAreFree(ranges, since: candidate.xid) else { continue }
+            deletedWorkRemaining = budget
+            let free: Bool
+            do { free = try await blocksAreFree(ranges, since: candidate.xid) } catch is APFSBudgetExhausted {
+                deletedWorkRemaining = 0; free = false
+            }
+            volumeBudgets[candidate.volume] = deletedWorkRemaining
+            guard free else { continue }
             try await emit(.found(file(name: candidate.name, path: candidate.path, inode: candidate.inode, id: candidate.id,
                                        record: candidate.record, content: content, deleted: true)))
         }
@@ -746,7 +834,15 @@ actor APFSContainer {
 
     // MARK: - Space manager
 
-    /// Whether every block in `ranges` is provably not in use at the current checkpoint.
+    /// Whether every block in `ranges` is provably still the candidate's at the current checkpoint.
+    ///
+    /// A block qualifies only while its free is still pending: it is in the main free queue with a
+    /// freeing transaction after the candidate's checkpoint (`xid`) and no later than the current
+    /// one, and its bitmap bit is still set. APFS keeps a freed block allocated until the free is
+    /// processed, so a set bit plus a queue entry means the block hasn't been handed out since the
+    /// free. A clear bit proves nothing: the block may have been reallocated (to a metadata node or
+    /// another file) and freed again since the candidate's checkpoint, so it is rejected. This
+    /// deliberately under-recovers: a file whose frees have already been processed isn't emitted.
     func blocksAreFree(_ ranges: [(Int64, Int64)], since xid: UInt64) async throws -> Bool {
         guard let manager = spaceman else { return false }
         for (start, end) in ranges {
@@ -757,9 +853,10 @@ actor APFSContainer {
                 let chunkEnd = min(end, (chunk + 1) * manager.blocksPerChunk)
                 try spend((chunkEnd - block) / 64 + 1)
                 guard let info = try await chunkInfo(chunk), info.address == chunk * manager.blocksPerChunk,
-                      info.blockCount > 0, info.blockCount <= manager.blocksPerChunk, info.freeCount <= info.blockCount,
-                      chunkEnd - info.address <= info.blockCount else { return false }
-                if info.freeCount == info.blockCount { block = chunkEnd; continue }
+                      info.blockCount > 0, info.blockCount <= manager.blocksPerChunk, info.freeCount >= 0,
+                      info.freeCount <= info.blockCount, chunkEnd - info.address <= info.blockCount else { return false }
+                // A wholly free chunk has every bit clear.
+                guard info.freeCount < info.blockCount else { return false }
                 var bitmap: Data?
                 if info.freeCount > 0 {
                     guard info.bitmapAddress > 0, let page = try await attempt({ try await self.bitmapBlock(info.bitmapAddress) }) else { return false }
@@ -767,8 +864,9 @@ actor APFSContainer {
                 }
                 while block < chunkEnd {
                     let bit = Int(block - info.address)
-                    let used = bitmap.map { ($0[bit / 8] >> (bit % 8)) & 1 == 1 } ?? true
-                    if used, !isPendingFree(block, since: xid) { return false }
+                    // No bitmap is needed for a chunk with no free blocks: every bit is set.
+                    let allocated = bitmap.map { ($0[bit / 8] >> (bit % 8)) & 1 == 1 } ?? true
+                    guard allocated, isPendingFree(block, since: xid) else { return false }
                     block += 1
                 }
             }
@@ -804,8 +902,9 @@ actor APFSContainer {
         return page
     }
 
-    /// Whether the main free queue holds `block`, freed no earlier than `xid` (a block freed before
-    /// the candidate's checkpoint can't have been the candidate's).
+    /// Whether the main free queue holds `block`, freed after the candidate's checkpoint `xid` (a
+    /// block freed in or before that transaction can't have been the candidate's) and no later
+    /// than the current checkpoint (a later transaction isn't part of the state being read).
     func isPendingFree(_ block: Int64, since xid: UInt64) -> Bool {
         var low = 0, high = freeQueue.count
         while low < high {
@@ -814,7 +913,7 @@ actor APFSContainer {
         }
         guard low > 0 else { return false }
         let range = freeQueue[low - 1]
-        return block < range.end && range.xid >= xid
+        return block < range.end && range.xid > xid && range.xid <= currentXID
     }
 }
 
@@ -824,6 +923,8 @@ struct APFSVolumeContext: Sendable {
     let xid: UInt64
     let omapTree: Int64
     let root: Int64
+    /// The object map has `OMAP_ENCRYPTING` or `OMAP_DECRYPTING` set: blocks may be ciphertext.
+    let converting: Bool
     let tree: APFSTree
 }
 
@@ -848,12 +949,15 @@ struct APFSRecordGroup {
 
 struct APFSDeletedCandidate: Sendable {
     let id: UInt64
+    /// Index of the volume in `nx_fs_oid`, for its budget.
+    let volume: Int
     let inode: APFSInode
     let record: APFSRecord
     let name: String
     let path: String
     let extents: [APFSFileExtent]
     let xid: UInt64
+    let converting: Bool
 }
 
 struct APFSFreeRange: Sendable { let start: Int64; let end: Int64; let xid: UInt64 }
