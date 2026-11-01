@@ -233,7 +233,10 @@ struct RecoveryEngine: Sendable {
         }
         // Makes the staged files durable and publishes them. Also runs after a cancel: every
         // staged file is complete, so it is kept like any file finished before the cancel.
+        // Staged files count as finished here, once their outcome is known (as a failed copy
+        // always counted), so `filesFinished` is always `written + failed`.
         func commitBatch() {
+            guard !batch.isEmpty else { return }
             for (staged, outcome) in commit(batch) {
                 switch outcome {
                 case .success(let copy): written.append((staged.index, copy))
@@ -242,14 +245,15 @@ struct RecoveryEngine: Sendable {
                     failed.append((staged.index, failure(staged.file, reason)))
                 }
             }
+            state.filesFinished += batch.count
             batch = []; batchBytes = 0; stagedFolders = []
+            progress(state)
         }
 
         for (index, file) in files.enumerated() {
             if Task.isCancelled { cancelled = true; break }
             state.currentName = file.name
             progress(state)
-            let baseBytes = state.bytesDone
             // A folder resolved now inside a folder that holds staged files could take the name
             // one of them is about to be published under (or push it to " (2)"). Publish them
             // first, so every name comes out as if each file were published as soon as written.
@@ -259,6 +263,8 @@ struct RecoveryEngine: Sendable {
                 logical += "/" + component
                 if directoryNames[logical] == nil, stagedFolders.contains(parent) { commitBatch(); break }
             }
+            // After that commit: a failed flush there takes its files' bytes back out.
+            let baseBytes = state.bytesDone
             let root = Root(fd: rootFD, id: rootID, path: rootPath)
             let outcome = await stage(file, index: index, root: root, directoryNames: &directoryNames) { done in
                 var update = state
@@ -276,10 +282,10 @@ struct RecoveryEngine: Sendable {
             case .failure(let reason):
                 state.bytesDone = baseBytes
                 failed.append((index, failure(file, reason)))
+                state.filesFinished += 1
             }
             if cancelled { break }
             if batch.count >= Self.publishBatchFiles || batchBytes >= Self.publishBatchBytes { commitBatch() }
-            state.filesFinished += 1
             progress(state)
         }
         commitBatch()

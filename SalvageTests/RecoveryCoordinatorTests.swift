@@ -388,6 +388,22 @@ struct RecoveryCoordinatorTests {
         #expect(!TempDir.regularFiles(under: base).contains { $0.hasSuffix(".partial") })
     }
 
+    /// A flush that fails when a new folder forces the staged files out takes their bytes and
+    /// their count back: progress always matches what was written and what failed.
+    @Test func progressAfterAFailedFolderTriggeredFlushCountsOnlyWhatHappened() async throws {
+        let dir = try TempDir()
+        let calls = Counter()
+        let files = [file("/b", size: 1, content: .resident(Data("f".utf8))),        // staged in the root...
+                     file("/b/c.txt", size: 2, content: .resident(Data("dd".utf8)))] // ...then a folder beside it
+        let coordinator = await recover(files, reader: MemoryReader(bytes: Data()), into: dir.url, sync: { fd in
+            calls.next() == 1 ? EIO : RecoveryEngine.durableSync(fd)
+        })
+        let result = try #require(summary(coordinator))
+        #expect(result.written.map(\.sourcePath) == ["/b/c.txt"] && result.failed.map(\.sourcePath) == ["/b"])
+        #expect(coordinator.progress.bytesDone == 2)
+        #expect(coordinator.progress.filesFinished == 2)
+    }
+
     @Test func aFailedBatchFlushPublishesNoneOfThatBatch() async throws {
         let dir = try TempDir()
         let base = dir.url

@@ -720,3 +720,36 @@ struct SweepReadAheadTests {
         await #expect(throws: ScanError.io("unreadable")) { _ = try await sweep(mapped, chunks: 6, failAt: 3, log: Log()) }
     }
 }
+
+@Suite("Checkpoint position")
+struct CheckpointPositionTests {
+    @Test func sweptBytesCountsEarlierExtentsAndTheSweepOffsetOnly() {
+        let extents = [ScanCheckpoint.Extent(offset: 512, length: 10 << 20), ScanCheckpoint.Extent(offset: 20 << 20, length: 6 << 20)]
+        // bytesScanned runs a read-ahead chunk past the sweep (and counts metadata read beyond it).
+        let point = ScanCheckpoint(deviceSizeBytes: 64 << 20, totalBytes: 16 << 20, extents: extents,
+                                   sweepVolumeIndex: 1, sweepOffset: 2 << 20, bytesScanned: 13 << 20)
+        #expect(point.sweptBytes == 12 << 20)
+        let first = ScanCheckpoint(deviceSizeBytes: 64 << 20, totalBytes: 16 << 20, extents: extents,
+                                   sweepVolumeIndex: 0, sweepOffset: 3 << 20, bytesScanned: 4 << 20)
+        #expect(first.sweptBytes == 3 << 20)
+        let done = ScanCheckpoint(deviceSizeBytes: 64 << 20, totalBytes: 16 << 20, extents: extents,
+                                  sweepVolumeIndex: 1, sweepOffset: 6 << 20, bytesScanned: 16 << 20, carveBackfillOffset: 1 << 20)
+        #expect(done.sweptBytes == 16 << 20)
+    }
+
+    /// A real sweep's checkpoints: the swept position never runs ahead of what was carved, while
+    /// `bytesScanned` may include the chunk read ahead.
+    @Test func sweptBytesOfARealScanIsTheCarvedPosition() async {
+        let (events, eventsIn) = AsyncStream<ScanEvent>.makeStream()
+        let (points, pointsIn) = AsyncStream<ScanCheckpoint>.makeStream()
+        await ScanSession(reader: ImageReader(data: fatImage())).run(events: eventsIn, checkpoints: pointsIn)
+        var seen: [ScanCheckpoint] = []
+        for await point in points { seen.append(point) }
+        for await _ in events {}
+        #expect(!seen.isEmpty)
+        for (index, point) in seen.enumerated() {
+            #expect(point.sweptBytes == Int64(index + 1) * ScanSession.sweepChunkBytes || point.sweptBytes == point.totalBytes)
+            #expect(point.sweptBytes <= point.bytesScanned)
+        }
+    }
+}
