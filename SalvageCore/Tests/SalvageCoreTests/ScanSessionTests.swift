@@ -659,3 +659,64 @@ struct PendingFormatDetectionTests {
         }
     }
 }
+
+/// The sweep reads the next chunk while the carver works on the current one (scale pass).
+@Suite("Sweep read-ahead")
+struct SweepReadAheadTests {
+    /// What the sweep did, in order, with the reads in flight at each point.
+    final class Log: @unchecked Sendable {
+        private let lock = NSLock()
+        private var entries: [String] = []
+        private var inFlight = 0
+        private(set) var maxInFlight = 0
+        var events: [String] { lock.withLock { entries } }
+        func add(_ entry: String) { lock.withLock { entries.append(entry) } }
+        func readStarted(_ index: Int64) {
+            lock.withLock { inFlight += 1; maxInFlight = max(maxInFlight, inFlight); entries.append("read \(index)") }
+        }
+        func readEnded() { lock.withLock { inFlight -= 1 } }
+    }
+
+    static let chunk = ScanSession.sweepChunkBytes
+
+    func sweep(_ extent: VolumeExtent, chunks: Int64, failAt: Int64? = nil, log: Log) async throws -> [Int64] {
+        var handled: [Int64] = []
+        try await ScanSession.sweep(extent, from: 0, to: chunks * Self.chunk, pauseGate: nil, read: { offset, count in
+            let index = (offset - extent.offset) / Self.chunk
+            log.readStarted(index)
+            defer { log.readEnded() }
+            if index == failAt { throw ScanError.io("unreadable") }
+            return Data(count: count)
+        }) { _, deviceOffset, next in
+            let index = (deviceOffset - extent.offset) / Self.chunk
+            log.add("carve \(index)")
+            // Long enough for the next chunk's read to start meanwhile.
+            try await Task.sleep(for: .milliseconds(20))
+            log.add("carved \(index)")
+            handled.append(next)
+        }
+        return handled
+    }
+
+    @Test func nextChunkIsReadWhileTheCurrentOneIsCarved() async throws {
+        let log = Log()
+        let handled = try await sweep(VolumeExtent(offset: 4096, length: 4 * Self.chunk, format: .raw), chunks: 4, log: log)
+        #expect(handled == (1...4).map { $0 * Self.chunk })
+        let events = log.events
+        for index in 0..<3 {
+            let read = try #require(events.firstIndex(of: "read \(index + 1)"))
+            #expect(read > events.firstIndex(of: "carve \(index)")! && read < events.firstIndex(of: "carved \(index)")!,
+                    "chunk \(index + 1) is read while chunk \(index) is carved")
+        }
+        #expect(events.filter { $0.hasPrefix("read") } == (0..<4).map { "read \($0)" }, "reads stay sequential, each once")
+        #expect(log.maxInFlight == 1)
+    }
+
+    @Test func unreadableSpotEndsALostExtentAfterTheChunksBeforeIt() async throws {
+        let lost = VolumeExtent(offset: 0, length: 6 * Self.chunk, format: .fat, isLost: true)
+        let handled = try await sweep(lost, chunks: 6, failAt: 3, log: Log())
+        #expect(handled == (1...3).map { $0 * Self.chunk })
+        let mapped = VolumeExtent(offset: 0, length: 6 * Self.chunk, format: .fat)
+        await #expect(throws: ScanError.io("unreadable")) { _ = try await sweep(mapped, chunks: 6, failAt: 3, log: Log()) }
+    }
+}
