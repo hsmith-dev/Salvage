@@ -6,8 +6,9 @@
   "header": "FFFB",
   "alternateHeaders": ["FFFA", "FFF3", "FFF2", "FFE3", "FFE2"],
   "validate": "mpegFrames",
+  "structure": "mp3",
   "cutsOthers": false,
   "embeds": ["mp3"],
   "maxBytes": 67108864,
-  "notes": "Untagged MPEG-1/2/2.5 Layer III. The mpegFrames check parses the frame header (version, layer, bitrate, sample rate, padding) and requires a second valid, consistent frame header exactly one frame later. A frame sync is a weak header: it never ends a carve that still has an end rule to find."
+  "notes": "Untagged MPEG-1/2/2.5 Layer III. The mpegFrames check parses the frame header (version, layer, bitrate, sample rate, padding) and requires a second valid, consistent frame header exactly one frame later. A frame sync is a weak header: it never ends a carve that still has an end rule to find. The mp3 walker follows the frames to the end of the stream and an optional APEv2/ID3v1 trailer."
 }

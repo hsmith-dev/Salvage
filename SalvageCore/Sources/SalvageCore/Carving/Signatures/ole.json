@@ -4,6 +4,7 @@
   "extension": "doc",
   "category": "documents",
   "header": "D0CF11E0A1B11AE1",
+  "structure": "ole2",
   "maxBytes": 268435456,
-  "notes": "OLE2 compound document (Office 97-2003 .doc/.xls/.ppt, .msg). The total size needs the sector allocation table, so the carve runs to the next header or maxBytes and is partial."
+  "notes": "OLE2 compound document (Office 97-2003 .doc/.xls/.ppt, .msg). The ole2 walker reads the header, DIFAT, FAT and first directory sector as the sweep passes them, validates every chain, and ends the file after the highest allocated sector."
 }

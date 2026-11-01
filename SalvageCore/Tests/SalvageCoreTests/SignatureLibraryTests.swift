@@ -23,7 +23,11 @@ struct SignatureLibraryTests {
             #expect(signature.headerReach <= FileSignature.maxReach && signature.footerReach <= FileSignature.maxReach, Comment(rawValue: signature.id))
             #expect(signature.maxBytes ?? 1 > 0, Comment(rawValue: signature.id))
         }
-        #expect(library.signatures.filter { !$0.hasKnownEnd }.map(\.id).sorted() == ["gzip", "mp3", "mp3", "ole", "rar5"])
+        #expect(library.signatures.filter { !$0.hasKnownEnd }.map(\.id).sorted() == ["rar5"])
+        #expect(library.signatures.filter { $0.structure == .mp3 }.count == 2)
+        #expect(library.signatures.first { $0.id == "ole" }?.structure == .ole2)
+        #expect(library.signatures.first { $0.id == "ole" }?.headerReach == 512)
+        #expect(library.signatures.first { $0.id == "gzip" }?.structure == .gzip)
         // Review fixes: weak headers, embedding, structural checks and trusted sizes.
         #expect(library.signatures.filter { !$0.cutsOthers }.map(\.id).sorted() == ["gzip", "mp3"])
         #expect(library.signatures.first { $0.id == "jpeg" }?.embeds == ["jpeg"])
@@ -47,7 +51,9 @@ struct SignatureLibraryTests {
         #expect(error(with("\"maxBytes\": 68719476737")) == .invalidField("maxBytes", "must be at most 68719476736"))
         #expect(error(with("\"maxBytes\": 68719476736")) == nil)
         #expect(error(with("\"trustedMaxBytes\": 0")) != nil)
-        #expect(error(with("\"structure\": \"png\"")) == .invalidField("structure", "must be 'gif'"))
+        #expect(error(with("\"structure\": \"png\"")) == .invalidField("structure", "must be one of 'gif', 'mp3', 'ole2', 'gzip'"))
+        #expect(error(with("\"structure\": \"gzip\", \"sizeField\": {\"offset\": 0, \"width\": 4}")) != nil)
+        #expect(error(with("\"structure\": \"ole2\"")) == nil)
         #expect(error(with("\"validate\": \"crc\"")) == .invalidField("validate", "must be 'mpegFrames'"))
         #expect(error(with("\"cutsOthers\": \"no\"")) == .invalidField("cutsOthers", "must be true or false"))
         #expect(error(with("\"structure\": \"gif\", \"footer\": \"3B\"")) != nil)

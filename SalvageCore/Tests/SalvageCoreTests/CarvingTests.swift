@@ -110,7 +110,21 @@ func sqliteBytes(pageSize: Int = 1024, pages: Int = 3) -> Data {
     return header + filler(pageSize * pages - header.count)
 }
 
-func gzipBytes(body: Int = 100) -> Data { Data([0x1F, 0x8B, 0x08, 0, 0, 0, 0, 0, 0, 3]) + filler(body) }
+/// A gzip member with stored DEFLATE blocks (at most 65535 bytes each) and a correct trailer.
+func gzipBytes(body: Int = 100, content: Data? = nil) -> Data {
+    let payload = content ?? filler(body)
+    var data = Data([0x1F, 0x8B, 0x08, 0, 0, 0, 0, 0, 0, 3])
+    var offset = 0
+    repeat {
+        let count = min(65535, payload.count - offset)
+        let last = offset + count == payload.count
+        data += Data([last ? 1 : 0]) + le16(count) + le16(count ^ 0xFFFF) + payload.subdata(in: offset..<offset + count)
+        offset += count
+    } while offset < payload.count
+    var crc = CRC32()
+    for byte in payload { crc.update(byte) }
+    return data + le32(Int(crc.value)) + le32(payload.count & 0xFFFF_FFFF)
+}
 
 // MARK: - Harness
 
@@ -243,9 +257,10 @@ struct CarvingTests {
     }
 
     @Test func nextHeaderEndsAnOpenEndedCarve() async throws {
-        let gzip = gzipBytes(body: 100), png = pngBytes()
-        let files = try await carve(device(size: 64 * 1024, [(4096, gzip), (8192, png)]))
-        #expect(files.map(\.name) == ["gzip-000000001000.gz", "png-000000002000.png"])
+        // RAR 5 has no end rule.
+        let rar5 = ascii("Rar!") + Data([0x1A, 0x07, 0x01, 0x00]) + filler(100), png = pngBytes()
+        let files = try await carve(device(size: 64 * 1024, [(4096, rar5), (8192, png)]))
+        #expect(files.map(\.name) == ["rar5-000000001000.rar", "png-000000002000.png"])
         #expect(files[0].bytes == 4096..<8192 && files[0].isPartial && files[0].overwriteConfidence == 0.6)
         #expect(files[1].bytes == 8192..<8192 + png.count && !files[1].isPartial)
     }
@@ -355,7 +370,8 @@ struct CarvingTests {
             (98304, Data([0x1F, 0x8B, 0x08]) + filler(100)),
         ])
         let files = try await carve(image, chunk: 4096)
-        #expect(files.count == 11)
+        // The last one is not a gzip header (FLG reserved bits set), so nothing is carved there.
+        #expect(files.count == 10)
         #expect(files.allSatisfy { $0.recoveryMethod == .carved && $0.recoveryConfidence != .high && $0.recoveryConfidence != nil })
         #expect(files.allSatisfy { $0.path.hasPrefix("/Reconstructed/") && $0.path.hasSuffix("/" + $0.name) })
         #expect(files.allSatisfy { $0.isPartial == ($0.recoveryConfidence == .low) })
@@ -496,10 +512,10 @@ struct CarvingTests {
         for sector in stride(from: 0, to: image.count - 4, by: 2048) { image.replaceSubrange(sector..<sector + 3, with: Data([0xFF, 0xFB, 0x90])) }
         let files = try await carve(image)
         #expect(files.filter { $0.name.hasPrefix("mp3-") }.isEmpty, Comment(rawValue: "\(files.map(\.name))"))
-        // A real untagged stream is still found.
+        // A real untagged stream is still found, and now ends exactly after its last frame.
         let stream = try await carve(device(size: 32 * 1024, [(4096, mp3Frames(10))]))
         #expect(stream.map(\.name) == ["mp3-000000001000.mp3"])
-        #expect(stream.first?.bytes?.lowerBound == 4096 && stream.first?.isPartial == true)
+        #expect(stream.first?.bytes == 4096..<4096 + mp3Frames(10).count && stream.first?.isPartial == false)
     }
 
     @Test func weakHeadersDoNotCutAnArchive() async throws {
@@ -621,5 +637,278 @@ struct CarvingTests {
         #expect(carved.map(\.path) == ["/Reconstructed/Pictures/jpeg-00000004b000.jpg"])
         #expect(carved.first?.bytes == 600 * 512..<600 * 512 + jpeg.count)
         #expect(carved.first?.recoveryConfidence == .medium)
+    }
+}
+
+// MARK: - Exact ends for MP3, OLE2 and gzip
+
+/// A compound file (version 3, 512-byte sectors): the directory in sector 0, one `Data` stream of
+/// `streamBytes` in the sectors after it, then the FAT. `mutate` edits the FAT before it is
+/// written.
+func ole2Bytes(streamBytes: Int = 5000, declaredSize: Int? = nil, mutate: (inout [UInt32]) -> Void = { _ in }) -> Data {
+    let streamSectors = (streamBytes + 511) / 512
+    let fatSector = 1 + streamSectors
+    var fat = [UInt32](repeating: 0xFFFF_FFFF, count: 128)
+    fat[0] = 0xFFFF_FFFE
+    for sector in 1..<fatSector { fat[sector] = sector == fatSector - 1 ? 0xFFFF_FFFE : UInt32(sector + 1) }
+    fat[fatSector] = 0xFFFF_FFFD
+    mutate(&fat)
+
+    var header = Data([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) + Data(repeating: 0, count: 16)
+    header += le16(0x3E) + le16(3) + le16(0xFFFE) + le16(9) + le16(6) + Data(repeating: 0, count: 6)
+    header += le32(0) + le32(1) + le32(0) + le32(0) + le32(4096) + le32(0xFFFF_FFFE) + le32(0) + le32(0xFFFF_FFFE) + le32(0)
+    header += le32(fatSector)
+    for _ in 1..<109 { header += le32(0xFFFF_FFFF) }
+    #expect(header.count == 512)
+
+    func entry(_ name: String, type: UInt8, child: UInt32, start: UInt32, size: Int) -> Data {
+        var nameBytes = Data()
+        for unit in name.utf16 { nameBytes += le16(Int(unit)) }
+        nameBytes += le16(0)
+        var record = nameBytes + Data(repeating: 0, count: 64 - nameBytes.count) + le16(nameBytes.count) + Data([type, 1])
+        record += le32(0xFFFF_FFFF) + le32(0xFFFF_FFFF) + le32(Int(child)) + Data(repeating: 0, count: 16 + 4 + 16)
+        return record + le32(Int(start)) + le64(size)
+    }
+    var directory = entry("Root Entry", type: 5, child: 1, start: 0xFFFF_FFFE, size: 0)
+    directory += entry("Data", type: 2, child: 0xFFFF_FFFF, start: 1, size: declaredSize ?? streamBytes)
+    directory += Data(repeating: 0, count: 256)
+    var stream = filler(streamBytes, seed: 9)
+    stream += Data(repeating: 0, count: streamSectors * 512 - streamBytes)
+    var fatData = Data()
+    for value in fat { fatData += le32(Int(value)) }
+    return header + directory + stream + fatData
+}
+
+/// Output of a system tool fed `input`, or nil when the tool is unavailable.
+func runTool(_ path: String, _ arguments: [String], input: Data? = nil) throws -> Data? {
+    guard FileManager.default.isExecutableFile(atPath: path) else { return nil }
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: path)
+    process.arguments = arguments
+    let output = Pipe()
+    process.standardOutput = output
+    process.standardError = FileHandle.nullDevice
+    if let input {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("salvage-tool-\(UUID().uuidString)")
+        try input.write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        process.standardInput = try FileHandle(forReadingFrom: file)
+        try process.run()
+    } else {
+        try process.run()
+    }
+    let data = output.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    return process.terminationStatus == 0 ? data : nil
+}
+
+/// Compressible text: dynamic Huffman blocks with back-references.
+func sampleText(_ lines: Int) -> Data {
+    var text = ""
+    for line in 0..<lines { text += "line \(line): the quick brown fox jumps over the lazy dog \(line * 7919 % 1000)\n" }
+    return Data(text.utf8)
+}
+
+@Suite("Carving exact ends: MP3, OLE2, gzip")
+struct CarvingFormatEndTests {
+    // MARK: MP3
+
+    @Test func mp3StreamEndsAfterItsLastFrameOrTrailer() async throws {
+        let frames = mp3Frames(12)
+        let tagV1 = ascii("TAG") + filler(125)
+        var apeHeader = ascii("APETAGEX") + le32(2000) + le32(32 + 20) + le32(1) + le32(1 << 31 | 1 << 29) + Data(repeating: 0, count: 8)
+        let apeFooter = ascii("APETAGEX") + le32(2000) + le32(32 + 20) + le32(1) + le32(1 << 31) + Data(repeating: 0, count: 8)
+        apeHeader += filler(20) + apeFooter
+        let id3 = ascii("ID3") + Data([3, 0, 0, 0, 0, 1, 0]) + filler(128) + Data(repeating: 0, count: 300)
+        for (label, file) in [("plain", frames), ("id3v1", frames + tagV1), ("ape+id3v1", frames + apeHeader + tagV1),
+                              ("id3v2", id3 + frames + tagV1)] {
+            for chunk in [333, 4096, 1 << 20] {
+                // Junk after the file's own end, past the zero slack of its last sector.
+                let end = 4096 + file.count, junk = (end + 511) / 512 * 512
+                let image = device(size: 64 * 1024, [(4096, file), (junk, filler(2000, seed: 3))])
+                let files = try await carve(image, chunk: chunk)
+                #expect(files.map(\.bytes) == [4096..<end], Comment(rawValue: "\(label) chunk \(chunk) \(files.map(\.name))"))
+                #expect(files.first?.isPartial == false && files.first?.recoveryConfidence == .medium, Comment(rawValue: label))
+            }
+        }
+    }
+
+    @Test func mp3WithoutEvidenceOfItsEndStaysPartial() async throws {
+        // Too few frames to trust.
+        let few = try await carve(device(size: 32 * 1024, [(4096, mp3Frames(5))]))
+        #expect(few.map(\.bytes) == [4096..<4096 + mp3Frames(5).count] && few.first?.isPartial == true)
+        // Non-zero bytes that aren't a frame right after the last frame: fragmented or overwritten.
+        let frames = mp3Frames(12)
+        let cut = try await carve(device(size: 32 * 1024, [(4096, frames + filler(600, seed: 5))]))
+        #expect(cut.map(\.bytes) == [4096..<4096 + frames.count] && cut.first?.isPartial == true)
+        #expect(cut.first?.overwriteConfidence == 0.6)
+        // The extent ends inside a frame.
+        let truncated = try await carve(device(size: 4096 + frames.count - 100, [(4096, frames.prefix(frames.count - 100))]))
+        #expect(truncated.first?.isPartial == true)
+        // An APE header whose footer is missing is not a trailer.
+        let ape = ascii("APETAGEX") + le32(2000) + le32(52) + le32(1) + le32(1 << 31 | 1 << 29) + Data(repeating: 0, count: 8) + filler(52)
+        let broken = try await carve(device(size: 32 * 1024, [(4096, frames + ape)]))
+        #expect(broken.map(\.bytes) == [4096..<4096 + frames.count] && broken.first?.isPartial == true)
+    }
+
+    @Test func xingFrameCountMustMatchTheWalk() async throws {
+        // MPEG-1 stereo: the Xing tag sits after the 4-byte header and 32 bytes of side info.
+        func stream(frames: Int, declared: Int) -> Data {
+            var data = mp3Frames(frames)
+            data.replaceSubrange(36..<48, with: ascii("Xing") + be32(1) + be32(declared))
+            return data
+        }
+        let exact = try await carve(device(size: 32 * 1024, [(4096, stream(frames: 4, declared: 4))]))
+        #expect(exact.first?.isPartial == false, Comment(rawValue: "a declared count below the minimum still validates"))
+        let mismatch = try await carve(device(size: 32 * 1024, [(4096, stream(frames: 12, declared: 40))]))
+        #expect(mismatch.map(\.bytes) == [4096..<4096 + mp3Frames(12).count] && mismatch.first?.isPartial == true)
+    }
+
+    @Test func coverArtInsideAnID3TagIsNotANewFile() async throws {
+        // A JPEG header at a sector boundary inside the tag's declared size.
+        var tag = ascii("ID3") + Data([3, 0, 0, 0, 0, 8, 0]) + filler(1024)   // 1024-byte body
+        tag.replaceSubrange(512..<512 + 4, with: Data([0xFF, 0xD8, 0xFF, 0xE0]))
+        let file = tag + mp3Frames(10)
+        let files = try await carve(device(size: 32 * 1024, [(4096, file)]))
+        #expect(files.map(\.name) == ["mp3-000000001000.mp3"])
+        #expect(files.first?.bytes == 4096..<4096 + file.count && files.first?.isPartial == false)
+    }
+
+    // MARK: OLE2
+
+    @Test func ole2EndsAfterItsHighestAllocatedSector() async throws {
+        let ole = ole2Bytes()
+        #expect(ole.count == 13 * 512)
+        for chunk in [1000, 4096, 1 << 20] {
+            let files = try await carve(device(size: 64 * 1024, [(8192, ole), (8192 + ole.count, filler(3000, seed: 4))]), chunk: chunk)
+            #expect(files.map(\.bytes) == [8192..<8192 + ole.count], Comment(rawValue: "chunk \(chunk)"))
+            #expect(files.first?.isPartial == false && files.first?.recoveryConfidence == .medium)
+            #expect(files.first?.path == "/Reconstructed/Documents/ole-000000002000.doc")
+        }
+    }
+
+    @Test func corruptOrIncompleteOLE2StaysPartial() async throws {
+        let cases: [(String, Data)] = [
+            ("pointer past the FAT", ole2Bytes { $0[4] = 500 }),
+            ("cycle", ole2Bytes { $0[10] = 1 }),
+            ("two predecessors", ole2Bytes { $0[0] = 3 }),
+            ("FAT sector marked free", ole2Bytes { $0[11] = 0xFFFF_FFFF }),
+            ("FAT sector inside a chain", ole2Bytes { $0[11] = 0xFFFF_FFFE; $0[10] = 11 }),
+            ("unlisted FAT marker", ole2Bytes { $0[12] = 0xFFFF_FFFD }),
+            ("stream size disagrees with its chain", ole2Bytes(declaredSize: 9000)),
+        ]
+        for (label, ole) in cases {
+            let files = try await carve(device(size: 64 * 1024, [(8192, ole), (32768, pngBytes())]))
+            #expect(files.first?.name == "ole-000000002000.doc", Comment(rawValue: label))
+            #expect(files.first?.isPartial == true && files.first?.overwriteConfidence == 1, Comment(rawValue: label))
+        }
+        // The FAT (in the last sector) is past the end of the extent.
+        let ole = ole2Bytes()
+        let truncated = try await carve(device(size: 8192 + ole.count - 512, [(8192, ole.prefix(ole.count - 512))]))
+        #expect(truncated.first?.isPartial == true && truncated.first?.overwriteConfidence == 0.6)
+        // A strong header before the FAT was read ends the carve.
+        var cut = ole
+        cut.replaceSubrange(2048..<2048 + 8, with: Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))
+        let files = try await carve(device(size: 64 * 1024, [(8192, cut)]))
+        #expect(files.first?.bytes == 8192..<8192 + 2048 && files.first?.isPartial == true)
+    }
+
+    @Test func realWordDocumentFromTextutilIsCarvedExactly() async throws {
+        let text = FileManager.default.temporaryDirectory.appendingPathComponent("salvage-\(UUID().uuidString).txt")
+        let doc = text.deletingPathExtension().appendingPathExtension("doc")
+        defer { try? FileManager.default.removeItem(at: text); try? FileManager.default.removeItem(at: doc) }
+        try sampleText(400).write(to: text)
+        guard try runTool("/usr/bin/textutil", ["-convert", "doc", text.path, "-output", doc.path]) != nil,
+              let bytes = try? Data(contentsOf: doc) else {
+            Issue.record("textutil unavailable; real-file OLE2 fixture not exercised")
+            return
+        }
+        #expect(bytes.prefix(8) == Data([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]))
+        let files = try await carve(device(size: 4096 + bytes.count + 8192, [(4096, bytes), (4096 + bytes.count, filler(5000, seed: 6))]),
+                                    chunk: 3000)
+        let file = try #require(files.first { $0.name.hasPrefix("ole-") })
+        #expect(file.bytes == 4096..<4096 + bytes.count)
+        #expect(!file.isPartial && file.recoveryConfidence == .medium)
+    }
+
+    // MARK: gzip
+
+    @Test func gzipEndsAtAVerifiedTrailer() async throws {
+        var fixtures: [(String, Data)] = [("stored", gzipBytes(body: 70000)), ("empty", gzipBytes(content: Data()))]
+        if let dynamic = try runTool("/usr/bin/gzip", ["-c", "-9"], input: sampleText(3000)) { fixtures.append(("dynamic", dynamic)) }
+        if let fixed = try runTool("/usr/bin/gzip", ["-c"], input: Data("hello hello hello".utf8)) { fixtures.append(("fixed", fixed)) }
+        if let random = try runTool("/usr/bin/gzip", ["-c"], input: randomBytes(40000, seed: 1)) { fixtures.append(("incompressible", random)) }
+        if let named = try runTool("/usr/bin/gzip", ["-c", "-N"], input: sampleText(50)) { fixtures.append(("named", named)) }
+        #expect(fixtures.count == 6, Comment(rawValue: "gzip(1) unavailable for real-file fixtures"))
+        for (label, gzip) in fixtures {
+            for chunk in [777, 1 << 20] {
+                let image = device(size: 4096 + gzip.count + 8192, [(4096, gzip), (4096 + gzip.count, filler(4000, seed: 2))])
+                let files = try await carve(image, chunk: chunk)
+                #expect(files.map(\.bytes) == [4096..<4096 + gzip.count], Comment(rawValue: "\(label) chunk \(chunk) \(files.map(\.name))"))
+                #expect(files.first?.isPartial == false && files.first?.recoveryConfidence == .medium, Comment(rawValue: label))
+            }
+        }
+        // Byte-at-a-time chunks for a small real stream.
+        if let small = try runTool("/usr/bin/gzip", ["-c"], input: sampleText(20)) {
+            let files = try await carve(device(size: 8192, [(1024, small)]), chunk: 1)
+            #expect(files.map(\.bytes) == [1024..<1024 + small.count] && files.first?.isPartial == false)
+        }
+    }
+
+    @Test func multiMemberGzipIsOneFileUnlessAMemberEndsOnASector() async throws {
+        let first = gzipBytes(body: 300), second = gzipBytes(body: 200, content: sampleText(3))
+        let joined = try await carve(device(size: 16 * 1024, [(1024, first + second)]))
+        #expect(joined.map(\.bytes) == [1024..<1024 + first.count + second.count] && joined.first?.isPartial == false)
+        // A member ending exactly at a sector boundary: the next gzip is its own file.
+        let aligned = gzipBytes(body: 1024 - 23)
+        #expect(aligned.count == 1024)
+        let split = try await carve(device(size: 16 * 1024, [(1024, aligned), (2048, second)]))
+        #expect(split.map(\.bytes) == [1024..<2048, 2048..<2048 + second.count])
+        #expect(split.allSatisfy { !$0.isPartial })
+    }
+
+    @Test func corruptOrTruncatedGzipStaysPartial() async throws {
+        let text = try runTool("/usr/bin/gzip", ["-c", "-9"], input: sampleText(2000)) ?? gzipBytes(body: 5000)
+        var badCRC = text
+        badCRC[badCRC.count - 6] ^= 0x55
+        var badData = text
+        badData[text.count / 2] ^= 0xFF
+        var badSize = gzipBytes(body: 400)
+        badSize[badSize.count - 4] ^= 1
+        for (label, gzip) in [("crc", badCRC), ("data", badData), ("isize", badSize)] {
+            let files = try await carve(device(size: 64 * 1024 + text.count, [(4096, gzip)]))
+            let file = try #require(files.first, Comment(rawValue: label))
+            #expect(file.isPartial && file.overwriteConfidence == 1, Comment(rawValue: label))
+            #expect(file.bytes.map { $0.upperBound <= 4096 + gzip.count } == true, Comment(rawValue: label))
+        }
+        // The extent ends mid-stream.
+        let truncated = try await carve(device(size: 4096 + text.count / 2, [(4096, text.prefix(text.count / 2))]))
+        #expect(truncated.map(\.bytes) == [4096..<4096 + text.count / 2])
+        #expect(truncated.first?.isPartial == true && truncated.first?.overwriteConfidence == 0.6)
+        // Invalid header flags: not a gzip at all.
+        var flags = gzipBytes(body: 100)
+        flags[3] = 0x80
+        #expect(try await carve(device(size: 16 * 1024, [(4096, flags)])).isEmpty)
+        // A stored-block length whose complement doesn't match.
+        var stored = gzipBytes(body: 100)
+        stored[13] ^= 0x01
+        let bad = try await carve(device(size: 16 * 1024, [(4096, stored)]))
+        #expect(bad.first?.isPartial == true && bad.first?.overwriteConfidence == 1)
+    }
+
+    @Test func gzipHeaderFlagsAreParsed() async throws {
+        // FEXTRA, FNAME, FCOMMENT and a correct FHCRC.
+        var header = Data([0x1F, 0x8B, 0x08, 0x1E, 0, 0, 0, 0, 0, 3]) + le16(4) + ascii("ab12") + ascii("name.txt") + Data([0])
+            + ascii("a comment") + Data([0])
+        var crc = CRC32()
+        for byte in header { crc.update(byte) }
+        header += le16(Int(crc.value & 0xFFFF))
+        let body = gzipBytes(body: 300).dropFirst(10)
+        let gzip = header + body
+        let files = try await carve(device(size: 16 * 1024, [(4096, gzip)]), chunk: 5)
+        #expect(files.map(\.bytes) == [4096..<4096 + gzip.count] && files.first?.isPartial == false)
+        var wrong = gzip
+        wrong[header.count - 1] ^= 0xFF
+        #expect(try await carve(device(size: 16 * 1024, [(4096, wrong)])).isEmpty)
     }
 }
