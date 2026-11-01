@@ -43,6 +43,8 @@ final class DiskImageRegistry: @unchecked Sendable {
 
     func register(_ image: OpenedDiskImage) { lock.withLock { images[image.id] = image } }
     func image(forDeviceID id: String) -> OpenedDiskImage? { lock.withLock { images[id] } }
+    /// Every image opened this launch (their files must never be overwritten, e.g. by an image).
+    var allImages: [OpenedDiskImage] { lock.withLock { Array(images.values) } }
 
     func track(_ attachment: AttachedDiskImage, for id: String) { lock.withLock { attachments[id] = attachment } }
     func untrack(_ id: String) { lock.withLock { _ = attachments.removeValue(forKey: id) } }

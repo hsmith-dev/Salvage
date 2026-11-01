@@ -6,7 +6,7 @@ set -euo pipefail
 # Packages a built Salvage.app into the release disk image (spec-tech-batch-6 §E, AD-10).
 #
 #   package-release.sh (--dry-run | --release) [--identity NAME] [--keychain PATH] \
-#       <Salvage.app> <version> <outdir>
+#       [--notary-profile NAME] <Salvage.app> <version> <outdir>
 #
 # Steps, in order:
 #   1. Verify the app bundle layout: the embedded helper at Contents/MacOS/SalvageHelper and its
@@ -25,10 +25,13 @@ set -euo pipefail
 #   --release   also runs 3. It needs, in the environment (the release.yml secret names):
 #                 DEVELOPMENT_TEAM      -- the Team ID the app and the DMG must be signed by
 #                 NOTARIZATION_API_KEY  -- "<KEY_ID>:<ISSUER_ID>:<base64 .p8 private key>"
+#                                          (not needed with --notary-profile)
 #               and a "Developer ID Application" identity in the keychain (--keychain selects
 #               one; release.yml passes its temporary keychain). The app must already be signed
 #               by DEVELOPMENT_TEAM and stapled, and its CFBundleShortVersionString must equal
 #               <version>.
+#   --notary-profile NAME   notarize with a `xcrun notarytool store-credentials` keychain profile
+#               instead of NOTARIZATION_API_KEY (scripts/release-local.sh passes this).
 #
 # Exit codes: 0 success; 1 a check or a tool failed; 2 usage error.
 # Tools can be overridden for tests: HDIUTIL, CODESIGN, XCRUN.
@@ -41,7 +44,7 @@ helper_rel="Contents/MacOS/SalvageHelper"
 plist_rel="Contents/Library/LaunchDaemons/dev.hsmith.Salvage.Helper.plist"
 
 usage() {
-    sed -n '6,7p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+    sed -n '8,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 fail() { echo "package-release: error: $*" >&2; exit 1; }
@@ -50,6 +53,7 @@ log() { echo "package-release: $*"; }
 mode=""
 identity="Developer ID Application"
 keychain=""
+notary_profile=""
 positional=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -58,6 +62,7 @@ while [ $# -gt 0 ]; do
             mode="${1#--}" ;;
         --identity) [ $# -ge 2 ] || usage; identity="$2"; shift ;;
         --keychain) [ $# -ge 2 ] || usage; keychain="$2"; shift ;;
+        --notary-profile) [ $# -ge 2 ] && [ -n "$2" ] || usage; notary_profile="$2"; shift ;;
         -h|--help) usage ;;
         --*) echo "package-release: unknown option $1" >&2; usage ;;
         *) positional+=("$1") ;;
@@ -83,10 +88,14 @@ dmg_name="Salvage-$version.dmg"
 if [ "$mode" = "release" ]; then
     missing=()
     [ -n "${DEVELOPMENT_TEAM:-}" ] || missing+=("DEVELOPMENT_TEAM")
-    [ -n "${NOTARIZATION_API_KEY:-}" ] || missing+=("NOTARIZATION_API_KEY")
+    if [ -z "$notary_profile" ]; then
+        [ -n "${NOTARIZATION_API_KEY:-}" ] || missing+=("NOTARIZATION_API_KEY")
+    fi
     if [ "${#missing[@]}" -gt 0 ]; then
         fail "--release needs these environment variables: ${missing[*]} (nothing was packaged)"
     fi
+fi
+if [ "$mode" = "release" ] && [ -z "$notary_profile" ]; then
     api_key_compact="$(printf '%s' "$NOTARIZATION_API_KEY" | tr -d '[:space:]')"
     IFS=':' read -r notary_key_id notary_issuer_id notary_key_b64 <<< "$api_key_compact"
     if [ -z "$notary_key_id" ] || [ -z "$notary_issuer_id" ] || [ -z "$notary_key_b64" ]; then
@@ -166,18 +175,27 @@ if [ "$mode" = "release" ]; then
     [ "$dmg_team" = "$DEVELOPMENT_TEAM" ] \
         || fail "DMG is signed by team '$dmg_team', expected '$DEVELOPMENT_TEAM'"
 
-    printf '%s' "$notary_key_b64" | base64 --decode > "$notary_key_path" \
-        || fail "NOTARIZATION_API_KEY's key part is not valid base64"
-    "$XCRUN" notarytool submit "$work/$dmg_name" \
-        --key "$notary_key_path" --key-id "$notary_key_id" --issuer "$notary_issuer_id" \
-        --wait || fail "notarization of the DMG failed"
-    rm -f "$notary_key_path"
+    if [ -n "$notary_profile" ]; then
+        "$XCRUN" notarytool submit "$work/$dmg_name" --keychain-profile "$notary_profile" \
+            --wait || fail "notarization of the DMG failed"
+    else
+        printf '%s' "$notary_key_b64" | base64 --decode > "$notary_key_path" \
+            || fail "NOTARIZATION_API_KEY's key part is not valid base64"
+        "$XCRUN" notarytool submit "$work/$dmg_name" \
+            --key "$notary_key_path" --key-id "$notary_key_id" --issuer "$notary_issuer_id" \
+            --wait || fail "notarization of the DMG failed"
+        rm -f "$notary_key_path"
+    fi
     "$XCRUN" stapler staple "$work/$dmg_name" || fail "stapling the DMG failed"
     "$XCRUN" stapler validate "$work/$dmg_name" || fail "stapled ticket does not validate"
     log "signed, notarized and stapled $dmg_name"
 else
     log "dry run: would sign:      $(printf '%q ' "${sign_cmd[@]}")"
-    log "dry run: would notarize:  $XCRUN notarytool submit $work/$dmg_name --key <NOTARIZATION_API_KEY .p8> --key-id <KEY_ID> --issuer <ISSUER_ID> --wait"
+    if [ -n "$notary_profile" ]; then
+        log "dry run: would notarize:  $XCRUN notarytool submit $work/$dmg_name --keychain-profile $notary_profile --wait"
+    else
+        log "dry run: would notarize:  $XCRUN notarytool submit $work/$dmg_name --key <NOTARIZATION_API_KEY .p8> --key-id <KEY_ID> --issuer <ISSUER_ID> --wait"
+    fi
     log "dry run: would staple:    $XCRUN stapler staple $work/$dmg_name && $XCRUN stapler validate $work/$dmg_name"
 fi
 

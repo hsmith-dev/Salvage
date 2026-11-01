@@ -3,7 +3,7 @@ import Foundation
 import SalvageCore
 
 /// The identity of a file on its volume: `(st_dev, st_ino)`.
-public struct FileIdentity: Sendable, Equatable {
+public struct FileIdentity: Sendable, Hashable {
     public let device: Int64
     public let inode: UInt64
     public init(device: Int64, inode: UInt64) { self.device = device; self.inode = inode }

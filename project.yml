@@ -29,6 +29,13 @@ targets:
     deploymentTarget: "14.0"
     sources:
       - path: Salvage
+        excludes:
+          - PrivacyInfo.xcprivacy
+      # Privacy manifest (required-reason APIs; see the file's header comment). Listed on its own
+      # so it is always a Resources-phase file at Salvage.app/Contents/Resources/PrivacyInfo.xcprivacy.
+      # It also covers the embedded SalvageHelper, a bare executable with no bundle of its own.
+      - path: Salvage/PrivacyInfo.xcprivacy
+        buildPhase: resources
       # Story 1.12 / AD-13: the privileged helper's launchd plist, copied to
       # Salvage.app/Contents/Library/LaunchDaemons/ where SMAppService.daemon(plistName:) finds it.
       - path: SalvageHelper/dev.hsmith.Salvage.Helper.plist
@@ -40,13 +47,14 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.hsmith.Salvage
         PRODUCT_NAME: Salvage
-        MARKETING_VERSION: "0.1.0"
+        MARKETING_VERSION: "1.0.0"
         CURRENT_PROJECT_VERSION: "1"
         SWIFT_VERSION: "6.0"
         SWIFT_STRICT_CONCURRENCY: complete
         ENABLE_HARDENED_RUNTIME: YES
         GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_NSHumanReadableCopyright: ""
+        INFOPLIST_KEY_NSHumanReadableCopyright: "Copyright © 2026 HSmithDev LLC. MIT License."
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.utilities
         # spec-tech-batch-7 §E: the app icon lives in Salvage/Assets.xcassets (picked up by the
         # `Salvage` source path above); its PNGs are rendered from docs/brand/icon.svg by
         # scripts/render-icon.sh.
@@ -100,7 +108,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.hsmith.Salvage.Helper
         PRODUCT_NAME: SalvageHelper
-        MARKETING_VERSION: "0.1.0"
+        MARKETING_VERSION: "1.0.0"
         CURRENT_PROJECT_VERSION: "1"
         SWIFT_VERSION: "6.0"
         SWIFT_STRICT_CONCURRENCY: complete
@@ -109,6 +117,7 @@ targets:
         # which the app's peer requirement pins.
         GENERATE_INFOPLIST_FILE: YES
         CREATE_INFOPLIST_SECTION_IN_BINARY: YES
+        INFOPLIST_KEY_NSHumanReadableCopyright: "Copyright © 2026 HSmithDev LLC. MIT License."
         SKIP_INSTALL: YES
         CODE_SIGN_STYLE: Automatic
         MACOSX_DEPLOYMENT_TARGET: "14.0"

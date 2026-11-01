@@ -272,7 +272,7 @@ private struct Info: Codable {
     }
     enum Failure: Codable {
         case unsupportedFilesystem, malformed(String), io(String), unsafeTarget(String), deviceInUse
-        case permissionDenied, deviceChanged, unlockFailed(Unlock)
+        case permissionDenied, deviceChanged, unlockFailed(Unlock), administratorPasswordNeeded
     }
     enum Outcome: Codable { case completed, cancelled, failed(Failure) }
     enum Notice: Codable {
@@ -364,6 +364,7 @@ private struct Info: Codable {
         case .permissionDenied: .permissionDenied
         case .deviceChanged: .deviceChanged
         case .unlockFailed(let u): .unlockFailed(Unlock(u))
+        case .administratorPasswordNeeded: .administratorPasswordNeeded
         }
     }
 
@@ -377,6 +378,7 @@ private struct Info: Codable {
         case .permissionDenied: .permissionDenied
         case .deviceChanged: .deviceChanged
         case .unlockFailed(let u): .unlockFailed(u.value)
+        case .administratorPasswordNeeded: .administratorPasswordNeeded
         }
     }
 

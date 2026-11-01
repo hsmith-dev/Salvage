@@ -9,6 +9,9 @@ public enum ScanError: Error, Sendable, Equatable, CustomStringConvertible {
     case permissionDenied
     case deviceChanged
     case unlockFailed(UnlockError)
+    /// A physical drive needed an administrator password (macOS's own dialog, via `authopen`) and
+    /// none was given: the user cancelled, or the dialog was left unanswered. Retrying asks again.
+    case administratorPasswordNeeded
 
     public var description: String {
         switch self {
@@ -20,6 +23,7 @@ public enum ScanError: Error, Sendable, Equatable, CustomStringConvertible {
         case .permissionDenied: "Allow Salvage in System Settings → Privacy & Security → Full Disk Access, then retry the scan. You may need to reopen Salvage."
         case .deviceChanged: "The device was removed or replaced. Reconnect it and select it again."
         case .unlockFailed: "Couldn't unlock this volume."
+        case .administratorPasswordNeeded: "Salvage needs your administrator password to read this drive. Scanning is read-only."
         }
     }
 }

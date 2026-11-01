@@ -83,7 +83,84 @@ one into a temp folder first.
 `package-release.sh` exit codes: `0` success, `1` a check or tool failed, `2` usage error. It never
 overwrites an existing DMG or `SHA256SUMS` in the output folder.
 
-## 4. Verifying a downloaded release
+## 4. Releasing from your own Mac
+
+`scripts/release-local.sh` does what the workflow does, on your Mac, with your own certificate and
+a notarytool keychain profile instead of CI secrets. It builds Release with your team, signs the app
+and the helper with Developer ID and the hardened runtime, verifies them (`codesign --verify --deep
+--strict` and `scripts/check-helper-signing-team.sh`), notarizes and staples the app, packages it
+with `package-release.sh --release --notary-profile`, which signs, notarizes and staples the DMG,
+and finishes with `spctl -a -vv` on the app and the DMG. The output is
+`build/release/X.Y.Z/Salvage-X.Y.Z.dmg` plus `SHA256SUMS` (`build/` is git-ignored).
+
+### One-time setup
+
+1. **Find your Team ID.** In Xcode, open **Settings → Accounts**, select your Apple ID, and look at
+   the team list: the Team ID is the 10-character code shown for the team (also under
+   **developer.apple.com → Account → Membership details**). Don't write it into any file in the
+   repository. Pass it per run, or export it in your shell profile:
+
+   ```sh
+   export SALVAGE_TEAM_ID=XXXXXXXXXX   # your 10-character Team ID
+   ```
+
+2. **Get a Developer ID Application certificate.** Only the Account Holder of the developer team
+   can create one. In Xcode, **Settings → Accounts → (team) → Manage Certificates… → + →
+   Developer ID Application**. (Or create it at **developer.apple.com → Certificates, IDs &
+   Profiles → Certificates → +**, upload a CSR made in Keychain Access, and double-click the
+   downloaded `.cer`.) Check that it is installed with its private key:
+
+   ```sh
+   security find-identity -v -p codesigning | grep "Developer ID Application"
+   ```
+
+3. **Store notarization credentials in the keychain** under a profile name (the script's default is
+   `salvage-notary`). Either an app-specific password for your Apple ID (made at
+   [account.apple.com](https://account.apple.com) → Sign-In and Security → App-Specific Passwords):
+
+   ```sh
+   xcrun notarytool store-credentials salvage-notary \
+     --apple-id you@example.com --team-id XXXXXXXXXX
+   # prompts for the app-specific password
+   ```
+
+   or an App Store Connect API key (the same `.p8` the workflow uses):
+
+   ```sh
+   xcrun notarytool store-credentials salvage-notary \
+     --key AuthKey_KEYID.p8 --key-id KEYID --issuer ISSUER-UUID
+   ```
+
+   The credentials stay in your login keychain; nothing is written to the repository.
+
+### Each release
+
+```sh
+git switch main && git pull           # a clean, committed tree; the script refuses a dirty one
+./scripts/release-local.sh --dry-run  # checks team, certificate, profile, version, output folder
+./scripts/release-local.sh            # builds, signs, notarizes (a few minutes), packages
+```
+
+The version is `MARKETING_VERSION` in `project.yml` (the CLI's `SalvageCLI.version` must match; a
+test checks). Options: `--team ID` (else `$SALVAGE_TEAM_ID`, else `$DEVELOPMENT_TEAM`),
+`--profile NAME` (else `$SALVAGE_NOTARY_PROFILE`, else `salvage-notary`), `--out DIR`,
+`--allow-dirty`. Every missing prerequisite is named before anything is built, and any failure
+stops the run without leaving a DMG. If Apple rejects a submission, the script prints the
+`xcrun notarytool log <id> --keychain-profile <profile>` command that explains why. The build log is
+in `build/release-work/`.
+
+Then go through [RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md), tag the commit
+(`git tag -a vX.Y.Z -m "Salvage X.Y.Z" && git push origin vX.Y.Z`) and attach the DMG and
+`SHA256SUMS` to the GitHub release (`gh release create vX.Y.Z build/release/X.Y.Z/* --generate-notes`).
+Pick one path per release. A pushed tag starts the release workflow: with its secrets unset it
+stops at the secrets check before building or publishing anything; with them set it uploads its own
+build over these assets (`--clobber`), which has a different checksum.
+
+`./scripts/test-release-local.sh` checks the script without any certificate, team or network: it
+replaces every Apple tool with a fake and covers the fail-closed preflight, `--dry-run`, a full run
+and failures after preflight.
+
+## 5. Verifying a downloaded release
 
 Download `Salvage-X.Y.Z.dmg` and `SHA256SUMS` into the same folder, then:
 
@@ -108,7 +185,7 @@ hdiutil detach "/Volumes/Salvage X.Y.Z"
 
 To install, drag `Salvage.app` onto the `Applications` link in the mounted image.
 
-## 5. Manual signed-helper end-to-end check (after the first signed release)
+## 6. Manual signed-helper end-to-end check (after the first signed release)
 
 The privileged helper (Story 1.12, AD-13) can't be exercised in CI: launchd only spawns it for a
 Developer ID-signed app whose Team ID matches the helper's SpawnConstraint. Do this once per release

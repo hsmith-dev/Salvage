@@ -3,8 +3,8 @@
 This guide follows the app from opening it to getting your files back. Text in **bold** or in
 quotes is what the app shows, taken from the Swift views in `Salvage/Views/`.
 
-> **Pre-release note.** Nobody has yet tested the app's screens by hand, and nobody has yet run the
-> signed privileged helper on a real USB drive. The behavior described here comes from the code
+> **Pre-release note.** Nobody has yet tested the app's screens by hand, scanned a real USB drive
+> through the administrator-password dialog, or run the signed privileged helper on one. The behavior described here comes from the code
 > and its automated tests. See [Not yet verified](../README.md#not-yet-verified).
 
 ## Before you start
@@ -22,42 +22,59 @@ quotes is what the app shows, taken from the Swift views in `Salvage/Views/`.
 2. Unzip it and move **Salvage** to your Applications folder. Release builds are signed with
    Developer ID and notarized by Apple.
 
-If no release is published yet, see [Build from source](../README.md#build-from-source). An unsigned
-build can scan only disk images you attach yourself.
+If no release is published yet, see [Build from source](../README.md#build-from-source). A build you
+make yourself reads drives the same way, after asking for your administrator password.
 
 Salvage needs macOS 14 or later.
 
-## One-time approval for reading drives
+## Your administrator password for reading drives
 
-USB drives and memory cards can only be read with extra permission, so Salvage includes a small
-read-only helper. The first time you scan one, the scan stops and Salvage shows:
+USB drives, memory cards and external hard drives can only be read with an administrator's
+permission. You never need Terminal for this. When you scan one, Salvage first shows:
 
-> To read USB drives and memory cards, Salvage needs your one-time permission. Open System
-> Settings, go to General, then Login Items (called Login Items & Extensions on newer macOS), and
-> turn on Salvage under "Allow in the Background". Then retry the scan. Salvage only ever reads
-> the drive; it never changes it.
+> macOS will ask for an administrator password so Salvage can read this drive. Salvage only reads
+> it — it never writes to it.
+
+Then macOS shows its own password dialog. Enter the name and password of an administrator account
+on this Mac. Salvage never sees the password: macOS's built-in `authopen` tool checks it, opens
+the whole drive **read-only**, and hands only that read-only connection to Salvage. Salvage then
+checks again that the connection is read-only and is the drive you picked before it reads
+anything. It asks for the password for each scan, and again when you reconnect a saved scan's
+drive.
+
+If you click **Cancel** (or leave the dialog unanswered for three minutes), the scan stops and
+Salvage shows:
+
+> Salvage needs your administrator password to read this drive. Scanning is read-only.
+
+Click **Try Again** to be asked again.
+
+Your startup drive is refused before any password is asked for, as before.
+
+### Skip the password next time (optional, release builds only)
+
+A signed release of Salvage also includes a small read-only helper. Under **Try Again** it offers
+**Skip the password next time**. Click it, then:
 
 1. Click **Open System Settings**. It opens Login Items.
 2. Turn on **Salvage** under **Allow in the Background**.
-3. Return to Salvage and click **Retry scan**.
 
-The helper does one thing. It opens the selected whole drive read-only and hands it to Salvage.
-It never writes, mounts or unmounts anything, never touches the network, and keeps no log. It
-refuses your startup drive. When it has had no work for 60 seconds it exits, and macOS starts it
-again when it is next needed (`SalvageHelper/main.swift`).
+After that, Salvage reads drives without asking for your password. The helper does one thing. It
+opens the selected whole drive read-only and hands it to Salvage. It never writes, mounts or
+unmounts anything, never touches the network, and keeps no log. It refuses your startup drive.
+When it has had no work for 60 seconds it exits, and macOS starts it again when it is next needed
+(`SalvageHelper/main.swift`). Builds you make yourself don't offer it; they always use the
+password dialog.
 
 Other messages you may see:
 
-- "This copy of Salvage can't read USB drives or memory cards because its read-only disk access
-  part is missing or isn't signed. Install Salvage from its official release. Disk images you own
-  can still be scanned." This usually means an unsigned build.
 - "Salvage's read-only disk access didn't respond. Retry the scan. If it keeps failing, restart
-  your Mac and try again."
+  your Mac and try again." (helper only; Salvage falls back to the password dialog when it can)
 - "Allow Salvage in System Settings → Privacy & Security → Full Disk Access, then retry the scan.
-  You may need to reopen Salvage." This appears when macOS denies the read. Whether Full Disk
-  Access is ever needed alongside the helper hasn't been tested on real hardware yet.
+  You may need to reopen Salvage." This appears when macOS denies a read after the drive was
+  opened. Whether Full Disk Access is ever needed hasn't been tested on real hardware yet.
 
-Disk images you attach yourself are opened directly, without the helper.
+Disk images you attach yourself are opened directly, without a password.
 
 ## Choose a drive
 
@@ -377,6 +394,64 @@ Reconstructed files:
 The supported types are in the [README](../README.md#what-it-can-read). Office 2007+ files
 (docx/xlsx/pptx) are ZIP containers, so they are reconstructed as `.zip`. Older Office files are
 saved as `.doc`.
+
+## Make an image first (failing drives)
+
+A drive that clicks, disconnects by itself, reads very slowly or reports read errors may not last
+long. Every scan, preview and recovery reads it again. The safer order is to copy the whole drive
+**once** into an image file on another drive, put the failing drive away, and then scan the image
+as many times as you need.
+
+1. Control-click the drive in the left column and choose **Image This Drive…**. You can also choose
+   **File > Image This Drive…** for the drive you last selected, or click **Image This Drive…** on
+   its results.
+2. In the save panel, choose a folder on a **different drive** with at least as much free space
+   as the whole drive (the panel says how much), and a name ending in `.img`. Click **Image**.
+3. The sheet shows the bytes copied, the speed, the time remaining and how many areas couldn't be
+   read so far. Copying a large drive takes hours. It runs at the drive's own speed.
+4. When it finishes, click **Open Image**. The image appears under **Disk images**. Click it to
+   scan it, as described in [Scan a disk-image file](#scan-a-disk-image-file).
+
+Salvage only reads the drive. It never writes to the drive. It opens the drive the same way as for
+a scan, so the drive's volumes are unmounted first and your startup drive is refused. Disconnect
+the drive when the image is done.
+
+What Salvage refuses before it copies anything:
+
+- a destination on the drive you are imaging ("This destination is on the drive you're imaging.
+  Choose a folder on a different drive.");
+- a destination without enough free space ("The image needs … of free space, but the destination
+  has only …");
+- a destination formatted MS-DOS (FAT) when the drive is larger than 4 GB, because FAT can't hold
+  a file that large;
+- an existing file, unless you agreed to replace it in the save panel. A file that is the disk
+  image behind an attached drive is never replaced, even then. The space a replaced file takes
+  up isn't counted as free.
+
+**Unreadable sectors.** Salvage reads the drive in 4 MB pieces. When a piece can't be read, Salvage
+reads it again in smaller pieces, down to single 512-byte sectors, so as little as possible is
+lost. What still can't be read is written to the image as zeros, so everything after it stays at
+the right place. Once more than 32 KB in a row couldn't be read, Salvage stops retrying single
+sectors and reads the rest of that area in 64 KB pieces until something reads again. That keeps a
+badly damaged drive from taking days.
+
+**A drive that returns nothing.** When 64 MB in a row can't be read, Salvage checks whether the
+drive is still connected and stops, with "The drive stopped returning data" (or that the drive was
+removed). The image keeps everything up to that point.
+
+The unreadable areas are listed in the summary and in a file saved next to the image,
+`<name>.img.badblocks.json`. That file lists their byte offsets on the drive, the number of bytes
+copied, whether the copy finished, and the image's SHA-256 checksum (only for a finished copy). It
+holds no file contents.
+
+**If the drive stops responding.** A read that hasn't returned after two minutes stops the copy,
+with "The drive stopped responding". macOS can't interrupt a read that is stuck in the drive, so
+Salvage stops waiting instead of hanging. Disconnect and reconnect the drive before you try again.
+
+**Cancel.** Click **Cancel** to stop after the current read. The image file is kept but holds only
+the first part of the drive. The summary says how much ("The image file holds only the first … of
+…"), and so does the `.badblocks.json` file. You can still scan the partial image, but Salvage finds
+only what lies in the copied part. To get a full copy, image the drive again.
 
 ## Scan a disk-image file
 

@@ -18,6 +18,7 @@ struct SalvageApp: App {
         .commands {
             UpdateCommands(checker: updates, activity: scanActivity)
             OpenImageCommand()
+            ImageDriveCommand()
         }
         .commands { ScanArchiveCommands() }
 

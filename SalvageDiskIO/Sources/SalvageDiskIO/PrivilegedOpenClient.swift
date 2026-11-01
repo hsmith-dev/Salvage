@@ -6,7 +6,10 @@ import ServiceManagement
 import XPC
 
 // Story 1.12 / AD-13: the app side of the privileged read-only helper. `RawBlockReader` is the
-// only caller; the app never talks to the helper's XPC service directly. The helper itself is a
+// only caller; the app never talks to the helper's XPC service directly. Since
+// spec-tech-authopen it is asked only once it is enabled; otherwise physical drives open through
+// the administrator-password dialog (AuthopenClient.swift), and the helper is the optional
+// "skip the password next time" path of signed builds. The helper itself is a
 // separate target (SalvageHelper/) that shares HelperShared/ with this module.
 
 /// Asks something privileged to open a validated whole disk read-only and hand back the fd.
@@ -37,7 +40,7 @@ protocol PrivilegedOpenTransport: Sendable {
 /// Plain-language guidance for the one-time approval the helper needs, plus the System Settings
 /// shortcut. Public so the app's approval view can show it; the app never reaches the helper.
 public enum PrivilegedHelperApproval {
-    public static let guidance = "To read USB drives and memory cards, Salvage needs your one-time permission. Open System Settings, go to General, then Login Items (called Login Items & Extensions on newer macOS), and turn on Salvage under \u{201C}Allow in the Background\u{201D}. Then retry the scan. Salvage only ever reads the drive; it never changes it."
+    public static let guidance = "Open System Settings, go to General, then Login Items (called Login Items & Extensions on newer macOS), and turn on Salvage under \u{201C}Allow in the Background\u{201D}. After that, Salvage reads USB drives and memory cards without asking for your password. It only ever reads the drive; it never changes it."
     public static let missingGuidance = "This copy of Salvage can't read USB drives or memory cards because its read-only disk access part is missing or isn't signed. Install Salvage from its official release. Disk images you own can still be scanned."
     public static let unavailableGuidance = "Salvage's read-only disk access didn't respond. Retry the scan. If it keeps failing, restart your Mac and try again."
 
@@ -48,6 +51,52 @@ public enum PrivilegedHelperApproval {
 
     /// Whether a scan failed only because the user hasn't approved the helper yet.
     public static func isApprovalRequired(_ error: ScanError) -> Bool { error == approvalRequiredError }
+
+    /// The helper's errors that mean "couldn't be reached" rather than a safety refusal; only
+    /// these let `openRawDevice` fall back to the administrator-password dialog.
+    static func isUnavailability(_ error: ScanError) -> Bool {
+        error == approvalRequiredError || error == missingError || error == unavailableError
+    }
+
+    // MARK: Optional "Skip the password next time" (signed builds)
+
+    /// Shown under the password explanation when the helper can be turned on.
+    public static let skipPasswordGuidance = "To skip the password next time, allow Salvage's read-only disk access once in System Settings. It stays read-only."
+
+    /// What the optional helper can do for this copy of Salvage.
+    public enum Offer: Sendable, Equatable {
+        /// Not offered: unsigned or development build, or the helper isn't embedded.
+        case unavailable
+        /// Can be registered; the user then approves it in System Settings.
+        case canRegister
+        /// Registered, waiting for the user's approval in System Settings.
+        case awaitingApproval
+        /// Approved: physical drives open without a password.
+        case enabled
+    }
+
+    /// The offer for this build. Only a build signed with a Team ID can run the helper (XPC
+    /// requires the same team on both ends), so ad-hoc and unsigned builds never see it.
+    public static func currentOffer() async -> Offer {
+        await offer(teamID: currentProcessTeamIdentifier(), status: SMAppServiceDaemonControl().status())
+    }
+
+    /// Registers the helper (which needs the user's approval in System Settings next).
+    public static func register() async -> Offer {
+        let control = SMAppServiceDaemonControl()
+        try? await control.register()
+        return await offer(teamID: currentProcessTeamIdentifier(), status: control.status())
+    }
+
+    static func offer(teamID: String?, status: HelperRegistrationStatus) -> Offer {
+        guard let teamID, !teamID.isEmpty else { return .unavailable }
+        switch status {
+        case .notFound: return .unavailable
+        case .notRegistered: return .canRegister
+        case .requiresApproval: return .awaitingApproval
+        case .enabled: return .enabled
+        }
+    }
 
     /// Opens System Settings at Login Items, where the helper is approved.
     @MainActor public static func openSystemSettings() { SMAppService.openSystemSettingsLoginItems() }
