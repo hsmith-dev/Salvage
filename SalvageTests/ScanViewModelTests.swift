@@ -126,6 +126,42 @@ struct ScanViewModelTests {
         #expect(model.state == .completed)
         #expect(!model.isAwaitingAdministratorPassword)
     }
+    /// Try Again after a cancelled password reuses the FileVault credentials of that run; any other
+    /// start zeroes kept ones.
+    @Test func tryAgainKeepsUnlockCredentialsAndOtherStartsZeroThem() async {
+        let attempts = AttemptProbe()
+        let seen = CredentialLog()
+        let model = ScanViewModel { run, events in
+            await seen.add(run.credentials)
+            if await attempts.next() <= 2 { throw ScanError.administratorPasswordNeeded }
+            try await events.send(.completed)
+        }
+        let credential = VolumeCredential(kind: .password, secret: "correct horse")
+        model.start(device, credentials: ["VOL": credential])
+        while model.isActive { await Task.yield() }
+        #expect(model.state == .failed(.administratorPasswordNeeded))
+        #expect(model.hasPasswordRetryCredentials && !credential.isZeroed)
+        model.retryAfterAdministratorPassword()
+        while model.isActive { await Task.yield() }
+        #expect(await seen.credentials.map { $0["VOL"] === credential } == [true, true])
+        #expect(model.hasPasswordRetryCredentials && !credential.isZeroed)
+        // A plain start (another scan) discards them, zeroed.
+        model.start(device)
+        while model.isActive { await Task.yield() }
+        #expect(model.state == .completed)
+        #expect(!model.hasPasswordRetryCredentials && credential.isZeroed)
+        #expect(await seen.credentials.last?.isEmpty == true)
+    }
+    @Test func tryAgainIsOnlyForACancelledPassword() async {
+        var runs = 0
+        let model = ScanViewModel { _, _ in throw ScanError.deviceChanged }
+        model.start(device)
+        while model.isActive { await Task.yield() }
+        model.retryAfterAdministratorPassword()
+        runs += model.isActive ? 1 : 0
+        #expect(runs == 0)
+        #expect(model.state == .failed(.deviceChanged))
+    }
     @Test func noticesAreCollectedInOrderAndResetPerScan() async {
         let attempts = AttemptProbe()
         let model = ScanViewModel { run, events in
@@ -625,6 +661,11 @@ private actor CleanupProbe {
     var didClean = false
     func cleaned() { didClean = true }
 }
+private actor CredentialLog {
+    var credentials: [[String: VolumeCredential]] = []
+    func add(_ value: [String: VolumeCredential]) { credentials.append(value) }
+}
+
 private actor AttemptProbe {
     var count = 0
     func next() -> Int { count += 1; return count }

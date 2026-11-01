@@ -95,8 +95,10 @@ name, boot-disk refusal, unmount, identity re-check):
    never passes `-w`, `-c` or `-extauth`. Exactly one descriptor from a zero exit is accepted.
    Anything else closes every descriptor received. A failed run with no descriptor (the user
    cancelled) becomes `ScanError.administratorPasswordNeeded`, which the app shows with
-   **Try Again**. A three-minute timeout, or cancelling the scan, terminates authopen (SIGTERM,
-   then SIGKILL).
+   **Try Again**, unless a re-check shows the drive was unplugged or replaced
+   (`deviceChanged`). After a successful open, the drive's identity and unmounted state are
+   checked again, because the dialog may have been up for minutes. A three-minute timeout, or
+   cancelling the scan, terminates authopen (SIGTERM, then SIGKILL).
 
 `prepare(device:onAdministratorPasswordPrompt:)` calls its hook just before step 3, so the scan
 screen and the saved-scan banner can say why the dialog is coming. Scan, saved-scan reconnect,

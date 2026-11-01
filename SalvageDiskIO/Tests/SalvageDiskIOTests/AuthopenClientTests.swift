@@ -299,10 +299,65 @@ struct AuthopenClientTests {
 @Suite("Raw open falls back to the password dialog", .serialized)
 struct PasswordFallbackTests {
     private func openers(status: HelperRegistrationStatus, helper: any PrivilegedOpening, password: any PrivilegedOpening,
-                         log: CallLog) -> ElevatedOpeners {
+                         log: CallLog, recheckError: ScanError? = nil) -> ElevatedOpeners {
         ElevatedOpeners(helper: LoggingOpener(name: "helper", log: log, inner: helper), helperStatus: { status },
                         password: LoggingOpener(name: "password", log: log, inner: password),
-                        willAskForPassword: { await log.add("explain") })
+                        willAskForPassword: { await log.add("explain") },
+                        recheckAfterPassword: {
+                            await log.add("recheck")
+                            if let recheckError { throw recheckError }
+                        })
+    }
+
+    static let mountedAgain = ScanError.io("The device was mounted again. Close files on it and retry.")
+
+    @Test func remountDuringTheDialogClosesTheDescriptorAndRefuses() async throws {
+        let log = CallLog()
+        let probe = try ClosureProbe()
+        let password = client(SendingLauncher { [dup(probe.readEnd)] })
+        await #expect(throws: Self.mountedAgain) {
+            _ = try await openRawDevice("disk42", expected: devNullIdentity(), directOpen: { _ in .failed(errno: EACCES) },
+                                        elevated: openers(status: .notRegistered, helper: FailingOpener(error: .io("never")),
+                                                          password: password, log: log, recheckError: Self.mountedAgain))
+        }
+        #expect(await log.entries == ["explain", "password", "recheck"])
+        close(probe.readEnd)
+        #expect(probe.allReadEndsClosed)
+    }
+
+    @Test func driveUnpluggedDuringTheDialogIsNotReportedAsAPasswordProblem() async {
+        let log = CallLog()
+        let password = client(ResultLauncher(DescriptorPassingResult(termination: .exited(1), descriptors: [], truncated: false)))
+        await #expect(throws: ScanError.deviceChanged) {
+            _ = try await openRawDevice("disk42", expected: devNullIdentity(), directOpen: { _ in .failed(errno: EACCES) },
+                                        elevated: openers(status: .notRegistered, helper: FailingOpener(error: .io("never")),
+                                                          password: password, log: log, recheckError: .deviceChanged))
+        }
+        #expect(await log.entries == ["explain", "password", "recheck"])
+    }
+
+    @Test func cancelWithTheDriveStillThereStaysAPasswordProblem() async {
+        let log = CallLog()
+        let password = client(ResultLauncher(DescriptorPassingResult(termination: .exited(1), descriptors: [], truncated: false)))
+        await #expect(throws: ScanError.administratorPasswordNeeded) {
+            _ = try await openRawDevice("disk42", expected: devNullIdentity(), directOpen: { _ in .failed(errno: EACCES) },
+                                        elevated: openers(status: .notRegistered, helper: FailingOpener(error: .io("never")),
+                                                          password: password, log: log))
+        }
+        #expect(await log.entries == ["explain", "password", "recheck"])
+    }
+
+    @Test func helperAndDirectOpensSkipThePasswordRecheck() async throws {
+        let log = CallLog()
+        let direct = try await openRawDevice("disk42", expected: devNullIdentity(), directOpen: { _ in .opened(open("/dev/null", O_RDONLY)) },
+                                             elevated: openers(status: .enabled, helper: HelperFake(.devNull),
+                                                               password: FailingOpener(error: .io("never")), log: log, recheckError: .deviceChanged))
+        close(direct)
+        let viaHelper = try await openRawDevice("disk42", expected: devNullIdentity(), directOpen: { _ in .failed(errno: EACCES) },
+                                                elevated: openers(status: .enabled, helper: HelperFake(.devNull),
+                                                                  password: FailingOpener(error: .io("never")), log: log, recheckError: .deviceChanged))
+        close(viaHelper)
+        #expect(await log.entries == ["helper"])
     }
 
     @Test(arguments: [HelperRegistrationStatus.notRegistered, .requiresApproval, .notFound])
@@ -312,7 +367,7 @@ struct PasswordFallbackTests {
         let fd = try await openRawDevice("disk42", expected: devNullIdentity(), directOpen: { _ in .failed(errno: EACCES) },
                                          elevated: openers(status: status, helper: FailingOpener(error: .io("never")), password: password, log: log))
         defer { close(fd) }
-        #expect(await log.entries == ["explain", "password"])
+        #expect(await log.entries == ["explain", "password", "recheck"])
         #expect(fcntl(fd, F_GETFL) & O_ACCMODE == O_RDONLY)
     }
 
@@ -368,7 +423,7 @@ struct PasswordFallbackTests {
         let fd = try await openRawDevice("disk42", expected: devNullIdentity(), directOpen: { _ in .failed(errno: EACCES) },
                                          elevated: openers(status: .enabled, helper: FailingOpener(error: error), password: password, log: log))
         defer { close(fd) }
-        #expect(await log.entries == ["helper", "explain", "password"])
+        #expect(await log.entries == ["helper", "explain", "password", "recheck"])
     }
 
     @Test func writableDescriptorFromThePasswordPathIsClosedAndRefused() async throws {

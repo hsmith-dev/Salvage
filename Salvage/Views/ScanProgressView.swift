@@ -39,7 +39,7 @@ struct ScanProgressView: View {
             }
             if case .failed(let error) = model.state, error == .administratorPasswordNeeded {
                 // spec-tech-authopen: the password dialog was cancelled or left unanswered.
-                AdministratorPasswordExplanation(onTryAgain: { if let device = model.device { model.start(device) } })
+                AdministratorPasswordExplanation(onTryAgain: { model.retryAfterAdministratorPassword() })
             } else if case .failed(let error) = model.state {
                 let needsApproval = PrivilegedHelperApproval.isApprovalRequired(error)
                 Text(needsApproval ? PrivilegedHelperApproval.guidance : error.description).textSelection(.enabled)

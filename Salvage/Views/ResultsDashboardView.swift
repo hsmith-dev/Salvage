@@ -89,7 +89,9 @@ struct ResultsDashboardView: View {
                         }
                         if error == .permissionDenied || error == .administratorPasswordNeeded || scan.canRetryFromCheckpoint,
                            !scan.isActive, let device = scan.device {
-                            Button(error == .administratorPasswordNeeded ? "Try Again" : "Retry scan") { scan.start(device) }
+                            Button(error == .administratorPasswordNeeded ? "Try Again" : "Retry scan") {
+                                if error == .administratorPasswordNeeded { scan.retryAfterAdministratorPassword() } else { scan.start(device) }
+                            }
                         }
                     }
                 }

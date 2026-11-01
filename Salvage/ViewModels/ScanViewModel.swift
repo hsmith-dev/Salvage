@@ -51,6 +51,11 @@ final class ScanViewModel {
     private(set) var pendingCheckpoint: ScanCheckpoint?
     /// spec-tech-authopen: preparation is waiting on macOS's administrator-password dialog.
     private(set) var isAwaitingAdministratorPassword = false
+    /// FileVault credentials of a run that stopped only because the administrator password was
+    /// cancelled, kept for Try Again. Such a run never read the drive, so they were never used.
+    /// Handed to the retry (which zeroes them as any run does), and zeroed by any other start,
+    /// opening a saved scan, or teardown.
+    private var passwordRetryCredentials: [String: VolumeCredential] = [:]
     /// True once the core has actually resumed from the checkpoint: the run's first progress event
     /// reports bytes already covered. A checkpoint the core rejected starts from zero and leaves this false.
     private(set) var resumedFromCheckpoint = false
@@ -133,6 +138,7 @@ final class ScanViewModel {
     /// Window teardown. Cancels the scan's Task like `cancel()`, but writes the latest checkpoint
     /// first and keeps it, so the interrupted scan can be resumed later.
     func stopForTeardown() {
+        discardPasswordRetryCredentials()
         releaseSource()
         guard let task else { return }
         if stopReason == nil { stopReason = .teardown }
@@ -140,7 +146,25 @@ final class ScanViewModel {
         task.cancel()
     }
 
+    /// Try Again after a cancelled administrator password: the same scan, with the same
+    /// FileVault credentials if it had any.
+    func retryAfterAdministratorPassword() {
+        guard state == .failed(.administratorPasswordNeeded), !isActive, let device else { return }
+        let credentials = passwordRetryCredentials
+        passwordRetryCredentials = [:]
+        start(device, credentials: credentials)
+    }
+
+    /// Whether Try Again would reuse FileVault credentials (exposed for tests).
+    var hasPasswordRetryCredentials: Bool { !passwordRetryCredentials.isEmpty }
+
+    private func discardPasswordRetryCredentials() {
+        for credential in passwordRetryCredentials.values { credential.zero() }
+        passwordRetryCredentials = [:]
+    }
+
     private func reset(for device: BlockDevice) {
+        discardPasswordRetryCredentials()
         self.device = device; files = []; seenFiles = []; bytesScanned = 0; totalBytes = 0
         lostPartitions = []; unlockRequests = []
         notices = []
@@ -254,6 +278,9 @@ final class ScanViewModel {
             case .completed: keep = false
             case .cancelled: keep = stopReason == .teardown
             default: keep = true
+            }
+            if state == .failed(.administratorPasswordNeeded), stopReason == nil, !credentials.isEmpty {
+                passwordRetryCredentials = credentials
             }
             if keep {
                 if let latestCheckpoint { save(latestCheckpoint, for: device) }

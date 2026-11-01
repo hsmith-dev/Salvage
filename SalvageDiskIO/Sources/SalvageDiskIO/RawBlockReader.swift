@@ -178,11 +178,21 @@ struct ElevatedOpeners: Sendable {
     var password: any PrivilegedOpening
     /// Runs just before `password` is asked, so the app can explain the dialog first.
     var willAskForPassword: @Sendable () async -> Void
+    /// Re-checks, after the password path returns, that the drive is still the expected one and
+    /// still unmounted: the dialog can stay up for minutes, and unlike the helper, authopen
+    /// checks neither. Throws the reason (`deviceChanged`, or "mounted again").
+    var recheckAfterPassword: @Sendable () async throws -> Void = {}
 
     static func live(onPasswordPrompt: @escaping @Sendable () async -> Void) -> ElevatedOpeners {
         let helper = PrivilegedOpenClient.live
         return ElevatedOpeners(helper: helper, helperStatus: { await helper.control.status() },
                                password: AuthopenClient.live, willAskForPassword: onPasswordPrompt)
+    }
+
+    func with(recheckAfterPassword recheck: @escaping @Sendable () async throws -> Void) -> ElevatedOpeners {
+        var copy = self
+        copy.recheckAfterPassword = recheck
+        return copy
     }
 }
 
@@ -216,7 +226,20 @@ func openRawDevice(_ name: String, expected: RawDeviceIdentity, directOpen: (Str
             try Task.checkCancellation()
             await elevated.willAskForPassword()
             try Task.checkCancellation()
-            descriptor = try await elevated.password.openWholeDiskReadOnly(request)
+            do {
+                descriptor = try await elevated.password.openWholeDiskReadOnly(request)
+            } catch ScanError.administratorPasswordNeeded {
+                // authopen's exit status doesn't tell a cancelled dialog from a failed open, so a
+                // drive that was unplugged or replaced meanwhile is reported as such instead.
+                try await elevated.recheckAfterPassword()
+                throw ScanError.administratorPasswordNeeded
+            }
+            do {
+                try await elevated.recheckAfterPassword()
+            } catch {
+                Darwin.close(descriptor)
+                throw error
+            }
         }
     case .failed(let code):
         throw ScanError.io(String(cString: strerror(code)))
@@ -305,7 +328,10 @@ private actor NativeRawDeviceOperations: RawDeviceOperations {
         return try await openRawDevice(name, expected: expected, directOpen: { path in
             let fd = Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
             return fd >= 0 ? .opened(fd) : .failed(errno: errno)
-        }, elevated: elevated)
+        }, elevated: elevated.with(recheckAfterPassword: { [self] in
+            guard try await identity(name) == expected else { throw ScanError.deviceChanged }
+            try ensureUnmounted(name, sources: ownedMountSources(), ancestorWholeDisks: registryAncestorWholeDisks(ofMediaNamed:))
+        }))
     }
     func closeDescriptor(_ descriptor: Int32) async { Darwin.close(descriptor) }
 }

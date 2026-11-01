@@ -130,6 +130,21 @@ optional "skip the password next time" path in signed builds.
     it was closed, and this made a strict check flaky under parallel runs.
   - App tests: the explanation flag and Try Again (`ScanViewModelTests`), reconnect after a
     cancelled password and the banner copy (`ScanArchiveTests`).
+- **Review follow-ups (second commit):**
+  - After the password path returns a descriptor, `ElevatedOpeners.recheckAfterPassword` re-checks
+    the drive's identity and runs `ensureUnmounted` again, because the dialog can stay up for
+    minutes and authopen checks neither. On failure the descriptor is closed and the reason is
+    thrown (`deviceChanged`, or "mounted again"). The helper and direct paths skip it, since the
+    helper re-checks mounts itself.
+  - When authopen fails with no descriptor, the same recheck runs first, so an unplugged or
+    replaced drive reports `deviceChanged` instead of "needs your administrator password".
+    authopen's exit status and stderr aren't documented as telling a cancel from an open
+    failure, so neither is parsed, and stderr stays on `/dev/null`.
+  - Try Again (`ScanViewModel.retryAfterAdministratorPassword`) reuses the FileVault credentials
+    of the run that stopped at the password. That run never read the drive, so the credentials
+    were never used. They are kept only for that failure. The retry consumes them, and the run
+    zeroes them after use as before. Any other start, opening a saved scan (`reset`) or teardown
+    zeroes kept ones.
 - **Not verified:** the real dialog was never shown. These are untested on real hardware:
   - authopen's exit status on Cancel, which the code treats as any non-zero exit with no fd;
   - what happens to the SecurityAgent dialog when authopen is terminated mid-prompt;
@@ -137,6 +152,3 @@ optional "skip the password next time" path in signed builds.
   - whether a descriptor authopen opens for a removable drive is then readable without Full Disk
     Access (TCC).
 
-  A removed drive makes authopen fail too, and that is currently reported as
-  `.administratorPasswordNeeded`. Try Again then surfaces `deviceChanged` from the identity
-  check.
