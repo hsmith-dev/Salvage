@@ -2,7 +2,7 @@
 title: 'CI and Test Hygiene from the Deferred List'
 type: 'tech'
 created: '2026-10-31'
-status: 'ready-for-dev'
+status: 'done'
 baseline_commit: 'd04d613'
 route: 'dispatch'
 context:

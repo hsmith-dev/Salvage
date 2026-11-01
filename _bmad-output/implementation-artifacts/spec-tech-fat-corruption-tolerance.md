@@ -2,7 +2,7 @@
 title: 'FAT32/exFAT: Skip a Damaged File Instead of Failing the Volume'
 type: 'tech'
 created: '2026-10-31'
-status: 'ready-for-dev'
+status: 'done'
 baseline_commit: 'd04d613'
 route: 'dispatch'
 context:

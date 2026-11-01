@@ -2,7 +2,7 @@
 title: 'Unlock and Recover from a FileVault-Encrypted Volume'
 type: 'feature'
 created: '2026-10-31'
-status: 'review'
+status: 'done'
 baseline_commit: '4d050bd'
 route: 'dispatch'
 context:

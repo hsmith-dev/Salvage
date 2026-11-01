@@ -2,7 +2,7 @@
 title: 'Carving: Exact Ends for MP3, OLE2 and gzip, and Bifragment JPEG Reassembly'
 type: 'tech'
 created: '2026-10-31'
-status: 'ready-for-dev'
+status: 'done'
 baseline_commit: 'd04d613'
 route: 'dispatch'
 context:

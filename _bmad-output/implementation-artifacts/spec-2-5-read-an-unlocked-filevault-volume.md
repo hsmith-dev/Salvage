@@ -2,7 +2,7 @@
 title: 'Read an Encrypted (FileVault) APFS Volume'
 type: 'feature'
 created: '2026-10-31'
-status: 'review'
+status: 'done'
 baseline_commit: 'd04d613'
 route: 'dispatch'
 context:
