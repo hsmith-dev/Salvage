@@ -18,6 +18,8 @@ public enum ScanNotice: Sendable, Equatable {
     case resumedCarvingPartial
     /// A mapped volume whose metadata couldn't be read; the rest of the device was still scanned.
     case volumeSkipped(formatName: String, offset: Int64, reason: String)
+    /// Damaged files or folders on a volume were skipped (never listed with wrong contents).
+    case damagedItemsSkipped(count: Int, examples: [String])
 
     /// Plain-language text for the dashboard (EXPERIENCE.md voice: short, complete, factual).
     public var text: String {
@@ -38,6 +40,11 @@ public enum ScanNotice: Sendable, Equatable {
             return "This scan continued from where it was interrupted. Reconstructed files from the part scanned before aren't listed; start the scan over to include them."
         case .volumeSkipped(let name, let offset, let reason):
             return "Salvage couldn't read the \(name) volume that starts \(Self.bytes(offset)) into this drive, so some of its files may be missing. \(reason) The rest of the drive was still scanned."
+        case .damagedItemsSkipped(let count, let examples):
+            let list = examples.isEmpty ? "" : " For example: \(examples.joined(separator: ", "))."
+            return count == 1
+                ? "1 damaged file or folder was skipped rather than listed with the wrong contents.\(list)"
+                : "\(count.formatted()) damaged files or folders were skipped rather than listed with the wrong contents, or flagged as possibly damaged.\(list)"
         }
     }
 

@@ -51,7 +51,8 @@ private func run(_ reader: any BlockReader) async -> Outcome { await run(ScanSes
 private func run(_ image: Data) async -> Outcome { await run(ImageReader(data: image)) }
 
 private func damagedExFAT() -> Data {
-    var damaged = exfatImage(); damaged[25 * 512 + 66] ^= 1   // corrupt entry-set checksum
+    // Structural damage (bad allocation-bitmap length) fails the volume; per-file damage no longer does.
+    var damaged = exfatImage(); damaged.put(25 * 512 + 120, 14, 8)
     return damaged
 }
 
@@ -183,5 +184,22 @@ struct ScanNoticeTests {
         }
         #expect(ScanNotice.carvingLimitReached(count: 250_000).text.contains("250,000"))
         #expect(ScanNotice.volumeSkipped(formatName: "NTFS", offset: 1_048_576, reason: "R.").text.contains("NTFS volume that starts 1 MB into"))
+    }
+}
+
+@Suite("Damaged FAT items become a notice")
+struct DamagedItemsNoticeTests {
+    @Test func noticeTextCountsAndGivesExamples() {
+        #expect(ScanNotice.damagedItemsSkipped(count: 1, examples: ["/A.TXT"]).text.hasPrefix("1 damaged file or folder was skipped"))
+        #expect(ScanNotice.damagedItemsSkipped(count: 3, examples: ["/A", "/B"]).text.contains("For example: /A, /B."))
+    }
+    @Test func cleanVolumeProducesNoDamagedItemsNotice() async {
+        let (stream, events) = AsyncStream<ScanEvent>.makeStream()
+        let (noticeStream, notices) = AsyncStream<ScanNotice>.makeStream()
+        await ScanSession(reader: ImageReader(data: fatImage())).run(events: events, notices: notices)
+        for await _ in stream {}
+        var collected: [ScanNotice] = []
+        for await notice in noticeStream { collected.append(notice) }
+        #expect(!collected.contains { if case .damagedItemsSkipped = $0 { true } else { false } })
     }
 }

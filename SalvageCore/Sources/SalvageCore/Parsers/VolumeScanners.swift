@@ -34,14 +34,25 @@ enum VolumeFormat: Sendable, Equatable {
 /// Runs the metadata parser for one volume. Parsers emit `.found`; APFS may also emit
 /// `.unlockRequired` for an encrypted volume (carrying `device` annotated with the volume).
 func scanVolume(_ extent: VolumeExtent, reader: any BlockReader, device: BlockDevice?,
+                notice: @escaping @Sendable (ScanNotice) -> Void = { _ in },
                 emit: @escaping @Sendable (ScanEvent) async throws -> Void) async throws {
     let found: @Sendable (RecoveredFile) async throws -> Void = { try await emit(.found($0)) }
     switch extent.format {
-    case .fat: try await FATVolume(reader: reader, extent: extent, emit: found).scan()
+    case .fat:
+        let volume = FATVolume(reader: reader, extent: extent, emit: found)
+        do { try await volume.scan() } catch { await reportSkipped(volume, notice: notice); throw error }
+        await reportSkipped(volume, notice: notice)
     case .ntfs: try await NTFSVolume(reader: reader, extent: extent, emit: found).scan()
     case .ext: try await EXTVolume(reader: reader, extent: extent, emit: found).scan()
     case .apfs: try await APFSContainer(reader: reader, extent: extent, device: device, emit: emit).scan()
     case .hfsPlus: try await HFSPlusVolume(reader: reader, extent: extent, emit: found).scan()
     case .raw: break
     }
+}
+
+private func reportSkipped(_ volume: FATVolume, notice: @Sendable (ScanNotice) -> Void) async {
+    let count = await volume.skippedCount
+    guard count > 0 else { return }
+    let examples = await volume.skipped.prefix(3).map(\.path)
+    notice(.damagedItemsSkipped(count: count, examples: Array(examples)))
 }

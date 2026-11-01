@@ -66,6 +66,31 @@ func exfatImage() -> Data {
     return image
 }
 
+/// What one `FATVolume` emitted and skipped when driven directly, and the error it stopped on, if any.
+struct FATVolumeResult {
+    var files: [RecoveredFile]
+    var skipped: [(path: String, reason: String)]
+    var skippedCount: Int
+    var error: (any Error)?
+    var names: [String] { files.map(\.name) }
+    func skipped(_ path: String, _ reason: String) -> Bool {
+        skipped.contains { $0.path == path && $0.reason.contains(reason) }
+    }
+}
+private actor FATVolumeFiles {
+    var files: [RecoveredFile] = []
+    func add(_ file: RecoveredFile) { files.append(file) }
+}
+func scanFATVolume(_ image: Data, reader: (any BlockReader)? = nil) async -> FATVolumeResult {
+    let collected = FATVolumeFiles(), source = reader ?? ImageReader(data: image)
+    let volume = FATVolume(reader: source, extent: VolumeExtent(offset: 0, length: source.sizeBytes),
+                           localTimeZone: TimeZone(identifier: "UTC")!, emit: { await collected.add($0) })
+    var failure: (any Error)?
+    do { try await volume.scan() } catch { failure = error }
+    return FATVolumeResult(files: await collected.files, skipped: await volume.skipped,
+                           skippedCount: await volume.skippedCount, error: failure)
+}
+
 func scan(_ image: Data, logicalBlockSize: Int = 512) async -> [ScanEvent] {
     let (stream, events) = AsyncStream<ScanEvent>.makeStream()
     await ScanSession(reader: ImageReader(data: image, logicalBlockSize: logicalBlockSize)).run(events: events)
@@ -105,15 +130,17 @@ struct ScanSessionTests {
         image[root+13] ^= 1
         #expect((await scan(image)).contains { if case .found(let file) = $0 { file.path == "/HELLO.TXT" } else { false } })
     }
-    @Test func priorDiscoveriesSurviveLaterCorruption() async {
+    @Test func laterDamagedFileIsSkippedAndTheScanCompletes() async {
         var image = fatImage(nested: false)
         let root = 552*512
         image.text(root+32, "BROKEN  TXT"); image.put(root+58, 4, 2); image.put(root+60, 5, 4)
         image.put(32*512+4*4, 4, 4)
         let events = await scan(image)
-        #expect(events.contains { if case .found(let file) = $0 { file.name == "HELLO.TXT" } else { false } })
-        #expect(events.contains { if case .error(.malformed) = $0 { true } else { false } })
-        #expect(!events.contains(.completed))
+        #expect(events.compactMap { if case .found(let file) = $0 { file.name } else { nil } } == ["HELLO.TXT"])
+        #expect(!events.contains { if case .error = $0 { true } else { false } })
+        #expect(events.last == .completed)
+        let volume = await scanFATVolume(image)
+        #expect(volume.error == nil && volume.skippedCount == 1 && volume.skipped("/BROKEN.TXT", "Allocation cycle"))
     }
     @Test func discoveryIsDeliveredWhileScanStillRuns() async {
         let (stream, events) = AsyncStream<ScanEvent>.makeStream()
@@ -166,24 +193,39 @@ struct ScanSessionTests {
         #expect(result.last == .completed)
         #expect(result.contains { if case .found(let file) = $0 { file.name == "file.txt" } else { false } })
     }
-    @Test func activeBitmapRejectsFreeAndPartiallyAllocatedStreams() async {
+    @Test func activeBitmapSkipsFreeAndPartiallyAllocatedStreams() async {
         let root = 25*512
         var free = exfatImage(); free[123*512] &= ~UInt8(2)
         let result = await scan(free)
         #expect(!result.contains { if case .found = $0 { true } else { false } })
-        #expect(result.contains { if case .error(.malformed) = $0 { true } else { false } })
+        #expect(result.last == .completed)
+        #expect((await scanFATVolume(free)).skipped("/file.txt", "free allocation cluster"))
         var partial = exfatImage()
         partial.put(root+40, 600, 8); partial.put(root+56, 600, 8)
         updateSetChecksum(&partial, offset: root, count: 96)
         partial[123*512] &= ~UInt8(4)
-        #expect(!(await scan(partial)).contains(.completed))
+        let partialResult = await scanFATVolume(partial)
+        #expect(partialResult.error == nil && partialResult.files.isEmpty)
+        #expect(partialResult.skipped("/file.txt", "free allocation cluster"))
     }
-    @Test func crossLinkedFilesAndDirectoryAreRejected() async {
+    @Test func crossLinkedFileAndDirectoryAreSkipped() async {
+        // SECOND.TXT claims HELLO.TXT's cluster: the later owner is skipped, the earlier one (already
+        // emitted, never retracted) is flagged suspect.
         var files = fatImage(nested: false); let root = 552*512
         files.text(root+32, "SECOND  TXT"); files.put(root+58, 3, 2); files.put(root+60, 5, 4)
-        #expect(!(await scan(files)).contains(.completed))
+        let events = await scan(files)
+        #expect(events.compactMap { if case .found(let file) = $0 { file.name } else { nil } } == ["HELLO.TXT"])
+        #expect(events.last == .completed)
+        let fileResult = await scanFATVolume(files)
+        #expect(fileResult.error == nil && fileResult.skippedCount == 2)
+        #expect(fileResult.skipped("/SECOND.TXT", "Cross-linked allocations with /HELLO.TXT"))
+        #expect(fileResult.skipped("/HELLO.TXT", "cross-link with /SECOND.TXT"))
+        // A directory cross-linked with a file is skipped with its subtree.
         var directory = fatImage(); directory.put(root+58, 3, 2)
-        #expect(!(await scan(directory)).contains(.completed))
+        let directoryResult = await scanFATVolume(directory)
+        #expect(directoryResult.error == nil && directoryResult.names == ["HELLO.TXT"])
+        #expect(directoryResult.skipped("/FOLDER", "Directory skipped with its contents: Cross-linked"))
+        #expect((await scan(directory)).last == .completed)
     }
     @Test func malformedFilenameEncodingsAreNotSilentlyReplaced() async {
         let root = 552*512
@@ -199,9 +241,26 @@ struct ScanSessionTests {
             image.replaceSubrange(root..<root+32, with: long); image.replaceSubrange(root+32..<root+64, with: entry)
             #expect((await scan(image)).contains { if case .found(let file) = $0 { file.name == "HELLO.TXT" } else { false } })
         }
+        // A well-formed long name that is not a usable filename also falls back to the 8.3 name.
+        var slash = fatImage(nested: false)
+        let entry = slash.subdata(in: root..<root+32)
+        var long = Data(repeating: 0xff, count: 32)
+        long[0] = 0x41; long[11] = 0x0f; long[12] = 0; long[26] = 0; long[27] = 0
+        var sum: UInt8 = 0
+        for byte in entry.prefix(11) { sum = ((sum & 1) << 7) &+ (sum >> 1) &+ byte }
+        long[13] = sum
+        for (index, unit) in "a/b".utf16.enumerated() { long.put([1,3,5][index], UInt64(unit), 2) }
+        long.put(7, 0, 2)
+        slash.replaceSubrange(root..<root+32, with: long); slash.replaceSubrange(root+32..<root+64, with: entry)
+        #expect((await scanFATVolume(slash)).names == ["HELLO.TXT"])
+        // exFAT has no 8.3 name to fall back to: the entry is skipped and the scan goes on.
         var exfat = exfatImage(); exfat.put(25*512+66, 0xd800, 2)
         updateSetChecksum(&exfat, offset: 25*512, count: 96)
-        #expect(!(await scan(exfat)).contains(.completed))
+        let events = await scan(exfat)
+        #expect(!events.contains { if case .found = $0 { true } else { false } })
+        #expect(events.last == .completed)
+        let result = await scanFATVolume(exfat)
+        #expect(result.skippedCount == 1 && result.skipped.first?.reason.contains("filename encoding") == true)
     }
     @Test func adjacentFATChainUsesBoundedCachedPages() async throws {
         var image = fatImage(nested: false)
@@ -234,12 +293,10 @@ struct ScanSessionTests {
         #expect(discoveries == 12 && completed)
     }
     @Test func boundedConsumerReceivesErrorAndFullQueueCancellationTerminates() async {
-        var image = fatImage(nested: false); let root = 552*512
-        image.text(root+32, "BROKEN  TXT"); image.put(root+58, 4, 2); image.put(root+60, 5, 4)
-        image.put(32*512+4*4, 4, 4)
-        let source = image
+        // HELLO.TXT is found in the root, then reading FOLDER's directory cluster fails.
+        let source = FailingImageReader(data: fatImage(), failingOffset: Int64(552*512 + 2*512))
         let (stream, events) = AsyncStream<ScanEvent>.makeStream(bufferingPolicy: .bufferingOldest(1))
-        let task = Task { await ScanSession(reader: ImageReader(data: source)).run(events: events) }
+        let task = Task { await ScanSession(reader: source).run(events: events) }
         var found = false, failed = false
         for await event in stream {
             for _ in 0..<100 { await Task.yield() }
@@ -272,17 +329,31 @@ struct ScanSessionTests {
         // produce exactly five MiB of new measured work between intermediate updates.
         #expect(zip(intermediate, intermediate.dropFirst()).allSatisfy { $1 - $0 == 5 * 1024 * 1024 })
     }
-    @Test func corruptExFATEntryChecksumStopsScan() async {
+    @Test func corruptExFATEntryChecksumSkipsOnlyThatEntry() async {
         var image = exfatImage(); image[25*512+66] ^= 1
         let events = await scan(image)
-        #expect(!events.contains(.completed))
-        #expect(events.contains { if case .error(.malformed) = $0 { true } else { false } })
+        #expect(!events.contains { if case .found = $0 { true } else { false } })
+        #expect(events.last == .completed)
+        let result = await scanFATVolume(image)
+        #expect(result.error == nil && result.skipped.map(\.reason) == ["Invalid exFAT file entry set."])
+        #expect(result.skipped.first?.path == "/<entry at byte \(25*512)>")
     }
-    @Test func fileAllocationCycleStopsWithoutCompletion() async {
+    @Test func fileAllocationCycleIsSkipped() async {
         var image = fatImage(nested: false); image.put(32*512+3*4, 3, 4)
         let events = await scan(image)
-        #expect(!events.contains(.completed))
-        #expect(events.contains { if case .error(.malformed) = $0 { true } else { false } })
+        #expect(!events.contains { if case .found = $0 { true } else { false } })
+        #expect(events.last == .completed)
+        #expect((await scanFATVolume(image)).skipped("/HELLO.TXT", "Allocation cycle"))
+    }
+    @Test func structuralDamageStillFailsTheVolume() async {
+        // The root directory's own chain is structural: a cycle there fails closed.
+        var rootCycle = fatImage(); rootCycle.put(32*512+2*4, 2, 4)
+        let rootResult = await scanFATVolume(rootCycle)
+        #expect(rootResult.files.isEmpty && rootResult.error as? ScanError == .malformed("Allocation cycle."))
+        #expect(!(await scan(rootCycle)).contains(.completed))
+        // So is the allocation bitmap's.
+        var bitmap = exfatImage(); bitmap.put(25*512+120, 14, 8)
+        #expect((await scanFATVolume(bitmap)).error as? ScanError == .malformed("Invalid allocation bitmap length."))
     }
     @Test func truncatedImageIsAnErrorAndAnEmptySectorIsSweptRaw() async {
         let truncated = await scan(Data(repeating: 0, count: 12))
@@ -399,7 +470,7 @@ struct ScanSessionTests {
         #expect(sectors.contains { if case .error(.malformed(let reason)) = $0 { reason.contains("512-byte logical sectors") } else { false } })
     }
     @Test(arguments: ["end marker", "volume label", "dot entry", "chain exhausted"])
-    func orphanedLongFilenameRunIsMalformed(_ terminator: String) async {
+    func orphanedLongFilenameRunIsSkipped(_ terminator: String) async {
         var image = fatImage(nested: false); let root = 552*512
         switch terminator {
         case "end marker":
@@ -416,8 +487,10 @@ struct ScanSessionTests {
         }
         let events = await scan(image)
         #expect(events.contains { if case .found(let file) = $0 { file.name == "HELLO.TXT" } else { false } })
-        #expect(events.contains { if case .error(.malformed(let reason)) = $0 { reason.contains("long filename") } else { false } })
-        #expect(!events.contains(.completed))
+        #expect(events.last == .completed)
+        let result = await scanFATVolume(image)
+        #expect(result.error == nil && result.names == ["HELLO.TXT"])
+        #expect(result.skippedCount == 1 && result.skipped.first?.reason.contains("long filename") == true)
     }
     @Test func deletedLongFilenameSlotsAreStillTolerated() async {
         let root = 552*512
@@ -451,9 +524,10 @@ struct ScanSessionTests {
         #expect(valid.last == .completed)
         #expect(valid.contains { if case .found(let file) = $0 { file.name == "file.txt" } else { false } })
         // The contiguous file occupies cluster 3; an up-case table chained there is a cross-link.
-        let overlap = await scan(withUpcase(cluster: 3, length: 5))
-        #expect(!overlap.contains(.completed))
-        #expect(overlap.contains { if case .error(.malformed(let reason)) = $0 { reason.contains("Cross-linked") } else { false } })
+        // The table is claimed first, so the file is the later owner and is skipped.
+        let overlap = await scanFATVolume(withUpcase(cluster: 3, length: 5))
+        #expect(overlap.error == nil && overlap.files.isEmpty)
+        #expect(overlap.skipped("/file.txt", "Cross-linked allocations with up-case table"))
         // An up-case length larger than its one-cluster chain is truncated metadata.
         let truncated = await scan(withUpcase(cluster: 10, length: 5000))
         #expect(!truncated.contains(.completed))
@@ -509,6 +583,15 @@ private struct SlowSweepReader: BlockReader {
     }
 }
 
+/// Throws an I/O error for the one read starting at `failingOffset`.
+private struct FailingImageReader: BlockReader {
+    let data: Data, failingOffset: Int64
+    var sizeBytes: Int64 { Int64(data.count) }
+    func read(at offset: Int64, count: Int) async throws -> Data {
+        if offset == failingOffset { throw ScanError.io("Injected read failure") }
+        return try await ImageReader(data: data).read(at: offset, count: count)
+    }
+}
 private func lfnSlot() -> Data {
     var long = Data(repeating: 0xff, count: 32)
     long[0] = 0x41; long[11] = 0x0f; long[12] = 0; long[13] = 0; long[26] = 0; long[27] = 0

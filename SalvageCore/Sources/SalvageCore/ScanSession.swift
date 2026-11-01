@@ -61,7 +61,7 @@ public struct ScanSession: Sendable, Identifiable {
             var parserFailed = Set<Int>(), unreadable = Set<Int>()
             for (index, extent) in extents.enumerated() {
                 do {
-                    try await scanVolume(extent, reader: measured, device: device, emit: { event in
+                    try await scanVolume(extent, reader: measured, device: device, notice: { notices?.yield($0) }, emit: { event in
                         if case .found(let file) = event, case .runs(let runs) = file.content { await claimed.add(runs) }
                         try await emit(event)
                     })
