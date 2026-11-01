@@ -284,12 +284,14 @@ struct ScanSessionTests {
         #expect(!events.contains(.completed))
         #expect(events.contains { if case .error(.malformed) = $0 { true } else { false } })
     }
-    @Test func unsupportedAndTruncatedImagesAreErrors() async {
-        for image in [Data(repeating: 0, count: 512), Data(repeating: 0, count: 12)] {
-            let events = await scan(image)
-            #expect(!events.contains(.completed))
-            #expect(events.contains { if case .error = $0 { true } else { false } })
-        }
+    @Test func truncatedImageIsAnErrorAndAnEmptySectorIsSweptRaw() async {
+        let truncated = await scan(Data(repeating: 0, count: 12))
+        #expect(!truncated.contains(.completed))
+        #expect(truncated.contains { if case .error = $0 { true } else { false } })
+        // Nothing recognized and no table: one raw extent is swept so completion is honest (FR-9 fallback).
+        let empty = await scan(Data(repeating: 0, count: 512))
+        #expect(empty.last == .completed)
+        #expect(!empty.contains { if case .found = $0 { true } else { false } })
     }
     @Test func MBRPartitionIsBounded() async {
         let volume = exfatImage()
@@ -314,9 +316,12 @@ struct ScanSessionTests {
         #expect(events.contains(.progress(bytesScanned: Int64(volume.count), totalBytes: Int64(volume.count))))
         #expect(events.allSatisfy { if case .found(let file) = $0 { file.sourceMetadata.volumeOffset == 512 } else { true } })
     }
-    @Test func unrecognizedWholeDiskIsUnsupported() async {
+    @Test func unrecognizedWholeDiskIsSweptAsOneRawExtent() async {
         let events = await scan(Data(repeating: 0x5a, count: 16 * 512))
-        #expect(events == [.error(.unsupportedFilesystem)])
+        #expect(events.last == .completed)
+        #expect(events.contains(.progress(bytesScanned: 16 * 512, totalBytes: 16 * 512)))
+        #expect(!events.contains { if case .found = $0 { true } else { false } })
+        #expect(!events.contains { if case .lostPartitionFound = $0 { true } else { false } })
     }
     @Test func cancellationNeverCompletes() async {
         let (stream, events) = AsyncStream<ScanEvent>.makeStream()

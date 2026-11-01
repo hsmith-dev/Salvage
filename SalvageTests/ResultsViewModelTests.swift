@@ -319,6 +319,81 @@ struct ResultsViewModelTests {
         #expect(model.visibleRows.count == 11)
     }
 
+    // MARK: Lost partitions (Stories 3.3 + 3.4)
+
+    func lostFile(_ name: String, volume: Int64, content: FileContent? = nil) -> RecoveredFile {
+        RecoveredFile(name: name, path: "/\(name)", sizeBytes: 10,
+                      sourceMetadata: SourceMetadata(filesystem: .exfat, volumeOffset: volume, recordOffset: volume + 512,
+                                                     allocationStart: 2, contiguous: true, rawRecord: Data()),
+                      content: content ?? .runs([DataRun(deviceOffset: volume + 4096, length: 4096)]))
+    }
+
+    @Test func lostPartitionCardScopesTheBrowserToItsVolumeAndCountsItsFiles() async {
+        let mib: Int64 = 1 << 20
+        let lost = LostPartitionCandidate(offset: mib, sizeBytes: 65536, formatName: "exFAT")
+        let mounted = file("a.jpg")                                    // volume 0
+        let b = lostFile("b.jpg", volume: mib), c = lostFile("c.mp3", volume: mib)
+        let unmapped = lostFile("d.jpg", volume: mib, content: .unmapped)
+        let hidden = lostFile("._b.jpg", volume: mib)
+        let model = ResultsViewModel(files: [mounted, b, c, unmapped, hidden], lostPartitions: [lost])
+        #expect(model.lostPartitions == [lost])
+        // The card counts recoverable files under the current system-files setting, like the tiles.
+        #expect(model.fileCount(in: lost) == 2)
+        model.showSystemFiles = true
+        #expect(model.fileCount(in: lost) == 3)
+        model.showSystemFiles = false
+        // The type grid still counts everything; scoping is the browser's job.
+        #expect(model.recoverableCount == 3)
+        await model.refresh()
+        #expect(model.visibleRows.count == 4)
+        #expect(model.scopedLostPartition == nil)
+        // Scoped to the card: mounted-volume files never appear, unmapped ones from the partition still do.
+        model.volumeFilter = mib
+        await model.refresh()
+        #expect(Set(model.visibleRows.map(\.name)) == ["b.jpg", "c.mp3", "d.jpg"])
+        #expect(model.scopedLostPartition == lost)
+        let title = ResultsViewModel.lostPartitionTitle(lost)
+        #expect(title.hasPrefix("Lost partition — exFAT, "))
+        #expect(model.browserTitle == "\(title) — 2 files, 1 can't be recovered")
+        model.category = .pictures
+        await model.refresh()
+        #expect(model.visibleRows.map(\.name) == ["b.jpg", "d.jpg"])
+        #expect(model.browserTitle == "\(title) · Pictures — 1 file, 1 can't be recovered")
+        // Back to every volume: the mounted file is listed again.
+        model.volumeFilter = nil; model.category = nil
+        await model.refresh()
+        #expect(model.visibleRows.count == 4)
+        #expect(model.browserTitle == "All files — 3 files, 1 can't be recovered")
+        // A scope for an offset the scan never reported is not a lost partition.
+        model.volumeFilter = 0
+        #expect(model.scopedLostPartition == nil)
+        #expect(ResultsViewModel.lostPartitionLocation(lost).hasSuffix("(sector \((2048).formatted()))"))
+    }
+
+    @Test func lostPartitionsAreOrderedByOffsetAndCountedEvenWhenEmpty() {
+        let second = LostPartitionCandidate(offset: 4 << 20, sizeBytes: 1 << 20, formatName: "NTFS")
+        let first = LostPartitionCandidate(offset: 1 << 20, sizeBytes: 1 << 20, formatName: "FAT32")
+        let model = ResultsViewModel(files: [lostFile("x.jpg", volume: 4 << 20)], lostPartitions: [second, first])
+        #expect(model.lostPartitions == [first, second])
+        #expect(model.fileCount(in: first) == 0)
+        #expect(model.fileCount(in: second) == 1)
+        #expect(ResultsViewModel(files: []).lostPartitions.isEmpty)
+    }
+
+    @Test func scanViewModelCollectsLostPartitionsInEventOrder() async {
+        let a = LostPartitionCandidate(offset: 1 << 20, sizeBytes: 65536, formatName: "exFAT")
+        let b = LostPartitionCandidate(offset: 8 << 20, sizeBytes: 1 << 20, formatName: "EXT2/3/4")
+        let model = ScanViewModel { _, events in
+            try await events.send(.lostPartitionFound(a))
+            try await events.send(.lostPartitionFound(b))
+            try await events.send(.completed)
+        }
+        model.start(BlockDevice(bsdName: "disk42", displayName: "Fixture", sizeBytes: 16 << 20, isInternal: false, isBootVolume: false))
+        while model.isActive { await Task.yield() }
+        #expect(model.state == .completed)
+        #expect(model.lostPartitions == [a, b])
+    }
+
     @Test func confidenceLabelAnnouncesTheWord() {
         #expect(ConfidenceLabel(confidence: .high).accessibilityText == "Recovery confidence High")
         #expect(ConfidenceLabel(confidence: .low).accessibilityText == "Recovery confidence Low")

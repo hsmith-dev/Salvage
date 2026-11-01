@@ -52,6 +52,8 @@ final class ResultsViewModel {
         var showSystemFiles: Bool
         var sortField: SortField
         var ascending: Bool
+        /// Scopes the browser to one volume's files (a Lost Partitions card); nil shows every volume.
+        var volume: Int64? = nil
     }
 
     /// The dashboard's totals for one `showSystemFiles` setting.
@@ -62,6 +64,8 @@ final class ResultsViewModel {
         var recoverableBytes: Int64
         /// Found but unmapped: shown separately, never part of the recoverable totals.
         var unrecoverableCount: Int
+        /// Recoverable files per lost partition (FR-9), keyed by the partition's device offset.
+        var lostPartitionFileCounts: [Int64: Int] = [:]
     }
 
     /// What the dashboard says when there is nothing to show in the type tiles.
@@ -91,6 +95,11 @@ final class ResultsViewModel {
     static let searchDebounce: Duration = .milliseconds(150)
 
     let rows: [Row]
+    /// Filesystems found in unallocated space (FR-9), in device order. Their files are in `rows`,
+    /// grouped by `sourceMetadata.volumeOffset == candidate.offset`.
+    let lostPartitions: [LostPartitionCandidate]
+    /// The File Browser's volume scope: a lost partition's offset, or nil for every volume.
+    var volumeFilter: Int64?
     /// Rows the browser currently shows, filtered and sorted off the main actor by `refresh()`.
     private(set) var visibleRows: [Row] = []
     /// Recoverable and unrecoverable counts within `visibleRows`, for the browser title.
@@ -121,21 +130,24 @@ final class ResultsViewModel {
     private let applyQuery: Apply
     private let sleep: Sleep
 
-    convenience init(files: [RecoveredFile]) { self.init(rows: files.map(Row.init)) }
+    convenience init(files: [RecoveredFile], lostPartitions: [LostPartitionCandidate] = []) {
+        self.init(rows: files.map(Row.init), lostPartitions: lostPartitions)
+    }
 
-    init(rows: [Row],
+    init(rows: [Row], lostPartitions: [LostPartitionCandidate] = [],
          apply: @escaping Apply = { query, rows in try ResultsViewModel.apply(query, to: rows) },
          sleep: @escaping Sleep = { try await Task.sleep(for: $0) }) {
         self.rows = rows
+        self.lostPartitions = lostPartitions.sorted { $0.offset < $1.offset }
         rowsByID = Dictionary(rows.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         applyQuery = apply
         self.sleep = sleep
     }
 
     /// Builds the model with per-file derivations computed off the main actor (large scans).
-    static func build(files: [RecoveredFile]) async -> ResultsViewModel {
+    static func build(files: [RecoveredFile], lostPartitions: [LostPartitionCandidate] = []) async -> ResultsViewModel {
         let rows = await Task.detached(priority: .userInitiated) { files.map(Row.init) }.value
-        let model = ResultsViewModel(rows: rows)
+        let model = ResultsViewModel(rows: rows, lostPartitions: lostPartitions)
         await model.refresh()
         return model
     }
@@ -149,6 +161,7 @@ final class ResultsViewModel {
         var byCategory = Dictionary(uniqueKeysWithValues: FileCategory.allCases.map { ($0, Bucket(category: $0, count: 0, totalBytes: 0)) })
         var recoverable = 0, unrecoverable = 0
         var bytes: Int64 = 0
+        var lostCounts = Dictionary(uniqueKeysWithValues: lostPartitions.map { ($0.offset, 0) })
         for row in rows where includingSystemFiles || !row.isSystemFile {
             guard row.isRecoverable else { unrecoverable += 1; continue }
             let size = max(0, row.sizeBytes)
@@ -156,9 +169,10 @@ final class ResultsViewModel {
             bytes += size
             byCategory[row.category]?.count += 1
             byCategory[row.category]?.totalBytes += size
+            if !lostCounts.isEmpty { lostCounts[row.file.sourceMetadata.volumeOffset]? += 1 }
         }
         let result = Aggregates(buckets: FileCategory.allCases.compactMap { byCategory[$0] }, recoverableCount: recoverable,
-                                recoverableBytes: bytes, unrecoverableCount: unrecoverable)
+                                recoverableBytes: bytes, unrecoverableCount: unrecoverable, lostPartitionFileCounts: lostCounts)
         aggregateCache[includingSystemFiles] = result
         return result
     }
@@ -176,6 +190,27 @@ final class ResultsViewModel {
     }
     var hasRecoverableFiles: Bool { recoverableCount > 0 }
 
+    // MARK: Lost partitions (FR-9)
+
+    /// Recoverable files found inside one lost partition, under the current system-files setting.
+    func fileCount(in partition: LostPartitionCandidate) -> Int { current.lostPartitionFileCounts[partition.offset] ?? 0 }
+
+    /// The lost partition the browser is scoped to, if any.
+    var scopedLostPartition: LostPartitionCandidate? {
+        guard let volumeFilter else { return nil }
+        return lostPartitions.first { $0.offset == volumeFilter }
+    }
+
+    /// "Lost partition — exFAT, 23.18 GB": the card's and the scoped browser's name for it.
+    nonisolated static func lostPartitionTitle(_ partition: LostPartitionCandidate) -> String {
+        "Lost partition — \(partition.formatName), \(ByteCountFormatter.string(fromByteCount: partition.sizeBytes, countStyle: .file))"
+    }
+
+    /// Where on the device it starts: "at 1 MB (sector 2,048)". Offsets are shown, never written.
+    nonisolated static func lostPartitionLocation(_ partition: LostPartitionCandidate) -> String {
+        "at \(ByteCountFormatter.string(fromByteCount: partition.offset, countStyle: .file)) (sector \((partition.offset / 512).formatted()))"
+    }
+
     /// What the dashboard says instead of the tiles, or nil when there are tiles to show.
     func emptyState(scanCompleted: Bool) -> EmptyState? {
         guard !hasRecoverableFiles else { return nil }
@@ -191,7 +226,7 @@ final class ResultsViewModel {
 
     var query: Query {
         Query(category: category, search: searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-              showSystemFiles: showSystemFiles, sortField: sort.field, ascending: sort.ascending)
+              showSystemFiles: showSystemFiles, sortField: sort.field, ascending: sort.ascending, volume: volumeFilter)
     }
 
     struct Applied: Sendable {
@@ -244,6 +279,7 @@ final class ResultsViewModel {
             if index % stride == stride - 1 { try Task.checkCancellation() }
             if (query.showSystemFiles || !row.isSystemFile)
                 && (query.category == nil || row.category == query.category)
+                && (query.volume == nil || row.file.sourceMetadata.volumeOffset == query.volume)
                 && (query.search.isEmpty || row.searchKey.contains(query.search)) {
                 result.append(row)
             }
@@ -275,9 +311,14 @@ final class ResultsViewModel {
     }
 
     /// "Pictures — 12 files, 2 can't be recovered": counts recoverable files, like the tiles,
-    /// with unrecoverable ones named separately.
+    /// with unrecoverable ones named separately. Scoped to a lost partition, the scope leads:
+    /// "Lost partition — exFAT, 23.18 GB · Pictures — 12 files".
     var browserTitle: String {
-        var title = "\(category?.displayName ?? "All files") — \(Self.filesText(visibleRecoverableCount))"
+        var scope = category?.displayName ?? "All files"
+        if let lost = scopedLostPartition {
+            scope = Self.lostPartitionTitle(lost) + (category.map { " · \($0.displayName)" } ?? "")
+        }
+        var title = "\(scope) — \(Self.filesText(visibleRecoverableCount))"
         if visibleUnrecoverableCount > 0 { title += ", \(visibleUnrecoverableCount.formatted()) can't be recovered" }
         return title
     }
