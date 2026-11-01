@@ -47,6 +47,10 @@ targets:
         ENABLE_HARDENED_RUNTIME: YES
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_NSHumanReadableCopyright: ""
+        # spec-tech-batch-7 §E: the app icon lives in Salvage/Assets.xcassets (picked up by the
+        # `Salvage` source path above); its PNGs are rendered from docs/brand/icon.svg by
+        # scripts/render-icon.sh.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CODE_SIGN_STYLE: Automatic
         MACOSX_DEPLOYMENT_TARGET: "14.0"
     postBuildScripts:
