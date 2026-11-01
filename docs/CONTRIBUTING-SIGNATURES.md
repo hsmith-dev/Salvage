@@ -63,6 +63,7 @@ set to `null` counts as absent.
 | `footerSizeField` | size field | Extra footer length read from the footer record (a ZIP end-of-central-directory comment). |
 | `footerOffsetCheck` | non-empty array of size fields | Fields read from the footer whose sum must equal the footer's offset from the file start. A footer that fails belongs to a nested file and is skipped (ZIP). |
 | `structure` | string | A format walker built into the engine: `"gif"`, `"mp3"`, `"ole2"` or `"gzip"`. Can't be combined with `sizeField`, `segments` or `footer`. |
+| `entropy` | string | An extra content check run on every carve of this type: `"jpegBaseline"` decodes the JPEG's Huffman-coded image data and reports the file as partial if decoding fails before its end marker. Only valid on JPEG signatures. |
 
 `footerLength`, `footerMode`, `footerSizeField` and `footerOffsetCheck` all need a `footer`.
 

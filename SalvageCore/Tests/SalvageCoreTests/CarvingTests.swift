@@ -1,4 +1,6 @@
+import CoreGraphics
 import Foundation
+import ImageIO
 import Testing
 @testable import SalvageCore
 
@@ -911,4 +913,424 @@ struct CarvingFormatEndTests {
         wrong[header.count - 1] ^= 0xFF
         #expect(try await carve(device(size: 16 * 1024, [(4096, wrong)])).isEmpty)
     }
+}
+
+// MARK: - Baseline JPEG encoding for the entropy decoder and reassembly tests
+
+/// Encodes a baseline (or extended, SOF1) JPEG from synthetic quantized coefficients: no pixels
+/// are involved, but the scan is a real T.81 entropy-coded scan (canonical Huffman codes, byte
+/// stuffing, restart markers with one-bit padding).
+struct TestJPEG {
+    struct Table {
+        let counts: [UInt8]
+        let values: [UInt8]
+        /// Canonical code and length of each symbol.
+        var codes: [UInt8: (code: Int, length: Int)] {
+            var codes: [UInt8: (Int, Int)] = [:]
+            var code = 0, index = 0
+            for length in 1...16 {
+                for _ in 0..<Int(counts[length - 1]) { codes[values[index]] = (code, length); code += 1; index += 1 }
+                code <<= 1
+            }
+            return codes
+        }
+        /// A table with `values` spread over lengths `first...` (no all-ones code).
+        static func spread(_ values: [UInt8], perLength: [Int]) -> Table {
+            var counts = [UInt8](repeating: 0, count: 16)
+            var remaining = values.count, length = 0
+            for count in perLength where remaining > 0 { let used = min(count, remaining); counts[length] = UInt8(used); remaining -= used; length += 1 }
+            precondition(remaining == 0)
+            return Table(counts: counts, values: values)
+        }
+    }
+
+    static let acSymbols: [UInt8] = [0x00, 0x01, 0x02, 0x11, 0x03, 0x21, 0x12, 0x04, 0x31, 0xF0]
+        + (0..<16).flatMap { run in (1...10).map { UInt8(run << 4 | $0) } }.filter { ![0x01, 0x02, 0x11, 0x03, 0x21, 0x12, 0x04, 0x31].contains($0) }
+    /// Luminance-like and chrominance-like tables with different shapes.
+    static let dc0 = Table.spread(Array(0...11), perLength: [0, 1, 5, 1, 1, 1, 1, 1, 1])
+    static let dc1 = Table.spread(Array(0...11), perLength: [0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+    static let ac0 = Table.spread(acSymbols, perLength: [0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 125])
+    static let ac1 = Table.spread(acSymbols, perLength: [0, 2, 1, 3, 2, 3, 3, 4, 3, 5, 4, 4, 0, 0, 2, 126])
+
+    var width = 128
+    var height = 96
+    /// Sampling factors per component (one component: grayscale).
+    var sampling: [(h: Int, v: Int)] = [(2, 2), (1, 1), (1, 1)]
+    var restartInterval = 0
+    var seed: UInt64 = 1
+    var extended = false
+    /// How many nonzero AC coefficients a block gets, at most.
+    var density = 12
+
+    var totalMCUs: Int {
+        let maxH = sampling.map(\.h).max()!, maxV = sampling.map(\.v).max()!
+        if sampling.count == 1 { return (width + 7) / 8 * ((height + 7) / 8) }
+        return (width + 8 * maxH - 1) / (8 * maxH) * ((height + 8 * maxV - 1) / (8 * maxV))
+    }
+
+    func encode() -> Data {
+        var data = Data([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10]) + Data("JFIF".utf8) + Data([0, 1, 1, 0, 0, 1, 0, 1, 0, 0])
+        func segment(_ marker: UInt8, _ payload: Data) { data += Data([0xFF, marker, UInt8((payload.count + 2) >> 8), UInt8((payload.count + 2) & 0xFF)]) + payload }
+        segment(0xDB, Data([0x00]) + Data(repeating: 8, count: 64))
+        var frame = Data([8, UInt8(height >> 8), UInt8(height & 0xFF), UInt8(width >> 8), UInt8(width & 0xFF), UInt8(sampling.count)])
+        for (index, factor) in sampling.enumerated() { frame += Data([UInt8(index + 1), UInt8(factor.h << 4 | factor.v), 0]) }
+        segment(extended ? 0xC1 : 0xC0, frame)
+        for (id, table) in [(0x00, Self.dc0), (0x10, Self.ac0), (0x01, Self.dc1), (0x11, Self.ac1)] as [(UInt8, Table)] {
+            segment(0xC4, Data([id]) + Data(table.counts) + Data(table.values))
+        }
+        if restartInterval > 0 { segment(0xDD, Data([UInt8(restartInterval >> 8), UInt8(restartInterval & 0xFF)])) }
+        var scan = Data([UInt8(sampling.count)])
+        for index in sampling.indices { scan += Data([UInt8(index + 1), index == 0 ? 0x00 : 0x11]) }
+        segment(0xDA, scan + Data([0, 63, 0]))
+
+        var writer = BitWriter()
+        var random = seed
+        func next(_ bound: Int) -> Int {
+            random = random &* 6364136223846793005 &+ 1442695040888963407
+            return Int((random >> 33) % UInt64(bound))
+        }
+        let tables = [(Self.dc0.codes, Self.ac0.codes), (Self.dc1.codes, Self.ac1.codes)]
+        var dc = [Int](repeating: 0, count: sampling.count), predictors = dc
+        let blocks = sampling.count == 1 ? [0] : sampling.enumerated().flatMap { Array(repeating: $0.offset, count: $0.element.h * $0.element.v) }
+        var restart = 0
+        for mcu in 0..<totalMCUs {
+            if restartInterval > 0, mcu > 0, mcu % restartInterval == 0 {
+                data += writer.finish()
+                data += Data([0xFF, UInt8(0xD0 + restart)])
+                restart = (restart + 1) & 7
+                predictors = predictors.map { _ in 0 }
+            }
+            for component in blocks {
+                let (dcCodes, acCodes) = tables[component == 0 ? 0 : 1]
+                dc[component] = max(-100, min(100, dc[component] + next(41) - 20))
+                let difference = dc[component] - predictors[component]
+                predictors[component] = dc[component]
+                writer.coded(difference, dcCodes, run: nil)
+                // A few AC coefficients, sometimes past a run of 16 zeros (ZRL).
+                var position = 1
+                for _ in 0..<next(density + 1) {
+                    let run = next(5) == 0 ? 16 + next(8) : next(4)
+                    guard position + run <= 63 else { break }
+                    var value = next(61) - 30
+                    if value == 0 { value = 1 }
+                    var zeros = run
+                    while zeros >= 16 { writer.symbol(0xF0, acCodes); zeros -= 16 }
+                    writer.coded(value, acCodes, run: zeros)
+                    position += run + 1
+                }
+                if position < 64 { writer.symbol(0x00, acCodes) }
+            }
+        }
+        data += writer.finish()
+        return data + Data([0xFF, 0xD9])
+    }
+
+    struct BitWriter {
+        var bytes = Data()
+        var accumulator = 0
+        var count = 0
+        mutating func put(_ value: Int, _ length: Int) {
+            for bit in stride(from: length - 1, through: 0, by: -1) {
+                accumulator = accumulator << 1 | (value >> bit & 1)
+                count += 1
+                if count == 8 {
+                    bytes.append(UInt8(accumulator))
+                    if accumulator == 0xFF { bytes.append(0) }
+                    accumulator = 0; count = 0
+                }
+            }
+        }
+        mutating func symbol(_ symbol: UInt8, _ codes: [UInt8: (code: Int, length: Int)]) {
+            let code = codes[symbol]!
+            put(code.code, code.length)
+        }
+        /// A DC difference (`run == nil`) or an AC coefficient after `run` zeros.
+        mutating func coded(_ value: Int, _ codes: [UInt8: (code: Int, length: Int)], run: Int?) {
+            var size = 0
+            while (1 << size) <= abs(value) { size += 1 }
+            symbol(UInt8((run ?? 0) << 4 | size), codes)
+            if size > 0 { put(value >= 0 ? value : value + (1 << size) - 1, size) }
+        }
+        /// Pads the last byte with one bits.
+        mutating func finish() -> Data {
+            if count > 0 { put((1 << (8 - count)) - 1, 8 - count) }
+            defer { bytes = Data() }
+            return bytes
+        }
+    }
+}
+
+/// A JPEG from ImageIO (Apple's encoder) of a noisy gradient.
+func imageIOJPEG(width: Int = 160, height: Int = 120, progressive: Bool = false, quality: Double = 0.9) throws -> Data {
+    var pixels = [UInt8](repeating: 0, count: width * height * 4)
+    var state: UInt64 = 7
+    for y in 0..<height {
+        for x in 0..<width {
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            let noise = Int(state >> 59)
+            let base = (y * width + x) * 4
+            pixels[base] = UInt8((x * 255 / width + noise) & 0xFF)
+            pixels[base + 1] = UInt8((y * 255 / height + noise) & 0xFF)
+            pixels[base + 2] = UInt8(((x + y) * 2 + noise * 3) & 0xFF)
+            pixels[base + 3] = 255
+        }
+    }
+    let provider = try #require(CGDataProvider(data: Data(pixels) as CFData))
+    let image = try #require(CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
+                                     space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                                     provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent))
+    let output = NSMutableData()
+    let destination = try #require(CGImageDestinationCreateWithData(output as CFMutableData, "public.jpeg" as CFString, 1, nil))
+    var properties: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: quality]
+    if progressive { properties[kCGImagePropertyJFIFDictionary] = [kCGImagePropertyJFIFIsProgressive: true] }
+    CGImageDestinationAddImage(destination, image, properties as CFDictionary)
+    #expect(CGImageDestinationFinalize(destination))
+    return output as Data
+}
+
+extension RecoveredFile {
+    var runs: [DataRun] { if case .runs(let runs) = content { runs } else { [] } }
+    /// The file's bytes read from `image` through its runs.
+    func contents(in image: Data) -> Data {
+        var data = Data()
+        for run in runs { if let offset = run.deviceOffset { data += image.subdata(in: Int(offset)..<Int(offset + run.length)) } }
+        return data.prefix(Int(sizeBytes))
+    }
+}
+
+/// Offset of the start-of-scan data in a JPEG.
+func scanDataStart(_ jpeg: Data) -> Int {
+    var offset = 2
+    while jpeg[offset + 1] != 0xDA { offset += 2 + Int(jpeg[offset + 2]) << 8 + Int(jpeg[offset + 3]) }
+    return offset + 2 + Int(jpeg[offset + 2]) << 8 + Int(jpeg[offset + 3])
+}
+
+@Suite("Baseline JPEG entropy decoding and bifragment reassembly")
+struct JPEGReassemblyTests {
+    /// Reassembly is opt-in; these limits turn it on.
+    static let joining: SignatureCarver.Limits = {
+        var limits = SignatureCarver.Limits.default
+        limits.reassembleFragmentedJPEGs = true
+        return limits
+    }()
+
+    /// A two-fragment layout: the JPEG at `start`, split after `firstLength` bytes, `gap` placed at
+    /// the break, the rest of the JPEG at `resume`.
+    static func split(_ jpeg: Data, start: Int = 8192, firstLength: Int, gap: Data, resume: Int, size: Int = 256 * 1024) -> Data {
+        device(size: size, [(start, jpeg.prefix(firstLength)), (start + firstLength, gap), (resume, jpeg.dropFirst(firstLength))])
+    }
+
+    @Test(arguments: [0, 1, 4])
+    func syntheticBaselineJPEGsDecodeToTheirFullMCUCount(restartInterval: Int) {
+        for (sampling, extended) in [([(2, 2), (1, 1), (1, 1)], false), ([(1, 1)], false), ([(2, 1), (1, 1), (1, 1)], true), ([(1, 1), (1, 1), (1, 1)], false)] {
+            let encoder = TestJPEG(width: 99, height: 61, sampling: sampling, restartInterval: restartInterval, seed: 3, extended: extended)
+            let jpeg = encoder.encode()
+            let result = JPEGBaselineDecoder.decode(jpeg)
+            let label = Comment(rawValue: "\(sampling) interval \(restartInterval)")
+            #expect(result.outcome == .complete, label)
+            #expect(result.mcusDecoded == encoder.totalMCUs && result.totalMCUs == encoder.totalMCUs, label)
+            #expect(result.validUpTo == jpeg.count, label)
+            #expect(result.restartSequenceOK, label)
+            #expect(result.restartMarkers == (restartInterval == 0 ? 0 : (encoder.totalMCUs - 1) / restartInterval), label)
+        }
+    }
+
+    @Test func imageIOBaselineJPEGsDecodeAndProgressiveOnesAreUnsupported() throws {
+        for (width, height, quality) in [(160, 120, 0.9), (33, 17, 0.5), (640, 8, 1.0)] {
+            let jpeg = try imageIOJPEG(width: width, height: height, quality: quality)
+            let result = JPEGBaselineDecoder.decode(jpeg)
+            #expect(result.outcome == .complete, Comment(rawValue: "\(width)x\(height)"))
+            #expect(result.mcusDecoded == result.totalMCUs && result.totalMCUs > 0)
+        }
+        let progressive = try imageIOJPEG(progressive: true)
+        #expect(progressive.contains(0xC2))
+        guard case .unsupported = JPEGBaselineDecoder.decode(progressive).outcome else {
+            Issue.record("a progressive JPEG must be unsupported, not judged")
+            return
+        }
+    }
+
+    @Test func brokenScanDataIsInvalidNearTheBreakAndTruncatedDataIsTruncated() throws {
+        let jpeg = TestJPEG(width: 256, height: 128, restartInterval: 8, seed: 5).encode()
+        let middle = jpeg.count / 2
+        // Foreign bytes from the middle on (FF-free, so the marker syntax still looks fine).
+        var foreign = jpeg.prefix(middle) + filler(jpeg.count - middle - 2) + Data([0xFF, 0xD9])
+        var result = JPEGBaselineDecoder.decode(foreign)
+        #expect(result.outcome == .invalid)
+        #expect(result.validUpTo >= middle - 8 && result.validUpTo <= middle + 600)
+        #expect(result.mcusDecoded < result.totalMCUs)
+        // A restart marker out of sequence.
+        foreign = jpeg
+        let marker = try #require((scanDataStart(jpeg)..<jpeg.count - 1).first { jpeg[$0] == 0xFF && jpeg[$0 + 1] == 0xD1 })
+        foreign[marker + 1] = 0xD3
+        result = JPEGBaselineDecoder.decode(foreign)
+        #expect(result.outcome == .invalid && !result.restartSequenceOK)
+        // Data that just stops.
+        result = JPEGBaselineDecoder.decode(jpeg.prefix(middle))
+        #expect(result.outcome == .truncated && result.validUpTo == middle)
+        // Real data with an EOI too early.
+        result = JPEGBaselineDecoder.decode(jpeg.prefix(middle) + Data([0xFF, 0xD9]))
+        #expect(result.outcome == .invalid)
+    }
+
+    @Test func contiguousRealJPEGsAreStillCarvedInOnePiece() async throws {
+        let jpeg = try imageIOJPEG(), synthetic = TestJPEG(restartInterval: 3).encode()
+        let files = try await carve(device(size: 128 * 1024, [(4096, jpeg), (65536, synthetic)]), chunk: 4096)
+        #expect(files.map(\.bytes) == [4096..<4096 + jpeg.count, 65536..<65536 + synthetic.count])
+        #expect(files.allSatisfy { !$0.isPartial && $0.recoveryConfidence == .medium })
+    }
+
+    @Test(arguments: [0, 2])
+    func twoFragmentsAroundAnUnrelatedFileAreJoined(restartInterval: Int) async throws {
+        let jpeg = TestJPEG(width: 256, height: 192, restartInterval: restartInterval, seed: 11).encode()
+        #expect(jpeg.count > 12 * 1024)
+        let firstLength = 8 * 512, png = pngBytes(body: 3000), resume = 8192 + firstLength + 8192
+        let image = Self.split(jpeg, firstLength: firstLength, gap: png, resume: resume)
+        for chunk in [1 << 20, 4096, 1000, 513] {
+            let label = Comment(rawValue: "interval \(restartInterval), chunk \(chunk)")
+            let files = try await carve(image, chunk: chunk, limits: Self.joining)
+            #expect(files.count == 2, label)
+            let joined = try #require(files.first { $0.signature == "jpeg" }, label)
+            #expect(joined.runs == [DataRun(deviceOffset: 8192, length: Int64(firstLength)),
+                                    DataRun(deviceOffset: Int64(resume), length: Int64(jpeg.count - firstLength))], label)
+            #expect(joined.sizeBytes == Int64(jpeg.count), label)
+            #expect(joined.contents(in: image) == jpeg, label)
+            #expect(!joined.isPartial && joined.overwriteConfidence == 0.3, label)
+            #expect(joined.recoveryEvidence.fragmentCount == 2 && joined.recoveryConfidence == .low, label)
+            #expect(!joined.sourceMetadata.contiguous && joined.name == "jpeg-000000002000.jpg", label)
+            #expect(files.first { $0.signature == "png" }?.bytes == 8192 + firstLength..<8192 + firstLength + png.count, label)
+        }
+    }
+
+    @Test func aGapWithoutAHeaderOrWithAStrayFooterIsBridgedToo() async throws {
+        let jpeg = TestJPEG(width: 256, height: 192, seed: 21).encode()
+        let firstLength = 11 * 512, resume = 8192 + firstLength + 3 * 512
+        // Old random data between the fragments, holding an FF D9 that ends the carve early today.
+        var gap = randomBytes(3 * 512, seed: 9)
+        gap[700] = 0xFF; gap[701] = 0xD9
+        let image = Self.split(jpeg, firstLength: firstLength, gap: gap, resume: resume)
+        let files = try await carve(image, chunk: 2048, limits: Self.joining)
+        let joined = try #require(files.first)
+        #expect(files.count == 1)
+        #expect(joined.runs.map(\.deviceOffset) == [8192, Int64(resume)] && joined.contents(in: image) == jpeg)
+        #expect(!joined.isPartial && joined.recoveryConfidence == .low)
+    }
+
+    @Test func aLiveFileBetweenTheFragmentsIsSkipped() async throws {
+        let jpeg = TestJPEG(width: 200, height: 200, restartInterval: 5, seed: 31).encode()
+        let firstLength = 6 * 512, resume = 8192 + firstLength + 4096
+        let image = Self.split(jpeg, firstLength: firstLength, gap: filler(4096), resume: resume)
+        let files = try await carve(image, claimed: [DataRun(deviceOffset: Int64(8192 + firstLength), length: 4096)], limits: Self.joining)
+        let joined = try #require(files.first)
+        #expect(files.count == 1 && joined.contents(in: image) == jpeg && joined.runs.count == 2)
+    }
+
+    @Test func aDecoyThatPassesMarkerSyntaxButNotEntropyDecodingIsNeverJoined() async throws {
+        let jpeg = TestJPEG(width: 256, height: 192, restartInterval: 4, seed: 41).encode()
+        let firstLength = 8 * 512, png = pngBytes(body: 3000), resume = 8192 + firstLength + 8192
+        let rest = jpeg.count - firstLength
+        // FF-free filler and stuffed random bytes ending in EOI: valid marker syntax, but not this
+        // JPEG's entropy data. Also the true continuation with a single corrupted byte.
+        var stuffed = Data()
+        for byte in randomBytes(rest, seed: 77) { stuffed.append(byte); if byte == 0xFF { stuffed.append(0) } }
+        var corrupted = Data(jpeg.dropFirst(firstLength))
+        corrupted[corrupted.startIndex + rest / 2] ^= 0x5A
+        let decoys: [(String, Data)] = [
+            ("filler", filler(rest - 2) + Data([0xFF, 0xD9])), ("stuffed", stuffed + Data([0xFF, 0xD9])),
+            ("corrupted", corrupted),
+        ]
+        for (label, decoy) in decoys {
+            let image = device(size: 256 * 1024, [(8192, jpeg.prefix(firstLength)), (8192 + firstLength, png), (resume, decoy)])
+            let files = try await carve(image, chunk: 4096, limits: Self.joining)
+            let partial = try #require(files.first { $0.signature == "jpeg" }, Comment(rawValue: label))
+            #expect(partial.runs.count == 1 && partial.isPartial, Comment(rawValue: label))
+            #expect(partial.bytes == 8192..<8192 + firstLength, Comment(rawValue: label))
+            #expect(files.allSatisfy { $0.runs.count == 1 }, Comment(rawValue: label))
+        }
+    }
+
+    @Test func twoCandidateContinuationsAreAmbiguousAndNeitherIsUsed() async throws {
+        let jpeg = TestJPEG(width: 256, height: 192, seed: 51).encode()
+        let firstLength = 8 * 512, png = pngBytes(body: 3000)
+        let rest = Data(jpeg.dropFirst(firstLength))
+        let second = 8192 + firstLength + 8192, third = (second + rest.count + 4096) / 512 * 512
+        let image = device(size: 256 * 1024, [(8192, jpeg.prefix(firstLength)), (8192 + firstLength, png), (second, rest), (third, rest)])
+        let files = try await carve(image, limits: Self.joining)
+        let partial = try #require(files.first { $0.signature == "jpeg" })
+        #expect(partial.runs.count == 1 && partial.isPartial && partial.bytes == 8192..<8192 + firstLength)
+    }
+
+    @Test func aFragmentedProgressiveJPEGStaysUnreassembled() async throws {
+        let jpeg = try imageIOJPEG(width: 320, height: 240, progressive: true)
+        #expect(jpeg.count > 8 * 512 + 2048)
+        let firstLength = 8 * 512, png = pngBytes(body: 3000), resume = 8192 + firstLength + 8192
+        let files = try await carve(Self.split(jpeg, firstLength: firstLength, gap: png, resume: resume), limits: Self.joining)
+        let partial = try #require(files.first { $0.signature == "jpeg" })
+        #expect(partial.runs.count == 1 && partial.isPartial && partial.bytes == 8192..<8192 + firstLength)
+    }
+
+    @Test func theSearchIsBoundedByItsWindow() async throws {
+        let jpeg = TestJPEG(width: 256, height: 192, seed: 61).encode()
+        let firstLength = 8 * 512, png = pngBytes(body: 3000), resume = 8192 + firstLength + 64 * 1024
+        let image = Self.split(jpeg, firstLength: firstLength, gap: png, resume: resume)
+        var limits = Self.joining
+        limits.joinSearchBytes = 32 * 1024
+        let bounded = try await carve(image, limits: limits)
+        #expect(bounded.first { $0.signature == "jpeg" }?.isPartial == true)
+        limits.joinSearchBytes = 128 * 1024
+        let found = try await carve(image, limits: limits)
+        #expect(found.first { $0.signature == "jpeg" }?.contents(in: image) == jpeg)
+    }
+
+    @Test func byDefaultASplitJPEGStaysPartialAndAStrayFooterNoLongerValidatesIt() async throws {
+        let jpeg = TestJPEG(width: 256, height: 192, seed: 11).encode()
+        let firstLength = 8 * 512, resume = 8192 + firstLength + 8192
+        let split = try await carve(Self.split(jpeg, firstLength: firstLength, gap: pngBytes(body: 3000), resume: resume))
+        #expect(split.first { $0.signature == "jpeg" }?.bytes == 8192..<8192 + firstLength)
+        #expect(split.allSatisfy { $0.runs.count == 1 })
+        #expect(split.first { $0.signature == "jpeg" }?.isPartial == true)
+        // Foreign bytes after the break, then an FF D9: marker syntax alone would call this a
+        // complete file; the scan data says it isn't.
+        var gap = randomBytes(3 * 512, seed: 9)
+        gap[700] = 0xFF; gap[701] = 0xD9
+        let image = Self.split(jpeg, firstLength: firstLength, gap: gap, resume: 8192 + firstLength + 3 * 512)
+        let files = try await carve(image)
+        let file = try #require(files.first)
+        #expect(files.count == 1 && file.bytes == 8192..<8192 + firstLength + 702)
+        #expect(file.isPartial && file.overwriteConfidence == 1 && file.recoveryConfidence == .low)
+    }
+
+    @Test func aSameSizeSiblingsOrphanedTailCanPassEntropyValidationWhichIsWhyJoiningIsOff() async throws {
+        // Two JPEGs with the same tables and dimensions; the second's tail (its header gone) lies
+        // where the first's second fragment would be, and the first's real continuation is gone.
+        let first = TestJPEG(width: 256, height: 192, seed: 1134, density: 13).encode()
+        let sibling = TestJPEG(width: 256, height: 192, seed: 5135, density: 13).encode()
+        let firstLength = 11 * 512
+        let image = device(size: 192 * 1024, [(8192, first.prefix(firstLength)), (8192 + firstLength, pngBytes(body: 3000)),
+                                              (8192 + firstLength + 8192, Data(sibling.dropFirst(firstLength / 2 + 1000)))])
+        // With joining on, the decoder validates a join that is not the first JPEG.
+        let joined = try await carve(image, limits: Self.joining)
+        let wrong = try #require(joined.first { $0.runs.count == 2 })
+        #expect(wrong.contents(in: image) != first)
+        #expect(JPEGBaselineDecoder.decode(wrong.contents(in: image)).outcome == .complete)
+        // By default it stays a partial carve of the bytes that really are the first JPEG's.
+        let files = try await carve(image)
+        #expect(files.allSatisfy { $0.runs.count == 1 })
+        #expect(files.first { $0.signature == "jpeg" }?.bytes == 8192..<8192 + firstLength)
+    }
+
+    @Test func entropySignatureFieldIsValidated() throws {
+        #expect(SignatureLibrary.bundled.signatures.first { $0.id == "jpeg" }?.entropy == .jpegBaseline)
+        #expect(throws: SignatureError.self) {
+            try FileSignature(json: Data(#"{"schemaVersion": 1, "id": "x", "extension": "x", "category": "pictures", "header": "FF", "footer": "FFD9", "entropy": "jpegBaseline"}"#.utf8))
+        }
+        #expect(throws: SignatureError.self) {
+            try FileSignature(json: Data(#"{"schemaVersion": 1, "id": "x", "extension": "x", "category": "pictures", "header": "FF", "entropy": "zstd"}"#.utf8))
+        }
+    }
+}
+
+extension RecoveredFile {
+    /// The carving signature id a carved file's name starts with.
+    var signature: String { String(name.prefix { $0 != "-" }) }
 }

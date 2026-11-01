@@ -38,6 +38,11 @@ import Foundation
 /// two consecutive valid MPEG audio frame headers). `trustedMaxBytes` is the largest size a size
 /// field or record walk may claim and still count as validated: larger claims usually mean a
 /// fragmented file or a garbage field, so such carves are partial.
+/// `entropy` names an engine-built entropy decoder run over the data a `segments` walk hands to
+/// the footer search (`"jpegBaseline"`: the baseline/extended Huffman JPEG decoder, see
+/// `JPEGEntropyDecoder.swift`). A carve whose entropy data fails to decode is not validated by its
+/// footer (and, when enabled, the engine tries to reassemble it from two fragments; see
+/// `SignatureCarver`).
 public struct FileSignature: Sendable, Equatable {
     public static let currentSchemaVersion = 1
     /// Most bytes past a candidate position any rule may read (header, size fields, record
@@ -124,6 +129,8 @@ public struct FileSignature: Sendable, Equatable {
     public enum Structure: String, Sendable, CaseIterable { case gif, mp3, ole2, gzip }
     /// Engine-built header checks.
     public enum Validation: String, Sendable { case mpegFrames }
+    /// Engine-built entropy decoders for the data after a `segments` walk's `stopAt` record.
+    public enum Entropy: String, Sendable, CaseIterable { case jpegBaseline }
 
     public let id: String
     public let `extension`: String
@@ -149,6 +156,7 @@ public struct FileSignature: Sendable, Equatable {
     public let cutsOthers: Bool
     /// Largest size-field or record-walk size reported as validated; nil uses the engine default.
     public let trustedMaxBytes: Int64?
+    public let entropy: Entropy?
 
     /// Bytes from the header start the engine must see before it can evaluate a match.
     var headerReach: Int {
@@ -354,6 +362,14 @@ extension FileSignature {
         } else {
             validation = nil
         }
+        if let name = try decoder.optionalString("entropy") {
+            guard let entropy = Entropy(rawValue: name) else {
+                throw SignatureError.invalidField("entropy", "must be one of \(Entropy.allCases.map { "'\($0.rawValue)'" }.joined(separator: ", "))")
+            }
+            self.entropy = entropy
+        } else {
+            entropy = nil
+        }
         if let raw = decoder.fields["footerOffsetCheck"] {
             guard let list = raw as? [Any], !list.isEmpty else { throw SignatureError.invalidField("footerOffsetCheck", "must be a non-empty array") }
             footerOffsetCheck = try list.enumerated().map { try SizeField(any: $1, field: "footerOffsetCheck[\($0)]") }
@@ -384,6 +400,9 @@ extension FileSignature {
         }
         if structure != nil, !sizeFields.isEmpty || segments != nil || footer != nil {
             throw SignatureError.invalidField("structure", "cannot be combined with sizeField, segments or footer")
+        }
+        if entropy != nil, segments?.stopAt.isEmpty != false || footer == nil {
+            throw SignatureError.invalidField("entropy", "needs segments with stopAt and a footer")
         }
         let reach = max(headerReach, footerReach)
         guard reach <= Self.maxReach else {
