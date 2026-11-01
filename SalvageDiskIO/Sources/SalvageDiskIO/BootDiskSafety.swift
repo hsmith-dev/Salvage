@@ -223,3 +223,12 @@ func resolveBootDisks() -> Result<Set<String>, BootDiskResolutionError> {
 func isWithinBootDiskSet(_ candidate: String, bootDisks: Set<String>) -> Bool {
     bootDisks.contains(candidate)
 }
+
+/// Runs blocking subprocess work on a global GCD queue so it never ties up a cooperative-pool
+/// thread (or the main actor) for the length of a `diskutil` listing (`DeviceWatcher`'s lock-state
+/// annotation).
+func offCooperativePool<T: Sendable>(_ work: @escaping @Sendable () -> T) async -> T {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.global(qos: .userInitiated).async { continuation.resume(returning: work()) }
+    }
+}

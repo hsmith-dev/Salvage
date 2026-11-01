@@ -111,7 +111,7 @@ public final class DeviceWatcher: DeviceWatching, Sendable {
     }
 
     /// The listing is a blocking subprocess (tens to hundreds of milliseconds), so it runs on a GCD
-    /// queue through the same hop `FileVaultUnlocker` uses: never on the main actor, never on a
+    /// queue through `offCooperativePool`: never on the main actor, never on a
     /// cooperative-pool thread (where it would hold one of the few threads Swift concurrency has
     /// for the whole wait). `listing` is injectable so a test can observe where it runs.
     nonisolated static func annotateLockedDevices(_ devices: [BlockDevice],

@@ -76,8 +76,8 @@ and publishes the zip with a SHA-256 checksum.
 - **FileVault unlock (AD-3).** The spine places FileVault unlock in SalvageDiskIO. Since Story 2.5,
   the app checks credentials and decrypts in **SalvageCore**
   (`Parsers/APFSCrypto.swift`, `EncryptedVolumeUnlock`), from the container's raw bytes, without
-  mounting and without `diskutil`. `SalvageDiskIO/FileVaultUnlocker.swift`, the Story 2.4
-  `diskutil apfs unlockVolume -nomount` path, is still in the package, but the app doesn't call it.
+  mounting and without `diskutil`. The Story 2.4 `diskutil apfs unlockVolume -nomount` unlocker was
+  removed once nothing called it.
 - **Encrypted volumes found mid-scan (AD-11).** The spine says the scan pauses on `.unlockRequired`.
   In the code, the parser skips the locked volume and the scan carries on. When it ends, the app
   offers the unlock sheet for each such volume and re-scans the drive with the volume unlocked
