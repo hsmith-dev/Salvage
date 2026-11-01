@@ -151,7 +151,10 @@ struct ImageDriveSheet: View {
             if model.phase == .checking {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
-                    Text(model.isCancelling ? "Canceling…" : "Checking the destination and preparing the drive for read-only access…")
+                    Text(model.isCancelling ? "Canceling…"
+                         : model.asksForPassword ? "macOS asks for an administrator password so Salvage can read this drive. Salvage only reads it and never changes it."
+                         : "Checking the destination and preparing the drive for read-only access…")
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             } else {
                 let progress = model.progress

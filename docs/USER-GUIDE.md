@@ -424,13 +424,20 @@ What Salvage refuses before it copies anything:
   has only …");
 - a destination formatted MS-DOS (FAT) when the drive is larger than 4 GB, because FAT can't hold
   a file that large;
-- an existing file, unless you agreed to replace it in the save panel.
+- an existing file, unless you agreed to replace it in the save panel. A file that is the disk
+  image behind an attached drive is never replaced, even then. The space a replaced file takes
+  up isn't counted as free.
 
 **Unreadable sectors.** Salvage reads the drive in 4 MB pieces. When a piece can't be read, Salvage
 reads it again in smaller pieces, down to single 512-byte sectors, so as little as possible is
 lost. What still can't be read is written to the image as zeros, so everything after it stays at
-the right place. A large area where nothing at all can be read is marked in a few reads instead of
-being retried sector by sector, which keeps a badly damaged drive from taking days.
+the right place. Once more than 32 KB in a row couldn't be read, Salvage stops retrying single
+sectors and reads the rest of that area in 64 KB pieces until something reads again. That keeps a
+badly damaged drive from taking days.
+
+**A drive that returns nothing.** When 64 MB in a row can't be read, Salvage checks whether the
+drive is still connected and stops, with "The drive stopped returning data" (or that the drive was
+removed). The image keeps everything up to that point.
 
 The unreadable areas are listed in the summary and in a file saved next to the image,
 `<name>.img.badblocks.json`. That file lists their byte offsets on the drive, the number of bytes

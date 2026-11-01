@@ -39,20 +39,36 @@ is opened:
 - `DestinationSafety.live.assess(folder, drive)` must be `.safe`. `.sameDevice` shows the red
   destination-blocked banner (DESIGN.md's one blocking state); `.undetermined` is refused too.
 - A FAT ("msdos") destination is refused for a drive over 4 GiB − 1.
-- Free space (`RecoveryCoordinator.availableCapacity`, plus a confirmed file's own size) must be
-  at least the drive's size; unknown free space refuses.
+- Free space (`volumeAvailableCapacity`, falling back to `statfs`; not the "important usage"
+  figure, which counts purgeable space macOS may not free in time) must be at least the drive's
+  size. A file being replaced isn't counted as freed. Unknown free space refuses.
+- Protected files: every attached disk image's backing file (`hdiutil info -plist`, by
+  `(st_dev, st_ino)`; one of them may be the drive being imaged) and every image open in Salvage
+  are never replaced, whether or not replacing was confirmed. When that list can't be read, no
+  existing file is replaced.
 
 `ImageOutputFile` (SalvageDiskIO) then opens the folder (`O_DIRECTORY`), checks with `fstatfs` that
-it is the volume that was assessed, removes a confirmed existing *regular file* only, and creates
+it is the volume that was assessed, removes a confirmed, unprotected existing *regular file* only
+(the `.badblocks.json` too, only when replacing was confirmed), and creates
 the image with `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW`; the descriptor must be a regular file.
-Writes are `pwrite` in order; the end is `F_FULLFSYNC` (falling back to `fsync`).
+Writes are `pwrite` in order (a 0-byte write fails). Every image, partial ones too, ends with
+`F_FULLFSYNC`, falling back to `fsync` only on ENOTSUP/EINVAL; any other failure is reported. The
+sidecar's flush and close results are checked.
 
 **Copy loop.** `DriveImager` (SalvageDiskIO), against any `BlockReader` and `ImageSink`:
 
 - 4 MiB chunks (the raw reader's limit). A chunk failing with `ScanError.io` is re-read as 64 KiB
-  pieces, failed pieces as 4 KiB, then 512-byte blocks. A range where no piece reads is marked
-  unreadable as a whole without descending further: a single bad sector costs about 89 reads, a
-  fully dead 4 MiB chunk 65.
+  pieces, and every failed piece is split again, depth first, as 4 KiB and then 512-byte reads.
+  A single bad sector costs 89 reads.
+- Bounded cost: the run of consecutive unreadable bytes since the last good read. Past 32 KiB a
+  failed piece isn't split any more (a failed chunk is still split once into 64 KiB pieces, so
+  good data after a bad area is found again); a good read ends the run. A fully dead first chunk
+  costs 145 reads, each later one 65.
+- Past 64 MiB of consecutive unreadable bytes the copy stops ("The drive stopped returning
+  data…") after re-checking that the device is still present (IORegistry media identity), rather
+  than "completing" an image of a drive that returns only errors.
+- A 0-byte read ("Short raw-device read.") counts as unreadable only while the device is still
+  present; a read from a closed session always stops the copy.
 - Unreadable bytes are written as zeros and recorded as merged `ImagingBadRange`s.
 - Any other error (device removed, permission, a closed session) ends the copy (`.stopped`), and
   so does a write failure.
@@ -68,6 +84,11 @@ Writes are `pwrite` in order; the end is `F_FULLFSYNC` (falling back to `fsync`)
 (complete / cancelled / stopped), a plain-language note, bytes copied, unreadable bytes, bad
 ranges (byte offsets on the drive), SHA-256, source name and BSD name, block size, start and end.
 Metadata only. Written for every run that created the image file, including cancel and stop.
+
+**Closing the source.** After a timeout or a cancel a read may still be stuck in the kernel, and
+`RawBlockReader.close()` would queue behind it on the reader's actor. So only a completed copy
+awaits the close; otherwise the sidecar is written, the summary shown, and the close runs detached
+whenever the stuck read returns.
 
 **Summary.** Title (Image complete / Imaging canceled / Imaging stopped), the note (for an
 incomplete copy: "The image file holds only the first X of Y…"), the image path, bytes copied and
@@ -99,6 +120,14 @@ Finder**, **Done** and **Open Image** (`DiskImageLibrary.shared.open`, the exist
   folder: blocked and undetermined destinations, free space and FAT refusals (drive never opened),
   bad sectors and sidecar, cancel and sidecar, replace only when confirmed, drive in use, a closed
   scan session, eligibility, formatting.
+
+Review follow-up tests: scattered bad sectors split to single sectors, a drive returning only
+errors stopping (with the presence re-check and the read budget), 0-byte reads with the drive
+present or gone, a closed session; protected backing files (also a hard link, and live against
+the attached test image), an unknown protected list, stale sidecars; and in the app an actor
+reader whose read blocks its thread synchronously, like `pread`: after a timeout and after a cancel
+the run finishes and writes its sidecar while the close still waits, and the close happens once
+the read returns.
 
 ## Not verified
 

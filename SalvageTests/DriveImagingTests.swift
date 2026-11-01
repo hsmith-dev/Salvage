@@ -21,7 +21,7 @@ struct DriveImagingTests {
                              fsType: String = "apfs", opened: OpenCounter = OpenCounter(),
                              openError: (any Error)? = nil) -> DriveImagingEnvironment {
         DriveImagingEnvironment(
-            openSource: { _ in
+            openSource: { _, _ in
                 opened.increment()
                 if let openError { throw openError }
                 return .init(reader: reader, close: { opened.close() })
@@ -142,6 +142,76 @@ struct DriveImagingTests {
         #expect(try Data(contentsOf: url).count == Int(device.sizeBytes))
     }
 
+    @Test func aReplacedFileIsNotCountedAsFreeSpaceAndAnAttachedImagesBackingFileIsNeverReplaced() async throws {
+        let dir = try folder(); defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("card.img")
+        try Data(count: Int(device.sizeBytes)).write(to: url)
+        let short = await run(environment(MemoryDrive(size: device.sizeBytes), free: device.sizeBytes - 1), to: url, replacing: true)
+        guard case .failed(let message) = short.phase else { Issue.record("expected failed"); return }
+        #expect(message.contains("free space"))
+
+        let identity = try #require(liveFileIdentity(ofPath: url.path))
+        var env = environment(MemoryDrive(size: device.sizeBytes))
+        env.protectedFiles = { [identity] }
+        let backing = await run(env, to: url, replacing: true)
+        guard case .failed(let refused) = backing.phase else { Issue.record("expected failed"); return }
+        #expect(refused.contains("disk image behind an attached drive"))
+        env.protectedFiles = { nil }
+        let unknown = await run(env, to: url, replacing: true)
+        guard case .failed = unknown.phase else { Issue.record("an unknown set must not replace"); return }
+        #expect(try Data(contentsOf: url) == Data(count: Int(device.sizeBytes)))
+    }
+
+    @Test func aReadStuckInTheKernelDoesNotHangTheSheetAfterATimeout() async throws {
+        let dir = try folder(); defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("card.img")
+        let drive = StuckDrive(size: device.sizeBytes, stuckAt: 2 * 1024 * 1024)
+        defer { drive.release() }
+        var env = environment(MemoryDrive(size: 0))
+        env.openSource = { _, _ in .init(reader: drive, close: { await drive.close() }) }
+        env.imager.readTimeout = .milliseconds(300)
+        let model = DriveImagingModel(device: device, destination: url, replacingConfirmed: false, environment: env)
+        model.start()
+        guard await finishes(model, within: .seconds(10)) else { Issue.record("the sheet hung on the stuck read"); return }
+        guard case .finished(let summary) = model.phase, case .stopped(let reason) = summary.outcome else {
+            Issue.record("expected stopped, got \(model.phase)"); return
+        }
+        #expect(reason.contains("stopped responding"))
+        #expect(summary.bytesCopied == 2 * 1024 * 1024)
+        let report = try ImagingReport.decode(Data(contentsOf: try #require(summary.sidecarURL)))
+        #expect(report.status == .stopped)
+        #expect(!drive.closed, "the close waits behind the stuck read")
+        drive.release()
+        for _ in 0..<200 where !drive.closed { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(drive.closed, "and still happens once the read returns")
+    }
+
+    @Test func cancelDuringAStuckReadEndsAtOnce() async throws {
+        let dir = try folder(); defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("card.img")
+        let drive = StuckDrive(size: device.sizeBytes, stuckAt: 1024 * 1024)
+        defer { drive.release() }
+        var env = environment(MemoryDrive(size: 0))
+        env.openSource = { _, _ in .init(reader: drive, close: { await drive.close() }) }
+        let model = DriveImagingModel(device: device, destination: url, replacingConfirmed: false, environment: env)
+        model.start()
+        for _ in 0..<500 where !drive.isStuck { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(drive.isStuck)
+        model.cancel()
+        guard await finishes(model, within: .seconds(10)) else { Issue.record("cancel hung on the stuck read"); return }
+        guard case .finished(let summary) = model.phase else { Issue.record("expected finished"); return }
+        #expect(summary.outcome == .cancelled)
+        #expect(summary.bytesCopied == 1024 * 1024)
+        #expect(FileManager.default.fileExists(atPath: try #require(summary.sidecarURL).path))
+    }
+
+    /// Polls rather than awaiting the run, so a hang fails the test instead of hanging it.
+    private func finishes(_ model: DriveImagingModel, within limit: Duration) async -> Bool {
+        let deadline = ContinuousClock.now + limit
+        while model.isActive, ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(20)) }
+        return !model.isActive
+    }
+
     @Test func aDriveInUseOrRefusedIsReportedPlainly() async throws {
         let dir = try folder(); defer { try? FileManager.default.removeItem(at: dir) }
         let url = dir.appendingPathComponent("card.img")
@@ -162,7 +232,7 @@ struct DriveImagingTests {
         #expect(try await reader.read(at: 0, count: 512).count == 512)
         await session.close()
         var env = environment(MemoryDrive(size: device.sizeBytes))
-        env.openSource = { _ in .init(reader: reader, close: {}) }
+        env.openSource = { _, _ in .init(reader: reader, close: {}) }
         let model = await run(env, to: url)
         guard case .finished(let summary) = model.phase, case .stopped(let reason) = summary.outcome else {
             Issue.record("expected stopped"); return
@@ -207,6 +277,47 @@ final class MemoryDrive: BlockReader, @unchecked Sendable {
         let first = Int(offset / 512), last = Int((offset + Int64(count) - 1) / 512)
         if (first...last).contains(where: bad.contains) { throw ScanError.io("Input/output error") }
         return bytes.subdata(in: Int(offset)..<Int(offset) + count)
+    }
+}
+
+/// Like `RawBlockReader`: an actor whose read at or past `stuckAt` blocks its thread in a
+/// synchronous call (as `pread` does on a failing drive), so every later call on the actor --
+/// `close()` included -- waits behind it until `release()`.
+actor StuckDrive: BlockReader {
+    nonisolated let sizeBytes: Int64
+    nonisolated let logicalBlockSize = 512
+    private nonisolated let stuckAt: Int64
+    private nonisolated let gate = DispatchSemaphore(value: 0)
+    private nonisolated let state = LockedFlags()
+
+    init(size: Int64, stuckAt: Int64) { sizeBytes = size; self.stuckAt = stuckAt }
+
+    nonisolated var isStuck: Bool { state.get(\.stuck) }
+    nonisolated var closed: Bool { state.get(\.closed) }
+    nonisolated func release() { if state.set(\.released) { for _ in 0..<64 { gate.signal() } } }
+
+    func read(at offset: Int64, count: Int) async throws -> Data {
+        if offset + Int64(count) > stuckAt, !state.get(\.released) {
+            _ = state.set(\.stuck)
+            blockThread()
+        }
+        return Data(repeating: 1, count: count)
+    }
+
+    func close() { _ = state.set(\.closed) }
+
+    /// A synchronous wait, holding the actor's thread like a stuck `pread`.
+    private nonisolated func blockThread() { gate.wait() }
+}
+
+final class LockedFlags: @unchecked Sendable {
+    struct Flags { var stuck = false, closed = false, released = false }
+    private let lock = NSLock()
+    private var flags = Flags()
+    func get(_ key: KeyPath<Flags, Bool>) -> Bool { lock.withLock { flags[keyPath: key] } }
+    /// Sets the flag; true when it wasn't set before.
+    func set(_ key: WritableKeyPath<Flags, Bool>) -> Bool {
+        lock.withLock { defer { flags[keyPath: key] = true }; return !flags[keyPath: key] }
     }
 }
 

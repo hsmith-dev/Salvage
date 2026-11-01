@@ -18,11 +18,17 @@ struct DriveImagingEnvironment: Sendable {
         let close: @Sendable () async -> Void
     }
 
-    var openSource: @Sendable (BlockDevice) async throws -> Source
+    /// Opens the drive; the closure runs just before macOS's administrator-password dialog.
+    var openSource: @Sendable (BlockDevice, _ willAskForPassword: @escaping @Sendable () async -> Void) async throws -> Source
     /// The destination folder's verdict against the drive (`DestinationSafety`).
     var assess: @Sendable (URL, BlockDevice) -> DestinationAssessment
     var freeSpace: @Sendable (URL) -> Int64?
     var filesystemType: @Sendable (URL) -> String?
+    /// Files that must never be replaced: every attached disk image's backing file (one of them
+    /// may be the drive being imaged) and every image open in Salvage. Nil when unknown.
+    var protectedFiles: @Sendable () -> Set<FileIdentity>? = { [] }
+    /// Whether the drive is still attached (asked on a 0-byte read and on a long unreadable run).
+    var presence: @Sendable (BlockDevice) -> (@Sendable () async -> Bool)? = { _ in nil }
     var imager = DriveImager()
 
     /// The live environment. `session` is the window's finished scan session: when it is of this
@@ -30,7 +36,7 @@ struct DriveImagingEnvironment: Sendable {
     /// rather than opening the drive a second time.
     static func live(reusing session: SourceSession?) -> DriveImagingEnvironment {
         DriveImagingEnvironment(
-            openSource: { device in
+            openSource: { device, willAskForPassword in
                 #if DEBUG
                 if UITestFixture.active != nil { throw ScanError.unsafeTarget("Imaging isn't available with UI-test fixtures.") }
                 #endif
@@ -38,12 +44,27 @@ struct DriveImagingEnvironment: Sendable {
                    !session.isClosed {
                     return Source(reader: SessionImagingReader(session: session), close: {})
                 }
-                let reader = try await RawBlockReader.prepare(device: device)
+                let reader = try await RawBlockReader.prepare(device: device, onAdministratorPasswordPrompt: willAskForPassword)
                 return Source(reader: reader, close: { await reader.close() })
             },
             assess: { folder, device in DestinationSafety.live.assess(destination: folder, source: device) },
-            freeSpace: { RecoveryCoordinator.availableCapacity(at: $0) },
-            filesystemType: { ImageOutputFile.filesystemType(ofPath: $0.resolvingSymlinksInPath().path) })
+            freeSpace: { availableCapacity(at: $0) },
+            filesystemType: { ImageOutputFile.filesystemType(ofPath: $0.resolvingSymlinksInPath().path) },
+            protectedFiles: {
+                guard let attached = ImageOutputFile.attachedImageBackingFiles() else { return nil }
+                return attached.union(DiskImageRegistry.shared.allImages.map(\.identity))
+            },
+            presence: { DriveImager.presence(of: $0) })
+    }
+
+    /// Free space for one file as large as the drive: `volumeAvailableCapacity`, what is free now.
+    /// (The "important usage" figure recovery prefers counts purgeable space macOS may or may not
+    /// free in time, and an image is written for hours.) Falls back to `statfs`.
+    static func availableCapacity(at url: URL) -> Int64? {
+        if let free = (try? url.resourceValues(forKeys: [.volumeAvailableCapacityKey]))?.volumeAvailableCapacity, free > 0 {
+            return Int64(free)
+        }
+        return RecoveryCoordinator.statfsAvailable(at: url)
     }
 }
 
@@ -168,6 +189,8 @@ final class DriveImagingModel: Identifiable {
     private(set) var phase: Phase = .checking
     private(set) var progress: ImagingProgress
     private(set) var copyStartedAt: Date?
+    /// macOS is (or was) showing its administrator-password dialog to open the drive.
+    private(set) var asksForPassword = false
     private var samples: [(time: Date, bytes: Int64)] = []
     private var task: Task<Void, Never>?
     private let environment: DriveImagingEnvironment
@@ -198,6 +221,7 @@ final class DriveImagingModel: Identifiable {
             let phase = await Self.perform(device: device, destination: destination, replacingConfirmed: replacing,
                                            environment: environment,
                                            copying: { await self.beginCopying() },
+                                           willAskForPassword: { await self.willAskForPassword() },
                                            progress: { value in Task { @MainActor in self.record(value) } })
             await self.finish(phase)
         }
@@ -212,6 +236,8 @@ final class DriveImagingModel: Identifiable {
 
     /// Waits for the run to end (tests).
     func waitUntilFinished() async { await task?.value }
+
+    private func willAskForPassword() { asksForPassword = true }
 
     private func beginCopying() {
         phase = .copying
@@ -259,6 +285,7 @@ final class DriveImagingModel: Identifiable {
     nonisolated static func perform(device: BlockDevice, destination: URL, replacingConfirmed: Bool,
                                     environment: DriveImagingEnvironment,
                                     copying: @Sendable () async -> Void,
+                                    willAskForPassword: @escaping @Sendable () async -> Void = {},
                                     progress: @escaping @Sendable (ImagingProgress) -> Void) async -> Phase {
         let folder = destination.deletingLastPathComponent()
         let assessment = environment.assess(folder, device)
@@ -274,17 +301,17 @@ final class DriveImagingModel: Identifiable {
         guard let free = environment.freeSpace(folder) else {
             return .failed("Salvage couldn't read how much free space the destination has, so it didn't start. Choose a folder on another drive.")
         }
-        // A file the save panel confirmed replacing frees its space when it is replaced.
-        let replaced = replacingConfirmed ? existingRegularFileSize(destination) : 0
-        let (sum, overflow) = max(0, free).addingReportingOverflow(replaced)
-        let available = overflow ? Int64.max : sum
+        // A file being replaced isn't counted as freed: it may not be replaceable after all, and
+        // its space may not come back at once (snapshots, a Trash-like copy).
+        let available = max(0, free)
         guard available >= device.sizeBytes else {
             return .failed("The image needs \(DriveImagingFormat.bytes(device.sizeBytes)) of free space, but the destination has only \(DriveImagingFormat.bytes(available)). Choose a drive with more free space.")
         }
         if Task.isCancelled { return .failed("Canceled. Nothing was copied.") }
 
         let source: DriveImagingEnvironment.Source
-        do { source = try await environment.openSource(device) } catch is CancellationError {
+        let protected = environment.protectedFiles()
+        do { source = try await environment.openSource(device, willAskForPassword) } catch is CancellationError {
             return .failed("Canceled. Nothing was copied.")
         } catch {
             return .failed(describe(error))
@@ -294,15 +321,19 @@ final class DriveImagingModel: Identifiable {
             return .failed(ScanError.deviceChanged.description)
         }
         let output: ImageOutputFile
-        do { output = try ImageOutputFile(creating: destination, replacingConfirmed: replacingConfirmed, checked: assessment) } catch {
+        do {
+            output = try ImageOutputFile(creating: destination, replacingConfirmed: replacingConfirmed, checked: assessment,
+                                         protectedFiles: protected)
+        } catch {
             await source.close()
             return .failed(describe(error))
         }
         await copying()
         let started = Date()
-        let result = await environment.imager.run(reader: source.reader, sink: output, progress: progress)
+        var imager = environment.imager
+        imager.stillPresent = imager.stillPresent ?? environment.presence(device)
+        let result = await imager.run(reader: source.reader, sink: output, progress: progress)
         output.close()
-        await source.close()
         let finished = Date()
 
         var summary = DriveImagingSummary(
@@ -320,13 +351,15 @@ final class DriveImagingModel: Identifiable {
                 unreadableBytes: summary.unreadableBytes, badRanges: summary.badRanges, sha256: summary.sha256,
                 elapsed: summary.elapsed)
         }
+        if result.outcome == .completed {
+            await source.close()
+        } else {
+            // After a timeout or a cancel, a read may still be stuck in the kernel, and closing a
+            // RawBlockReader queues behind it on the same actor. The close runs on its own then,
+            // whenever that read returns; the sidecar and the summary don't wait for it.
+            Task.detached { await source.close() }
+        }
         return .finished(summary)
-    }
-
-    nonisolated private static func existingRegularFileSize(_ url: URL) -> Int64 {
-        var info = stat()
-        guard lstat(url.path, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { return 0 }
-        return Int64(info.st_size)
     }
 
     nonisolated static func describe(_ error: any Error) -> String {
