@@ -91,6 +91,16 @@ struct ResultsDashboardView: View {
                         Button("View these files") { onOpen(nil) }
                     }
                 }
+                // What the scan could not do: calm, text only, no alarm color (DESIGN.md).
+                if !scan.noticeLines.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("About this scan").font(.headline)
+                        ForEach(Array(scan.noticeLines.enumerated()), id: \.offset) { _, line in
+                            Text(line).foregroundStyle(.secondary).textSelection(.enabled)
+                        }
+                    }
+                    .accessibilityElement(children: .combine)
+                }
                 // The only-system-files state carries its own toggle; don't show a second one.
                 if emptyState != .onlySystemFiles {
                     VStack(alignment: .leading, spacing: 4) {
@@ -101,7 +111,8 @@ struct ResultsDashboardView: View {
                         }
                     }
                 }
-                Text("Files listed here have been indexed from intact metadata. No files have been copied or recovered.")
+                Text(Self.closingNote(reconstructed: totals.reconstructedCount,
+                                      fromMetadata: totals.recoverableCount - totals.reconstructedCount + totals.unrecoverableCount))
                     .font(.subheadline).foregroundStyle(.secondary)
             }
             .padding(32)
@@ -125,7 +136,7 @@ struct ResultsDashboardView: View {
         .buttonStyle(.plain)
         .disabled(bucket.count == 0)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(bucket.category.displayName), \(filesText(bucket.count)), \(bytes(bucket.totalBytes))")
+        .accessibilityLabel(Self.tileAccessibilityLabel(bucket))
     }
 
     private var statusLine: String {
@@ -135,6 +146,23 @@ struct ResultsDashboardView: View {
         case .failed: return "Scan stopped early — \(found) before it stopped"
         default: return "Scan completed — \(found)"
         }
+    }
+
+    /// The dashboard's closing sentence: how the listed files were found, and that nothing was copied.
+    static func closingNote(reconstructed: Int, fromMetadata: Int) -> String {
+        let how = switch (fromMetadata > 0, reconstructed > 0) {
+        case (_, false): "have been indexed from intact metadata"
+        case (false, true): "have been reconstructed from their contents on the device"
+        case (true, true): "have been indexed from intact metadata or reconstructed from their contents on the device"
+        }
+        return "Files listed here \(how). No files have been copied or recovered."
+    }
+
+    static func tileAccessibilityLabel(_ bucket: ResultsViewModel.Bucket) -> String {
+        var parts = [bucket.category.displayName, ResultsViewModel.filesText(bucket.count),
+                     ByteCountFormatter.string(fromByteCount: bucket.totalBytes, countStyle: .file)]
+        if bucket.reconstructedCount > 0 { parts.append("\(bucket.reconstructedCount.formatted()) reconstructed") }
+        return parts.joined(separator: ", ")
     }
 
     private func filesText(_ count: Int) -> String { ResultsViewModel.filesText(count) }

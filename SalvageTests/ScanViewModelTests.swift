@@ -95,6 +95,47 @@ struct ScanViewModelTests {
         while model.isActive { await Task.yield() }
         #expect(model.state == .completed)
     }
+    @Test func noticesAreCollectedInOrderAndResetPerScan() async {
+        let attempts = AttemptProbe()
+        let model = ScanViewModel { run, events in
+            if await attempts.next() == 1 {
+                run.notices.yield(.partitionTableIgnored(reason: "Invalid GPT header."))
+                run.notices.yield(.unreadableAreasSkipped(count: 3))
+                run.notices.yield(.unreadableAreasSkipped(count: 3))   // a repeat is shown once
+            }
+            try await events.send(.completed)
+        }
+        model.start(device)
+        while model.isActive { await Task.yield() }
+        #expect(model.state == .completed)
+        #expect(model.notices == [.partitionTableIgnored(reason: "Invalid GPT header."), .unreadableAreasSkipped(count: 3)])
+        #expect(model.noticeLines == model.notices.map(\.text))
+        #expect(model.noticeLines.last == "Part of this drive couldn't be read, so 3 areas were skipped.")
+        model.start(device)
+        while model.isActive { await Task.yield() }
+        #expect(model.notices.isEmpty && model.noticeLines.isEmpty)
+    }
+    @Test func noticesArriveBesideAnErrorWithoutReplacingIt() async {
+        let model = ScanViewModel { run, events in
+            run.notices.yield(.signaturesSkipped(["broken.json"]))
+            try await events.send(.error(.deviceChanged))
+        }
+        model.start(device)
+        while model.isActive { await Task.yield() }
+        #expect(model.state == .failed(.deviceChanged))
+        #expect(model.notices == [.signaturesSkipped(["broken.json"])])
+    }
+    @Test func dashboardWordingCoversReconstructedFiles() {
+        #expect(ResultsDashboardView.closingNote(reconstructed: 0, fromMetadata: 4)
+                == "Files listed here have been indexed from intact metadata. No files have been copied or recovered.")
+        #expect(ResultsDashboardView.closingNote(reconstructed: 2, fromMetadata: 4).contains("or reconstructed from their contents"))
+        let carvedOnly = ResultsDashboardView.closingNote(reconstructed: 2, fromMetadata: 0)
+        #expect(carvedOnly.contains("reconstructed") && !carvedOnly.contains("metadata"))
+        let bucket = ResultsViewModel.Bucket(category: .pictures, count: 3, totalBytes: 2000, reconstructedCount: 2)
+        #expect(ResultsDashboardView.tileAccessibilityLabel(bucket) == "Pictures, 3 files, 2 KB, 2 reconstructed")
+        let plain = ResultsViewModel.Bucket(category: .pictures, count: 1, totalBytes: 0)
+        #expect(!ResultsDashboardView.tileAccessibilityLabel(plain).contains("reconstructed"))
+    }
 }
 
 @MainActor @Suite("Pause, resume, cancel and checkpoints")

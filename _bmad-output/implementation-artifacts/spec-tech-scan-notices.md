@@ -2,7 +2,7 @@
 title: 'Scan Notices: Tell the User What a Scan Could Not Do'
 type: 'tech'
 created: '2026-10-31'
-status: 'ready-for-dev'
+status: 'done'
 baseline_commit: 'd04d613'
 route: 'dispatch'
 context:
@@ -69,3 +69,14 @@ The last one also ends the scan today, so files on the device's *other* volumes 
 - `./scripts/check-core-boundary.sh && ./scripts/check-no-network.sh`
 - `xcodebuild -project Salvage.xcodeproj -scheme Salvage -configuration Debug -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO -only-testing:SalvageTests test`
 - `xcodebuild -project Salvage.xcodeproj -scheme Salvage -configuration Debug -destination 'platform=macOS' CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO build`
+
+## Implementation Notes
+
+- **Single-volume rule.** A mapped volume's `.malformed` / `.unsupportedFilesystem` failure is isolated only when discovery returned more than one extent (mapped or lost). With exactly one extent the error is rethrown unchanged, so a one-volume device still reports `.error(.malformed)` and emits no `.volumeSkipped` (notices never duplicate an error). If every volume of a multi-volume device fails, each gets a `.volumeSkipped` and the scan still sweeps, carves and completes.
+- **Skipped volume is still swept.** A skipped mapped volume stays in the sweep, so the carver can reconstruct files from its bytes. Files that its parser emitted before failing keep their claimed runs.
+- **`volumeSkipped.formatName`** is `extent.formatName ?? format.displayName`. For a mapped FAT volume that reads "FAT32/exFAT", because discovery does not tell the two apart for mapped extents and parsers were out of scope. `reason` is `ScanError.description`.
+- **`partitionTableIgnored(reason:)`** comes from `VolumeDiscovery.Result.warnings`, which is a list of strings. The parser could not be edited, so `ScanSession.discoveryNotices` recognises the ignored-table sentence by its fixed prefix and suffix and pulls out the reason. The reason is kept on the value but left out of the user-facing text, because it is technical (e.g. "Invalid GPT header checksum or backup location.").
+- **Search-limit and unreadable notices** come from the structured fields (`probesTruncated` + `searchedBytes`, `failedProbes`), not the warning strings. When the search stopped after repeated read failures, both `.lostPartitionSearchLimited` and `.unreadableAreasSkipped` are emitted.
+- **`carvingLimitReached(count:)`** reports `carverLimits.maxCarvedFiles`, since the cap is only reached at that count. `.resumedCarvingPartial` is emitted only when the accepted checkpoint is past the very start of the sweep.
+- **Test seams.** `ScanSession` has two internal stored vars with defaults, `signatureLibrary` (`.bundled`) and `carverLimits` (`.default`), so tests can reach the signature-skipped and carving-limit producers. The public API and the inits are unchanged.
+- **App.** `ScanViewModel` drops an exact repeat of a notice and exposes `noticeLines` as the rendering model. The dashboard section sits below the tiles, the lost-partition card and the "Can't be recovered" section, using secondary text only. `ResultsDashboardView.closingNote` / `tileAccessibilityLabel` are static so they can be tested.
