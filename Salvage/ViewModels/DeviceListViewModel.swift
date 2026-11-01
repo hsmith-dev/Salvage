@@ -160,14 +160,16 @@ public final class DeviceListViewModel {
     /// The partition "Recover all files…" acts on for a sidebar row, or nil when the row offers no
     /// such action: only partitions of the drive whose scan has finished (matched by BSD name and
     /// attachment identity, so a drive re-attached under the same name doesn't qualify). A volume
-    /// inside an APFS container resolves to its container, where its files were found.
+    /// inside an APFS container is its own target: its files carry its name and UUID, so it
+    /// recovers only that volume (`PartitionGrouping.groups(for:…)` falls back to the container
+    /// when its name is ambiguous).
     public func recoverAllTarget(for partition: DevicePartition) -> DevicePartition? {
         guard let finished = finishedScanDevice,
               let drive = devices.first(where: { $0.id == finished.id }),
               drive.mediaIdentity == finished.mediaIdentity else { return nil }
         for top in drive.partitions {
             if top.id == partition.id { return top }
-            if top.children.contains(where: { $0.id == partition.id }) { return top }
+            if let volume = top.children.first(where: { $0.id == partition.id }) { return volume }
         }
         return nil
     }

@@ -1087,6 +1087,35 @@ struct APFSDeletedFileTests {
         let events = await scan(builder.image)
         #expect(events.last == .completed && found(events).count == 3)
     }
+
+    /// Every APFS file, live and deleted, names the volume it came from, so two volumes sharing a
+    /// container (and its offset) with the same paths can be told apart.
+    @Test func everyFileCarriesItsVolumesNameAndUUID() async throws {
+        var personal = twoCheckpointVolume()
+        personal.name = "Personal"
+        let work = SynthVolume(fsOID: 1027, name: "Work", states: simpleVolume(fsOID: 1027, name: "Work").states)
+        let probe = APFSImageBuilder()
+        var probed = [personal, work]
+        probe.container(&probed)
+        let gone = probed[0].states[5]!.files.first { $0.name == "gone.txt" }!.firstBlock!
+        let builder = APFSImageBuilder()
+        builder.pendingFrees = [(6, gone, 1)]
+        var volumes = [personal, work]
+        builder.container(&volumes)
+        let events = await scan(builder.image)
+        #expect(events.last == .completed)
+        let files = found(events)
+        let mine = files.filter { $0.sourceMetadata.volumeName == "Personal" }
+        let theirs = files.filter { $0.sourceMetadata.volumeName == "Work" }
+        #expect(mine.count + theirs.count == files.count)
+        #expect(mine.filter { !$0.isDeleted }.count == 3 && theirs.count == 3)
+        #expect(mine.filter(\.isDeleted).map(\.path) == ["/docs/gone.txt"])
+        #expect(mine.allSatisfy { $0.sourceMetadata.volumeID == personal.uuid.uuidString.uppercased() })
+        #expect(theirs.allSatisfy { $0.sourceMetadata.volumeID == work.uuid.uuidString.uppercased() })
+        // Same paths, same container offset: only the volume identity separates them.
+        #expect(Set(mine.filter { !$0.isDeleted }.map(\.path)) == Set(theirs.map(\.path)))
+        #expect(Set(files.map(\.sourceMetadata.volumeOffset)) == [0])
+    }
 }
 
 // MARK: - Real hdiutil images (Story 2.1 spike as a regression test)

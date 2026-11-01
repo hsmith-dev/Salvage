@@ -19,7 +19,7 @@ struct ResultsView: View {
                 } else {
                     ResultsDashboardView(model: model, scan: scan, partitionCache: partitionCache, onRecoverPartition: { summary in
                         partitionPlan = model.recoverAllPlan(for: summary, devicePartitions: scan.device?.partitions ?? [],
-                                                             cache: partitionCache)
+                                                             context: scan.partitionScanContext, cache: partitionCache)
                     }, onOpen: { category in
                         model.category = category
                         model.volumeFilter = nil
@@ -41,8 +41,7 @@ struct ResultsView: View {
         .onChange(of: model == nil) { _, _ in takePartitionRequest() }
         .sheet(item: $partitionPlan) { plan in
             if let source = scan.source {
-                RecoverySheet(files: plan.files, source: source, rootName: plan.name,
-                              reconstructedFiles: plan.reconstructed, onDone: { partitionPlan = nil })
+                RecoverySheet(plan: plan, source: source, onDone: { partitionPlan = nil })
             }
         }
     }
@@ -52,7 +51,7 @@ struct ResultsView: View {
         guard let request = partitionRequest.wrappedValue, let model, scan.source != nil else { return }
         partitionRequest.wrappedValue = nil
         partitionPlan = model.recoverAllPlan(for: request.partition, devicePartitions: scan.device?.partitions ?? [],
-                                             cache: partitionCache)
+                                             context: scan.partitionScanContext, cache: partitionCache)
     }
 }
 
@@ -107,7 +106,8 @@ struct ResultsDashboardView: View {
                         Button("Browse all files") { onOpen(nil) }
                     }
                 }
-                let partitionRows = model.partitionSummaries(devicePartitions: scan.device?.partitions ?? [], cache: partitionCache)
+                let partitionRows = model.partitionSummaries(devicePartitions: scan.device?.partitions ?? [],
+                                                             context: scan.partitionScanContext, cache: partitionCache)
                 if !partitionRows.isEmpty {
                     PartitionsSection(summaries: partitionRows, canRecover: scan.source != nil, onRecoverAll: onRecoverPartition)
                 }

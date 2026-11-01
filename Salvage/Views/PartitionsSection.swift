@@ -34,9 +34,9 @@ struct PartitionsSection: View {
             }
             .accessibilityElement(children: .combine)
             Spacer(minLength: 8)
-            Button("Recover all files…") { onRecoverAll(summary) }
+            Button(summary.recoverAllTitle) { onRecoverAll(summary) }
                 .disabled(!canRecover || !summary.canRecoverAll)
-                .accessibilityLabel("Recover all files from \(summary.name)")
+                .accessibilityLabel(summary.recoverAllAccessibilityLabel)
         }
         .frame(maxWidth: 640, alignment: .leading)
         .padding(16)

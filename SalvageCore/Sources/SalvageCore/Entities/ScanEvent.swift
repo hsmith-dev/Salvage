@@ -123,11 +123,19 @@ public struct SourceMetadata: Sendable, Equatable {
     public let contiguous: Bool
     /// Original record bytes preserve timestamps and format-specific fields for later recovery.
     public let rawRecord: Data
+    /// The volume's name inside a container that holds several volumes at one `volumeOffset`
+    /// (APFS); nil for formats with one volume per offset.
+    public let volumeName: String?
+    /// That volume's identity (the APFS volume UUID, uppercased), so volumes sharing a container
+    /// offset stay apart; nil for formats with one volume per offset.
+    public let volumeID: String?
     public init(filesystem: Filesystem, volumeOffset: Int64, recordOffset: Int64,
-                allocationStart: UInt64, contiguous: Bool, rawRecord: Data) {
+                allocationStart: UInt64, contiguous: Bool, rawRecord: Data,
+                volumeName: String? = nil, volumeID: String? = nil) {
         self.filesystem = filesystem; self.volumeOffset = volumeOffset
         self.recordOffset = recordOffset; self.allocationStart = allocationStart
         self.contiguous = contiguous; self.rawRecord = rawRecord
+        self.volumeName = volumeName; self.volumeID = volumeID
     }
 }
 
