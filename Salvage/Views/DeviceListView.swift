@@ -93,10 +93,17 @@ struct DeviceListView: View {
                     // VoiceOver even if a disabled row's announcement behavior turns out to be
                     // inconsistent -- not confirmed either way, no VoiceOver testing was done.
                     .accessibilityLabel(device.displayName)
-                    .accessibilityValue(device.isBootVolume ? bootVolumeReason : (isScanning && activeDeviceID == device.id ? "In use by another scan" : sizeText(for: device)))
+                    .accessibilityValue(accessibilityValue(for: device))
             }
         }
         .listStyle(.inset)
+    }
+
+    /// The glyph alone never conveys the FileVault state (EXPERIENCE.md): "Locked" is spoken too.
+    private func accessibilityValue(for device: BlockDevice) -> String {
+        if device.isBootVolume { return bootVolumeReason }
+        if isScanning && activeDeviceID == device.id { return "In use by another scan" }
+        return device.encryptedVolumeUUID == nil ? sizeText(for: device) : "Locked, \(sizeText(for: device))"
     }
 
     /// Routes List's own selection mechanism through `DeviceListViewModel`: a non-nil id goes
@@ -128,6 +135,7 @@ struct DeviceListView: View {
 private struct DeviceRow: View {
     let device: BlockDevice
     var inUse = false
+    private var isLocked: Bool { device.encryptedVolumeUUID != nil }
 
     var body: some View {
         HStack(spacing: 12) {
@@ -145,13 +153,21 @@ private struct DeviceRow: View {
                         .font(.subheadline)
                         .foregroundStyle(.tertiary)
                 } else {
-                    Text(inUse ? "In use by another scan" : sizeText(for: device))
+                    Text(inUse ? "In use by another scan" : (isLocked ? "\(sizeText(for: device)) · Locked" : sizeText(for: device)))
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
             }
 
             Spacer()
+
+            // Story 2.4: a FileVault-locked device (EXPERIENCE.md "FileVault locked (known up
+            // front)"). Decorative here; `DeviceListView` speaks "Locked" in the row's value.
+            if isLocked {
+                Image(systemName: "lock.fill")
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+            }
         }
         .padding(12)
         .background(Color(nsColor: .controlBackgroundColor))

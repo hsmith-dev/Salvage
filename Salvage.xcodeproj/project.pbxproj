@@ -15,6 +15,7 @@
 		1E8AF016B1A0E95B494EAAED /* RecoverySheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 808421B06766C5A9FFA274ED /* RecoverySheet.swift */; };
 		29BABD96F117CF581C32C536 /* PreviewLoader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13AB8B7E7A20544CD69D8CBF /* PreviewLoader.swift */; };
 		35D156385907C3D8CBD6FAF6 /* ConfidenceLabel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9B3CBFEBAF88D26B71FD597C /* ConfidenceLabel.swift */; };
+		46AFE6F0A945A97A98DA3C7F /* FileVaultUnlockSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCB9F0B50D00C384779EDE2C /* FileVaultUnlockSheet.swift */; };
 		4D398A0ADFE72188D424D15E /* ResultsDashboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 32F1F12AAAACFF6920FA4E1E /* ResultsDashboardView.swift */; };
 		4E4930C119561323B128C398 /* DeviceListViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99D08CCB19B88001DA0D7837 /* DeviceListViewModel.swift */; };
 		52354930675517AFF3E449A9 /* UpdateCheckerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F798DD8A6F1B8EF9E72517BA /* UpdateCheckerTests.swift */; };
@@ -25,6 +26,7 @@
 		6B72BE7198AFA1AD22773D13 /* UpdateChecker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A78CB2252556649B9DABE08 /* UpdateChecker.swift */; };
 		6BEE060426D0E80E24AF664C /* ScanViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4CD440ACD4B335303928637 /* ScanViewModel.swift */; };
 		7258392A62CEBE52A5E50D56 /* FilePreviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E17D8A77B7537474A88104D /* FilePreviewView.swift */; };
+		74B11B07E7A978036AF8F18E /* UnlockViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1FC8E8A7A76780EA029855E8 /* UnlockViewModel.swift */; };
 		75CF67744D8200F5CEFB8E8A /* ResultsViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B552735CFF0ADC1F523CD01 /* ResultsViewModel.swift */; };
 		7D91E05428F149D39FF3CE3F /* PreviewLoaderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5482A784FE2B89690AB6EF74 /* PreviewLoaderTests.swift */; };
 		82973B300A3833E3A4CAE166 /* DeviceListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200C8811715FB24AA7CA8091 /* DeviceListView.swift */; };
@@ -42,6 +44,7 @@
 		DA2FFB71E137E4CF2BA82727 /* PrivilegedOpenProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C0D0F9FA3E8E62AA8B12EE1 /* PrivilegedOpenProtocol.swift */; };
 		DB4FF45FD4E869D4490DA392 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 98C64227FE351987F85FA819 /* ContentView.swift */; };
 		EF65AF81B3862EDF22A9CEF2 /* ResultsViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EDF6E74F57E1D6B66721A701 /* ResultsViewModelTests.swift */; };
+		F3C3DFAE8F44085210451A3E /* UnlockViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BD259F2B5E05DFE6F115B7A6 /* UnlockViewModelTests.swift */; };
 		FE47C27DA6E7769F4E910112 /* SalvageHelper in Embed Dependencies */ = {isa = PBXBuildFile; fileRef = F56855E06D1FF7725085AF55 /* SalvageHelper */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
@@ -92,6 +95,7 @@
 		0CD075B0C20C5E1B3BB018F0 /* BSDDeviceNames.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BSDDeviceNames.swift; sourceTree = "<group>"; };
 		13AB8B7E7A20544CD69D8CBF /* PreviewLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewLoader.swift; sourceTree = "<group>"; };
 		181533C1F6458A10898E049A /* HelperApprovalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HelperApprovalView.swift; sourceTree = "<group>"; };
+		1FC8E8A7A76780EA029855E8 /* UnlockViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnlockViewModel.swift; sourceTree = "<group>"; };
 		200C8811715FB24AA7CA8091 /* DeviceListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceListView.swift; sourceTree = "<group>"; };
 		207452AAAA5C899682CD4D98 /* PrivilegedDiskQueries.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivilegedDiskQueries.swift; sourceTree = "<group>"; };
 		32F1F12AAAACFF6920FA4E1E /* ResultsDashboardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResultsDashboardView.swift; sourceTree = "<group>"; };
@@ -116,6 +120,8 @@
 		B06FDFC018E70AED252E2AD4 /* ScanProgressView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScanProgressView.swift; sourceTree = "<group>"; };
 		B0933542F4F7159EED639D23 /* SalvageDiskIO */ = {isa = PBXFileReference; lastKnownFileType = folder; name = SalvageDiskIO; path = SalvageDiskIO; sourceTree = SOURCE_ROOT; };
 		B1DE755CB1D6209CEB18BBAE /* SalvageApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SalvageApp.swift; sourceTree = "<group>"; };
+		BCB9F0B50D00C384779EDE2C /* FileVaultUnlockSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileVaultUnlockSheet.swift; sourceTree = "<group>"; };
+		BD259F2B5E05DFE6F115B7A6 /* UnlockViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnlockViewModelTests.swift; sourceTree = "<group>"; };
 		C5742DFC4C322D2335F60B77 /* Salvage.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Salvage.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		C9D545C7519DEC1E75E987A4 /* SalvageTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SalvageTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		E40E27E6E6443F51724D8027 /* DeviceListViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceListViewModelTests.swift; sourceTree = "<group>"; };
@@ -165,6 +171,7 @@
 				3F82CDD0036874C3DF40E624 /* RecoveryCoordinatorTests.swift */,
 				EDF6E74F57E1D6B66721A701 /* ResultsViewModelTests.swift */,
 				7D688D515CDA1F3D3D907DEB /* ScanViewModelTests.swift */,
+				BD259F2B5E05DFE6F115B7A6 /* UnlockViewModelTests.swift */,
 				F798DD8A6F1B8EF9E72517BA /* UpdateCheckerTests.swift */,
 			);
 			path = SalvageTests;
@@ -205,6 +212,7 @@
 				200C8811715FB24AA7CA8091 /* DeviceListView.swift */,
 				46C282C21C963EE0A2EEB372 /* FileBrowserView.swift */,
 				8E17D8A77B7537474A88104D /* FilePreviewView.swift */,
+				BCB9F0B50D00C384779EDE2C /* FileVaultUnlockSheet.swift */,
 				181533C1F6458A10898E049A /* HelperApprovalView.swift */,
 				808421B06766C5A9FFA274ED /* RecoverySheet.swift */,
 				32F1F12AAAACFF6920FA4E1E /* ResultsDashboardView.swift */,
@@ -253,6 +261,7 @@
 				A823EAB151C49C3DEBC69CF6 /* ScanCheckpointStore.swift */,
 				F4CD440ACD4B335303928637 /* ScanViewModel.swift */,
 				033C52D0FB3387397999220A /* SourceSession.swift */,
+				1FC8E8A7A76780EA029855E8 /* UnlockViewModel.swift */,
 			);
 			path = ViewModels;
 			sourceTree = "<group>";
@@ -425,6 +434,7 @@
 				4E4930C119561323B128C398 /* DeviceListViewModel.swift in Sources */,
 				B7B0C2A5219E6799897814A2 /* FileBrowserView.swift in Sources */,
 				7258392A62CEBE52A5E50D56 /* FilePreviewView.swift in Sources */,
+				46AFE6F0A945A97A98DA3C7F /* FileVaultUnlockSheet.swift in Sources */,
 				C7C0D2892751F06B6080B61C /* HelperApprovalView.swift in Sources */,
 				29BABD96F117CF581C32C536 /* PreviewLoader.swift in Sources */,
 				531815604B039A4847467A94 /* RecoveryCoordinator.swift in Sources */,
@@ -437,6 +447,7 @@
 				6BEE060426D0E80E24AF664C /* ScanViewModel.swift in Sources */,
 				6A926703E084480718248DBB /* SourceSession.swift in Sources */,
 				680844754611EBBCB5945B3F /* TrustPanelView.swift in Sources */,
+				74B11B07E7A978036AF8F18E /* UnlockViewModel.swift in Sources */,
 				6B72BE7198AFA1AD22773D13 /* UpdateChecker.swift in Sources */,
 				852D2C18EBC9D9A45C4D231C /* UpdateCommands.swift in Sources */,
 			);
@@ -451,6 +462,7 @@
 				0D31EF07325DE657CECF20A8 /* RecoveryCoordinatorTests.swift in Sources */,
 				EF65AF81B3862EDF22A9CEF2 /* ResultsViewModelTests.swift in Sources */,
 				59D8A403E40711D298D4493F /* ScanViewModelTests.swift in Sources */,
+				F3C3DFAE8F44085210451A3E /* UnlockViewModelTests.swift in Sources */,
 				52354930675517AFF3E449A9 /* UpdateCheckerTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
