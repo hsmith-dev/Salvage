@@ -2,8 +2,11 @@ import Darwin
 import Foundation
 import SalvageCore
 
-/// Why a disk image file can't be read as a source.
-enum ImageOpenError: Error, Equatable, CustomStringConvertible {
+/// Why a disk image file can't be read as a source. The descriptions are the `salvage` tool's
+/// wording; the app words its own messages (`Salvage/ViewModels/ImageSource.swift`).
+///
+/// spec-tech-batch-7 §A moved this reader here from SalvageCLIKit so the app and the CLI share it.
+public enum ImageOpenError: Error, Equatable, CustomStringConvertible {
     case cannotOpen(path: String, reason: String)
     /// A device node (or a link to one): devices go through `RawBlockReader` and its safety checks.
     case deviceNode(path: String)
@@ -13,7 +16,7 @@ enum ImageOpenError: Error, Equatable, CustomStringConvertible {
     /// A compressed, sparse or otherwise encoded image whose bytes aren't the disk's bytes.
     case encodedImage(path: String)
 
-    var description: String {
+    public var description: String {
         switch self {
         case .cannotOpen(let path, let reason): "Couldn't open \(path): \(reason)."
         case .deviceNode(let path):
@@ -34,14 +37,14 @@ enum ImageOpenError: Error, Equatable, CustomStringConvertible {
 /// A UDIF trailer ("koly" block in the last 512 bytes) is not part of the disk; an image with one
 /// is accepted only when the trailer says the data fork is the raw disk starting at byte 0 and
 /// it carries no block map (UDRW). Compressed images (UDZO, ...) are refused, never misread.
-final class ImageFileReader: BlockReader, @unchecked Sendable {
-    let sizeBytes: Int64
-    let path: String
+public final class ImageFileReader: BlockReader, @unchecked Sendable {
+    public let sizeBytes: Int64
+    public let path: String
     private let descriptor: Int32
     private let lock = NSLock()
     private var closed = false
 
-    init(path: String) throws {
+    public init(path: String) throws {
         self.path = path
         let fd = Darwin.open(path, O_RDONLY | O_CLOEXEC)
         guard fd >= 0 else { throw ImageOpenError.cannotOpen(path: path, reason: String(cString: strerror(errno))) }
@@ -66,7 +69,7 @@ final class ImageFileReader: BlockReader, @unchecked Sendable {
 
     deinit { close() }
 
-    func close() {
+    public func close() {
         lock.withLock {
             guard !closed else { return }
             closed = true
@@ -76,7 +79,7 @@ final class ImageFileReader: BlockReader, @unchecked Sendable {
 
     /// The UDIF trailer's data fork length when it describes a raw image (data fork at offset 0
     /// running up to the trailer, no XML block map); nil otherwise. Fields are big-endian.
-    static func rawDataForkLength(trailer: Data, fileSize: Int64) -> Int64? {
+    public static func rawDataForkLength(trailer: Data, fileSize: Int64) -> Int64? {
         guard trailer.count == 512 else { return nil }
         let bytes = [UInt8](trailer)
         func u64(_ offset: Int) -> UInt64 { bytes[offset..<(offset + 8)].reduce(0) { $0 << 8 | UInt64($1) } }
@@ -92,7 +95,7 @@ final class ImageFileReader: BlockReader, @unchecked Sendable {
         return read == count ? data : nil
     }
 
-    func read(at offset: Int64, count: Int) async throws -> Data {
+    public func read(at offset: Int64, count: Int) async throws -> Data {
         try Task.checkCancellation()
         guard offset >= 0, count >= 0, count <= 64 * 1024 * 1024, offset <= sizeBytes,
               Int64(count) <= sizeBytes - offset else {

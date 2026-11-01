@@ -10,14 +10,16 @@ struct ContentView: View {
         #if DEBUG
         // UI tests only (`-SalvageUITestFixture`): in-memory fakes, no checkpoints saved.
         if let fixture = UITestFixture.active {
-            let scan = ScanViewModel(runner: fixture.runScan, checkpointStore: nil)
+            // An opened disk image is read from its file; fixture drives from the fixture.
+            let scan = ScanViewModel(runner: DiskImageLibrary.runner(otherwise: fixture.runScan), checkpointStore: nil)
             _scan = State(initialValue: scan)
             rescan = { device, credentials in Task { @MainActor in scan.start(device, credentials: credentials) } }
             _unlock = State(initialValue: UnlockViewModel(verify: fixture.verifyUnlock, rescan: rescan))
             return
         }
         #endif
-        let scan = ScanViewModel(runner: Self.runScan, checkpointStore: .applicationSupport())
+        // spec-tech-batch-7 §A: an opened disk image is read from its file; drives as before.
+        let scan = ScanViewModel(runner: DiskImageLibrary.runner(otherwise: Self.runScan), checkpointStore: .applicationSupport())
         _scan = State(initialValue: scan)
         rescan = { device, credentials in Task { @MainActor in scan.start(device, credentials: credentials) } }
         _unlock = State(initialValue: UnlockViewModel(
@@ -124,6 +126,12 @@ enum CompositionRoot {
     @MainActor static func recoveryCoordinator(files: [RecoveredFile], source: SourceSession, rootName: String? = nil,
                                                reconstructedFiles: [RecoveredFile] = [],
                                                sourceLabel: String? = nil) -> RecoveryCoordinator {
+        // spec-tech-batch-7 §A: an image's results refuse the drive that holds the image file.
+        if let imageCheck = DiskImageLibrary.destinationCheck(for: source.device) {
+            return RecoveryCoordinator(files: files, content: source.content, deviceName: source.device.displayName,
+                                       rootName: rootName, reconstructedFiles: reconstructedFiles, sourceLabel: sourceLabel,
+                                       destinationCheck: imageCheck)
+        }
         #if DEBUG
         if let fixture = UITestFixture.active {
             return RecoveryCoordinator(files: files, content: source.content, deviceName: source.device.displayName,
