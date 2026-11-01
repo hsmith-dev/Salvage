@@ -178,6 +178,26 @@ private func keybagObject(type: UInt32, entries: [APFSKeybagEntry], size: Int = 
     return object
 }
 
+/// Counts PBKDF2 work instead of doing it; unwrapping is real, so a derived
+/// all-zero key never opens anything.
+private final class CountingProvider: APFSCryptoProvider, @unchecked Sendable {
+    private let lock = NSLock()
+    private var spent: UInt64 = 0, made = 0
+    /// Runs inside each derivation with its 1-based call number (e.g. to hold it, as a slow KDF).
+    let onDerive: @Sendable (Int) -> Void
+    init(onDerive: @escaping @Sendable (Int) -> Void = { _ in }) { self.onDerive = onDerive }
+    var iterations: UInt64 { lock.withLock { spent } }
+    var calls: Int { lock.withLock { made } }
+
+    func pbkdf2SHA256(password: UnsafeRawBufferPointer, salt: Data, iterations: UInt32, keyLength: Int) throws -> SecretBytes {
+        let call = lock.withLock { spent += UInt64(iterations); made += 1; return made }
+        onDerive(call)
+        return SecretBytes(count: keyLength)
+    }
+    func aesKeyUnwrap(kek: SecretBytes, wrapped: Data) throws -> SecretBytes? { try provider.aesKeyUnwrap(kek: kek, wrapped: wrapped) }
+    func aesBlockCipher(key: SecretBytes, encrypt: Bool) throws -> any AESBlockTransform { try provider.aesBlockCipher(key: key, encrypt: encrypt) }
+}
+
 @Suite("FileVault keybags and key unwrapping")
 struct APFSKeyUnwrapTests {
     let unwrapper = APFSKeyUnwrapper(provider: provider)
@@ -205,7 +225,8 @@ struct APFSKeyUnwrapTests {
     @Test func recoveryKeyUnlocksThroughItsRecordEvenTypedInLowercase() throws {
         let prk = "ABCD-EFGH-IJKL-MNOP-QRST-UVWX"
         let records = [try record("user password"), try record(prk, uuid: APFSKeybag.personalRecoveryKeyUUID)]
-        for typed in [prk, prk.lowercased(), "  \(prk)\n"] {
+        for typed in [prk, prk.lowercased(), "  \(prk)\n", "ABCDEFGHIJKLMNOPQRSTUVWX", "abcd efgh ijkl mnop qrst uvwx",
+                      "AbCd-EfGh - IjKl-MnOp\tQRST uvwx"] {
             let credential = VolumeCredential(kind: .recoveryKey, secret: typed, trimmingWhitespace: true)
             let kek = try unwrapper.unwrapKEK(records: records, credential: credential)
             #expect(kek.withBytes { Data($0) } == kekBytes)
@@ -230,6 +251,85 @@ struct APFSKeyUnwrapTests {
         #expect(throws: UnlockError.unsupported) { try unwrapper.unwrapVEK(Data([0x30, 0x00]), kek: secret(kekBytes)) }
     }
 
+    /// Apple's personal recovery key form: 24 letters or digits in six hyphenated groups of four,
+    /// however they were typed. Anything else is kept as typed.
+    @Test func recoveryKeysAreNormalizedOnTheBytes() throws {
+        func stored(_ typed: String, _ kind: VolumeCredential.Kind = .recoveryKey) throws -> String {
+            try VolumeCredential(kind: kind, secret: typed, trimmingWhitespace: kind == .recoveryKey).withSecret { String(decoding: $0, as: UTF8.self) }
+        }
+        let canonical = "ABCD-EFGH-1JKL-MNOP-QRS7-UVWX"
+        for typed in [canonical, "ABCDEFGH1JKLMNOPQRS7UVWX", "abcd-efgh-1jkl-mnop-qrs7-uvwx", "abcdefgh1jklmnopqrs7uvwx",
+                      "ABCD EFGH 1JKL MNOP QRS7 UVWX", " abcd - efgh - 1jkl - mnop - qrs7 - uvwx \n", "ABCD--EFGH1JKL\tMNOP-QRS7-UVWX"] {
+            #expect(try stored(typed) == canonical, "\(typed.debugDescription)")
+        }
+        // Not 24 key characters, or other characters in it: passed through unchanged (trimmed).
+        #expect(try stored("ABCD-EFGH") == "ABCD-EFGH")
+        #expect(try stored("abcd-efgh-ijkl-mnop-qrst-uvw") == "abcd-efgh-ijkl-mnop-qrst-uvw")
+        #expect(try stored("abcd-efgh-ijkl-mnop-qrst-uvwxy") == "abcd-efgh-ijkl-mnop-qrst-uvwxy")
+        #expect(try stored("abcd-efgh-ijkl-mnop-qrst-uvw!") == "abcd-efgh-ijkl-mnop-qrst-uvw!")
+        #expect(try stored("abcd-efgh-ijkl-mnop-qrst-uvwé") == "abcd-efgh-ijkl-mnop-qrst-uvwé")
+        // A password is never rewritten.
+        #expect(try stored("abcd efgh ijkl mnop qrst uvwx", .password) == "abcd efgh ijkl mnop qrst uvwx")
+    }
+
+    /// A hostile keybag of many expensive records is refused once one attempt's PBKDF2 budget is
+    /// spent, rather than costing every record's iterations.
+    @Test func manyHighIterationRecordsAreRefusedWithinTheBudget() throws {
+        let counting = CountingProvider()
+        let hostile = (0..<16).map { index in
+            APFSKeybagEntry(uuid: Data(repeating: UInt8(index), count: 16), tag: 3,
+                            data: blob(uuid: volumeUUID, wrapped: Data(count: 40), iterations: 9_000_000, salt: Data(count: 16)))
+        }
+        #expect(throws: UnlockError.toolFailure) {
+            try APFSKeyUnwrapper(provider: counting).unwrapKEK(records: hostile, credential: VolumeCredential(kind: .password, secret: "pw"))
+        }
+        #expect(counting.iterations <= APFSKeyUnwrapper.iterationBudget + 9_000_000)
+        #expect(counting.calls == 2)
+        // Ordinary records are all tried: the budget only bounds hostile work.
+        let ordinary = (0..<5).map { index in
+            APFSKeybagEntry(uuid: Data(repeating: UInt8(index), count: 16), tag: 3,
+                            data: blob(uuid: volumeUUID, wrapped: Data(count: 40), iterations: 200_000, salt: Data(count: 16)))
+        }
+        let fresh = CountingProvider()
+        #expect(throws: UnlockError.wrongPassword) {
+            try APFSKeyUnwrapper(provider: fresh).unwrapKEK(records: ordinary, credential: VolumeCredential(kind: .password, secret: "pw"))
+        }
+        #expect(fresh.calls == 5)
+    }
+
+    /// Cancelling a check stops it between records instead of deriving every record's key: the
+    /// first derivation is held (a slow KDF) until the check is cancelled, and none follows it.
+    @Test func cancellationStopsBetweenRecords() async throws {
+        let started = DispatchSemaphore(value: 0), proceed = DispatchSemaphore(value: 0)
+        let slow = CountingProvider { call in if call == 1 { started.signal(); proceed.wait() } }
+        let records = (0..<16).map { index in
+            APFSKeybagEntry(uuid: Data(repeating: UInt8(index), count: 16), tag: 3,
+                            data: blob(uuid: volumeUUID, wrapped: Data(count: 40), iterations: 1000, salt: Data(count: 16)))
+        }
+        let credential = VolumeCredential(kind: .password, secret: "pw")
+        let task = Task.detached { try APFSKeyUnwrapper(provider: slow).unwrapKEK(records: records, credential: credential) }
+        await withCheckedContinuation { continuation in DispatchQueue.global().async { started.wait(); continuation.resume() } }
+        task.cancel()
+        proceed.signal()
+        await #expect(throws: CancellationError.self) { _ = try await task.value }
+        #expect(slow.calls == 1)
+    }
+
+    /// `discardKeys()` releases the recorded volume key and erases the secret.
+    @Test func discardingKeysReleasesTheRecordedDecryptor() throws {
+        let credential = VolumeCredential(kind: .password, secret: "pw")
+        weak var released: APFSVolumeDecryptor?
+        do {
+            let decryptor = APFSVolumeDecryptor(xts: try xts(String(repeating: "01", count: 16), String(repeating: "02", count: 16)))
+            released = decryptor
+            credential.record(.success(decryptor))
+        }
+        #expect(released != nil && credential.decryptor != nil)
+        credential.discardKeys()
+        #expect(credential.decryptor == nil && credential.isZeroed)
+        #expect(released == nil)
+    }
+
     @Test func iterationCountAboveTheBoundIsNotTried() throws {
         let salt = Data(count: 16)
         let tooMany = APFSWrappedKey.maxIterations + 1
@@ -240,6 +340,9 @@ struct APFSKeyUnwrapTests {
         #expect(throws: UnlockError.unsupported) {
             try unwrapper.unwrapKEK(records: [entry], credential: VolumeCredential(kind: .password, secret: "pw"))
         }
+        // Above the per-record ceiling the blob itself is malformed.
+        #expect(APFSWrappedKey.maxIterations == 10_000_000)
+        #expect(throws: ScanError.self) { try APFSWrappedKey(der(0x30, der(0xa3, inner))) }
     }
 
     @Test func keybagObjectsParseAndHostileOnesFailClosed() throws {
@@ -327,7 +430,8 @@ private let diskutilAvailable = FileManager.default.isExecutableFile(atPath: "/u
 /// A disposable raw (UDIF) image holding one encrypted APFS volume, made without `sudo` in a
 /// private temp directory; only devices this image attached are ever touched, and it is detached
 /// in `destroy()`/`deinit`. A 64 MB container allows one volume, so the default one is deleted
-/// and the encrypted one added in its place.
+/// and the encrypted one added in its place. `layout` is hdiutil's partition layout: `GPTSPUD`
+/// puts the container in a GPT partition at a non-zero offset, `NONE` at offset 0.
 private final class EncryptedScratchImage {
     let directory: URL
     let imageURL: URL
@@ -336,20 +440,21 @@ private final class EncryptedScratchImage {
     private(set) var wholeDisk: String?
     private(set) var mountPoint: URL?
 
-    init(password: String) throws {
+    init(password: String, layout: String) throws {
         self.password = password
         volumeName = "SalvageFV" + String(UUID().uuidString.prefix(8))
         directory = FileManager.default.temporaryDirectory.appendingPathComponent("salvage-fv-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         imageURL = directory.appendingPathComponent("image.dmg")
         _ = try Self.run("/usr/bin/hdiutil", ["create", "-quiet", "-size", "64m", "-fs", "APFS", "-volname", "Plain",
-                                              "-layout", "NONE", "-type", "UDIF", imageURL.path])
+                                              "-layout", layout, "-type", "UDIF", imageURL.path])
         let output = try Self.run("/usr/bin/hdiutil", ["attach", "-nobrowse", "-nomount", imageURL.path])
         let disks = output.split(separator: "\n").compactMap { $0.split(separator: "\t").first.map { $0.trimmingCharacters(in: .whitespaces) } }
             .filter { $0.hasPrefix("/dev/disk") }
         wholeDisk = disks.first
-        // The synthesized container disk is the one whose first volume is "<container>s1".
-        guard let container = disks.first(where: { disk in disks.contains(disk + "s1") }) else {
+        // The synthesized container disk is the one whose first volume is "<container>s1"; with a
+        // partition map the image's own disk (with its partition "s1") comes first, so take the last.
+        guard let container = disks.last(where: { disk in disks.contains(disk + "s1") }) else {
             throw ScanError.io("No APFS container in: \(output)")
         }
         _ = try Self.run("/usr/sbin/diskutil", ["apfs", "deleteVolume", container + "s1"])
@@ -400,27 +505,41 @@ private actor EventLog {
     func add(_ event: ScanEvent) { events.append(event) }
 }
 
-private func scanSession(_ image: Data, credentials: [String: VolumeCredential]) async -> [ScanEvent] {
+private final class NoticeLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [ScanNotice] = []
+    func add(_ notice: ScanNotice) { lock.withLock { stored.append(notice) } }
+    var notices: [ScanNotice] { lock.withLock { stored } }
+}
+
+/// A full `ScanSession` (discovery, parsers, sweep): its events without progress, and its notices.
+private func scanSession(_ reader: any BlockReader, credentials: [String: VolumeCredential]) async -> (events: [ScanEvent], notices: [ScanNotice]) {
     let (stream, continuation) = AsyncStream<ScanEvent>.makeStream(bufferingPolicy: .bufferingOldest(64))
-    let task = Task { await ScanSession(reader: ImageReader(data: image)).run(events: continuation, credentials: credentials) }
+    let (noticeStream, notices) = AsyncStream<ScanNotice>.makeStream()
+    let task = Task { await ScanSession(reader: reader).run(events: continuation, notices: notices, credentials: credentials) }
+    let collected = Task { var all: [ScanNotice] = []; for await notice in noticeStream { all.append(notice) }; return all }
     var events: [ScanEvent] = []
     for await event in stream { if case .progress = event { continue }; events.append(event) }
     await task.value
-    return events
+    notices.finish()
+    return (events, await collected.value)
 }
 
-/// Drives `APFSContainer` alone over a whole-container image: no discovery, no sweep.
-private func containerEvents(_ reader: any BlockReader, credentials: [String: VolumeCredential]) async throws -> [ScanEvent] {
+/// Drives `APFSContainer` alone over the image's APFS partition: no discovery, no sweep.
+private func containerEvents(_ reader: any BlockReader, extent: VolumeExtent, credentials: [String: VolumeCredential],
+                             notice: @escaping @Sendable (ScanNotice) -> Void = { _ in }) async throws -> [ScanEvent] {
     let log = EventLog()
-    try await APFSContainer(reader: reader, extent: VolumeExtent(offset: 0, length: reader.sizeBytes, format: .apfs),
-                            device: nil, credentials: credentials, emit: { await log.add($0) }).scan()
+    try await APFSContainer(reader: reader, extent: extent, device: nil, credentials: credentials, notice: notice,
+                            emit: { await log.add($0) }).scan()
     return await log.events
 }
 
-/// Reads an image, letting `patch` rewrite any 4096-byte block on the way (to corrupt or alter
-/// metadata without editing the image).
+/// Reads an image, letting `patch` rewrite any 4096-byte container block on the way (to corrupt
+/// or alter metadata without editing the image). `base` is the container's device offset; the
+/// patch sees container-relative block numbers.
 private struct PatchingReader: BlockReader {
     let data: Data
+    var base: Int64 = 0
     let patch: @Sendable (_ block: Int64, _ bytes: inout Data) -> Void
     var sizeBytes: Int64 { Int64(data.count) }
     func read(at offset: Int64, count: Int) async throws -> Data {
@@ -429,9 +548,9 @@ private struct PatchingReader: BlockReader {
         while start + 4096 <= offset + Int64(count) {
             let range = Int(start - offset)..<Int(start - offset) + 4096
             // Only blocks that could be metadata are offered (an all-zero first word never is).
-            if result[range.lowerBound..<range.lowerBound + 8].contains(where: { $0 != 0 }) {
+            if start >= base, result[range.lowerBound..<range.lowerBound + 8].contains(where: { $0 != 0 }) {
                 var piece = result.subdata(in: range)
-                patch(start / 4096, &piece)
+                patch((start - base) / 4096, &piece)
                 result.replaceSubrange(range, with: piece)
             }
             start += 4096
@@ -440,14 +559,17 @@ private struct PatchingReader: BlockReader {
     }
 }
 
+private func isUnlockRequest(_ event: ScanEvent) -> Bool { if case .unlockRequired = event { true } else { false } }
+private func isMetadataFile(_ event: ScanEvent) -> Bool { if case .found(let file) = event { file.recoveryMethod == .metadata } else { false } }
+
 @Suite("A real FileVault volume", .enabled(if: diskutilAvailable), .serialized)
 struct FileVaultRealImageTests {
     struct Written { let path: String; let data: Data }
 
     /// Builds the image, writes files with known contents, deletes one, and detaches. Returns the
     /// raw image bytes plus what was written.
-    fileprivate func makeImage() throws -> (image: EncryptedScratchImage, data: Data, kept: [Written], deleted: [Written], uuid: String) {
-        let image = try EncryptedScratchImage(password: "fv-test-\(UUID().uuidString.prefix(6))")
+    fileprivate func makeImage(layout: String) throws -> (image: EncryptedScratchImage, data: Data, kept: [Written], deleted: [Written], uuid: String) {
+        let image = try EncryptedScratchImage(password: "fv-test-\(UUID().uuidString.prefix(6))", layout: layout)
         let root = try #require(image.mountPoint)
         try FileManager.default.createDirectory(at: root.appendingPathComponent("docs"), withIntermediateDirectories: true)
         var generator = SystemRandomNumberGenerator()
@@ -467,22 +589,30 @@ struct FileVaultRealImageTests {
         return (image, try Data(contentsOf: image.imageURL), kept, deleted, uuid)
     }
 
-    @Test func correctPasswordListsAndDecryptsFilesWrongPasswordAndCorruptKeybagFailClosed() async throws {
-        let (image, data, kept, deleted, uuid) = try makeImage()
+    /// `GPTSPUD` puts the container in a partition at a non-zero device offset, so a tweak or block
+    /// address taken device-relative instead of container-relative would fail; `NONE` keeps the
+    /// container at offset 0.
+    @Test(arguments: ["GPTSPUD", "NONE"])
+    func correctPasswordListsAndDecryptsFilesWrongPasswordAndCorruptKeybagFailClosed(layout: String) async throws {
+        let (image, data, kept, deleted, uuid) = try makeImage(layout: layout)
         defer { image.destroy() }
-        #expect(String(decoding: data[32..<36], as: UTF8.self) == "NXSB")
+        let apfs = try #require(try await VolumeDiscovery(reader: ImageReader(data: data)).discover().extents.first { $0.format == .apfs })
+        if layout == "NONE" { #expect(apfs.offset == 0) } else { #expect(apfs.offset > 0) }
+        #expect(apfs.offset % 4096 == 0)
+        let base = Int(apfs.offset)
+        #expect(String(decoding: data[base + 32..<base + 36], as: UTF8.self) == "NXSB")
 
         // No credential: exactly as before Story 2.5.
-        let locked = try await containerEvents(ImageReader(data: data), credentials: [:])
+        let locked = try await containerEvents(ImageReader(data: data), extent: apfs, credentials: [:])
         #expect(locked.contains { if case .unlockRequired(let device) = $0 { device.encryptedVolumeUUID?.uppercased() == uuid.uppercased() } else { false } })
-        #expect(!locked.contains { if case .found(let file) = $0 { file.recoveryMethod == .metadata } else { false } })
+        #expect(!locked.contains(where: isMetadataFile))
 
         // The correct password: every file listed, content byte-identical after decryption.
         let credential = VolumeCredential(kind: .password, secret: image.password)
         #expect(outcome(await EncryptedVolumeUnlock.verify(reader: ImageReader(data: data), volumeUUID: uuid, credential: credential)) == .some(nil))
-        let events = await scanSession(data, credentials: [uuid.lowercased(): credential])
+        let (events, _) = await scanSession(ImageReader(data: data), credentials: [uuid.lowercased(): credential])
         #expect(events.last == .completed, "\(String(describing: events.last))")
-        #expect(!events.contains { if case .unlockRequired = $0 { true } else { false } })
+        #expect(!events.contains(where: isUnlockRequest))
         let decryptor = try #require(credential.decryptor)
         credential.zero()
         let files = events.compactMap { if case .found(let file) = $0, file.recoveryMethod == .metadata { file } else { nil } }
@@ -495,8 +625,10 @@ struct FileVaultRealImageTests {
             let file = try #require(live.first { $0.path == expected.path })
             #expect(file.sizeBytes == Int64(expected.data.count))
             if expected.data.isEmpty { continue }
-            guard case .encryptedRuns(_, let keyID) = file.content else { Issue.record("\(file.path) isn't encrypted content"); continue }
+            guard case .encryptedRuns(let runs, let keyID) = file.content else { Issue.record("\(file.path) isn't encrypted content"); continue }
             #expect(keyID.uppercased() == uuid.uppercased())
+            // Runs are device-relative, inside the partition.
+            #expect(runs.allSatisfy { ($0.deviceOffset ?? apfs.offset) >= apfs.offset })
             #expect(try await reader.prefix(of: file, limit: file.sizeBytes) == expected.data, "\(expected.path)")
             // The raw bytes on disk really are ciphertext.
             #expect(data.range(of: expected.data.prefix(64)) == nil)
@@ -512,25 +644,25 @@ struct FileVaultRealImageTests {
         // A wrong password: wrongPassword, nothing parsed, the unlock request stays.
         let wrong = VolumeCredential(kind: .password, secret: "not-the-password")
         #expect(outcome(await EncryptedVolumeUnlock.verify(reader: ImageReader(data: data), volumeUUID: uuid, credential: wrong)) == .some(.wrongPassword))
-        let wrongEvents = try await containerEvents(ImageReader(data: data), credentials: [uuid: wrong])
+        let wrongEvents = try await containerEvents(ImageReader(data: data), extent: apfs, credentials: [uuid: wrong])
         #expect(wrong.failure == .wrongPassword && wrong.decryptor == nil)
-        #expect(wrongEvents.contains { if case .unlockRequired = $0 { true } else { false } })
-        #expect(!wrongEvents.contains { if case .found(let file) = $0 { file.recoveryMethod == .metadata } else { false } })
+        #expect(wrongEvents.contains(where: isUnlockRequest))
+        #expect(!wrongEvents.contains(where: isMetadataFile))
 
         // A corrupt container keybag: fail closed, `.unlockRequired` remains, no garbage files.
-        let keylocker = Int64(try data.number(APFS.keylockerOffset, 8))
+        let keylocker = Int64(try data.number(base + APFS.keylockerOffset, 8))
         #expect(keylocker > 0)
-        let corruptReader = PatchingReader(data: data) { block, bytes in if block == keylocker { bytes[100] ^= 0x5a } }
+        let corruptReader = PatchingReader(data: data, base: apfs.offset) { block, bytes in if block == keylocker { bytes[100] ^= 0x5a } }
         let corrupt = VolumeCredential(kind: .password, secret: image.password)
         #expect(outcome(await EncryptedVolumeUnlock.verify(reader: corruptReader, volumeUUID: uuid, credential: corrupt)) == .some(.toolFailure))
-        let corruptEvents = try await containerEvents(corruptReader, credentials: [uuid: corrupt])
-        #expect(corruptEvents.contains { if case .unlockRequired = $0 { true } else { false } })
+        let corruptEvents = try await containerEvents(corruptReader, extent: apfs, credentials: [uuid: corrupt])
+        #expect(corruptEvents.contains(where: isUnlockRequest))
         #expect(!corruptEvents.contains { if case .found = $0 { true } else { false } })
         #expect(corrupt.failure == .toolFailure)
 
         // A volume whose files don't all use the volume key (no ONEKEY: per-file keys, how
         // hardware-encrypted volumes are laid out) is unsupported, not a wrong password.
-        let perFileKeys = PatchingReader(data: data) { _, bytes in
+        let perFileKeys = PatchingReader(data: data, base: apfs.offset) { _, bytes in
             guard bytes.count == 4096, String(decoding: bytes[32..<36], as: UTF8.self) == "APSB" else { return }
             bytes[264] &= ~UInt8(APFS.fsOneKey)
             bytes.put(0, apfsFletcher64(bytes), 8)
@@ -538,10 +670,37 @@ struct FileVaultRealImageTests {
         let hardware = VolumeCredential(kind: .password, secret: image.password)
         #expect(outcome(await EncryptedVolumeUnlock.verify(reader: perFileKeys, volumeUUID: uuid, credential: hardware)) == .some(.unsupported))
 
+        // The right password but a damaged file tree (every encrypted node's ciphertext altered,
+        // so none decrypts to a verified node): `.damaged`, not "tied to another Mac", and the
+        // scan reports the volume skipped (`.volumeSkipped`) instead of asking for an unlock.
+        let probe = APFSContainer(reader: ImageReader(data: data), extent: apfs, device: nil,
+                                  credentials: [uuid: VolumeCredential(kind: .password, secret: image.password)], emit: { _ in })
+        try await probe.scan()
+        let encryptedNodes = Set(await probe.nodeCache.keys.filter(\.decrypted).map(\.address))
+        #expect(!encryptedNodes.isEmpty)
+        let damagedReader = PatchingReader(data: data, base: apfs.offset) { block, bytes in
+            if encryptedNodes.contains(block) { bytes[200] ^= 0x5a }
+        }
+        let damaged = VolumeCredential(kind: .password, secret: image.password)
+        #expect(outcome(await EncryptedVolumeUnlock.verify(reader: damagedReader, volumeUUID: uuid, credential: damaged)) == .some(.damaged))
+        let damagedNotices = NoticeLog()
+        let damagedScan = VolumeCredential(kind: .password, secret: image.password)
+        let damagedEvents = try await containerEvents(damagedReader, extent: apfs, credentials: [uuid: damagedScan], notice: { damagedNotices.add($0) })
+        #expect(damagedScan.failure == .damaged)
+        #expect(!damagedEvents.contains(where: isMetadataFile))
+        #expect(!damagedEvents.contains(where: isUnlockRequest))
+        let skipped = ScanNotice.volumeSkipped(formatName: "APFS", offset: apfs.offset, reason: APFSContainer.damagedUnlockedVolumeReason)
+        #expect(damagedNotices.notices == [skipped])
+        // Through a whole scan too (scanVolume hands APFS the session's notice channel).
+        let session = await scanSession(damagedReader, credentials: [uuid: VolumeCredential(kind: .password, secret: image.password)])
+        #expect(session.events.last == .completed)
+        #expect(session.notices.contains(skipped))
+        #expect(!session.events.contains(where: isUnlockRequest))
+
         // A credential whose key was recorded keeps working after its secret is zeroed (the flow
         // re-scans with every volume unlocked so far), and only with the right key.
         #expect(credential.isZeroed)
-        let again = try await containerEvents(ImageReader(data: data), credentials: [uuid: credential])
+        let again = try await containerEvents(ImageReader(data: data), extent: apfs, credentials: [uuid: credential])
         let againFiles = again.compactMap { if case .found(let file) = $0, file.recoveryMethod == .metadata, !file.isDeleted { file } else { nil } }
         #expect(Set(againFiles.map(\.path)).isSuperset(of: kept.map(\.path)))
     }

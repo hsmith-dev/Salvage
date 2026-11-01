@@ -290,8 +290,9 @@ struct APFSWrappedKey: Sendable {
     let iterations: UInt32?
     let salt: Data?
 
-    /// PBKDF2 work a hostile image may ask for; above this the record is unsupported, not tried.
-    static let maxIterations: UInt32 = 20_000_000
+    /// The most PBKDF2 iterations one record may ask for; above this the blob is malformed and
+    /// never tried. Real FileVault records use far fewer (100,000 on the spike's volume).
+    static let maxIterations: UInt32 = 10_000_000
 
     init(_ blob: Data) throws {
         guard let sequence = DERElement.first(0x30, in: try DERElement.elements(in: blob)),
@@ -306,7 +307,7 @@ struct APFSWrappedKey: Sendable {
         if let raw = DERElement.first(0x84, in: fields) {
             guard !raw.isEmpty, raw.count <= 5 else { throw ScanError.malformed("Key blob iteration count is invalid.") }
             let value = raw.reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
-            guard value > 0, value <= UInt64(UInt32.max) else { throw ScanError.malformed("Key blob iteration count is invalid.") }
+            guard value > 0, value <= UInt64(Self.maxIterations) else { throw ScanError.malformed("Key blob iteration count is invalid.") }
             iterations = UInt32(value)
         } else {
             iterations = nil
@@ -369,46 +370,44 @@ enum APFSKeybag {
 
 /// Derives a volume's key from a credential. Each step's failure has one meaning: no unlock record
 /// accepts the credential -> `wrongPassword`; no software-wrapped key at all, or a password-unwrapped
-/// KEK that doesn't unwrap the VEK -> `unsupported` (hardware-bound or unknown); anything unreadable
-/// -> `toolFailure`. Derived buffers are erased as soon as they're no longer needed.
+/// KEK that doesn't unwrap the VEK -> `unsupported` (hardware-bound or unknown); anything unreadable,
+/// or a keybag that asks for more PBKDF2 work than one attempt may spend -> `toolFailure`. Derived
+/// buffers are erased as soon as they're no longer needed.
 struct APFSKeyUnwrapper {
     let provider: any APFSCryptoProvider
     static let maxRecordsTried = 16
+    /// PBKDF2 iterations one attempt may spend across all records, on top of its costliest record:
+    /// a hostile keybag of many expensive records is refused instead of tried one by one.
+    static let iterationBudget: UInt64 = 10_000_000
 
-    /// The KEK from the first unlock record that `credential` opens.
+    /// The KEK from the first unlock record that `credential` opens. Checks for cancellation before
+    /// each record, so a cancelled check stops between key derivations.
     func unwrapKEK(records: [APFSKeybagEntry], credential: VolumeCredential) throws -> SecretBytes {
         guard !records.isEmpty else { throw UnlockError.unsupported }
         // A recovery key goes to its own record first; every record is tried either way.
         let ordered = records.filter { $0.uuid == APFSKeybag.personalRecoveryKeyUUID } + records.filter { $0.uuid != APFSKeybag.personalRecoveryKeyUUID }
         let candidates = credential.kind == .recoveryKey ? ordered : records
-        var tried = 0, parsed = 0
-        for record in candidates.prefix(Self.maxRecordsTried) {
+        let usable: [(salt: Data, iterations: UInt32, wrapped: Data)] = candidates.prefix(Self.maxRecordsTried).compactMap { record in
             guard let key = try? APFSWrappedKey(record.data), let salt = key.salt, let iterations = key.iterations,
-                  !salt.isEmpty, salt.count <= 64, iterations <= APFSWrappedKey.maxIterations, key.wrapped.count == 40 else { continue }
-            parsed += 1
-            for variant in try secretVariants(credential) {
-                defer { variant.zero() }
-                tried += 1
-                let derived = try variant.withBytes { try provider.pbkdf2SHA256(password: $0, salt: salt, iterations: iterations, keyLength: 32) }
-                defer { derived.zero() }
-                if let kek = try provider.aesKeyUnwrap(kek: derived, wrapped: key.wrapped) { return kek }
-            }
+                  !salt.isEmpty, salt.count <= 64, key.wrapped.count == 40 else { return nil }
+            return (salt, iterations, key.wrapped)
         }
         // No record in a form Salvage can try means the key isn't protected by a usable password.
-        guard parsed > 0, tried > 0 else { throw UnlockError.unsupported }
-        throw UnlockError.wrongPassword
-    }
-
-    /// The secret as typed, and for a recovery key also its ASCII-uppercased form (recovery keys
-    /// are shown in capitals). Each variant is erasable.
-    func secretVariants(_ credential: VolumeCredential) throws -> [SecretBytes] {
-        try credential.withSecret { bytes in
-            var variants = [SecretBytes(copying: bytes)]
-            if credential.kind == .recoveryKey, bytes.contains(where: { $0 >= 0x61 && $0 <= 0x7a }) {
-                variants.append(SecretBytes(copying: bytes.lazy.map { $0 >= 0x61 && $0 <= 0x7a ? $0 - 0x20 : $0 }))
-            }
-            return variants
+        guard let costliest = usable.map(\.iterations).max() else { throw UnlockError.unsupported }
+        let budget = Self.iterationBudget + UInt64(costliest)
+        // One erasable copy, so the credential's lock isn't held through key derivation.
+        let secret = try credential.withSecret { SecretBytes(copying: $0) }
+        defer { secret.zero() }
+        var spent: UInt64 = 0
+        for record in usable {
+            try Task.checkCancellation()
+            spent += UInt64(record.iterations)
+            guard spent <= budget else { throw UnlockError.toolFailure }
+            let derived = try secret.withBytes { try provider.pbkdf2SHA256(password: $0, salt: record.salt, iterations: record.iterations, keyLength: 32) }
+            defer { derived.zero() }
+            if let kek = try provider.aesKeyUnwrap(kek: derived, wrapped: record.wrapped) { return kek }
         }
+        throw UnlockError.wrongPassword
     }
 
     /// The volume's XTS key from its wrapped VEK and the unwrapped KEK.

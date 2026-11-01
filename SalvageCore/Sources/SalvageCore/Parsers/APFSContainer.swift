@@ -31,6 +31,8 @@ actor APFSContainer {
     /// The scanned device, annotated and emitted with `.unlockRequired` for an encrypted volume.
     let device: BlockDevice?
     let emit: @Sendable (ScanEvent) async throws -> Void
+    /// Where an unlocked volume whose file tree is damaged is reported as skipped (`.volumeSkipped`).
+    let notice: @Sendable (ScanNotice) -> Void
     /// Passwords or recovery keys by volume UUID (uppercased).
     let credentials: [String: VolumeCredential]
     let crypto: any APFSCryptoProvider
@@ -76,8 +78,9 @@ actor APFSContainer {
 
     init(reader: any BlockReader, extent: VolumeExtent, device: BlockDevice?,
          credentials: [String: VolumeCredential] = [:], crypto: any APFSCryptoProvider = CommonCryptoProvider(),
+         notice: @escaping @Sendable (ScanNotice) -> Void = { _ in },
          emit: @escaping @Sendable (ScanEvent) async throws -> Void) {
-        self.reader = reader; self.extent = extent; self.device = device; self.emit = emit
+        self.reader = reader; self.extent = extent; self.device = device; self.emit = emit; self.notice = notice
         self.credentials = Dictionary(credentials.map { ($0.key.uppercased(), $0.value) }, uniquingKeysWith: { first, _ in first })
         self.crypto = crypto
     }
@@ -172,7 +175,15 @@ actor APFSContainer {
             let context: APFSVolumeContext
             if volume.isEncrypted {
                 guard let unlocked = try await unlockedContext(volume, superblock: superblock) else {
-                    try await emit(.unlockRequired(unlockDevice(volume))); continue
+                    // Unlocked but its file tree is damaged: skipped with a notice, since asking for
+                    // the password again can't help. Any other failure still asks for an unlock.
+                    if credentials[volume.uuid.uuidString.uppercased()]?.failure == .damaged {
+                        notice(.volumeSkipped(formatName: extent.formatName ?? extent.format.displayName,
+                                              offset: extent.offset, reason: Self.damagedUnlockedVolumeReason))
+                    } else {
+                        try await emit(.unlockRequired(unlockDevice(volume)))
+                    }
+                    continue
                 }
                 context = unlocked
             } else {
@@ -230,16 +241,20 @@ actor APFSContainer {
             }
         }
         activeCipher = cipher; activeKeyID = volume.uuid.uuidString
-        // A key that unwraps but doesn't decrypt the root tree to a verified node isn't this
-        // volume's software key (e.g. hardware-bound): fail closed, never parse the guess.
+        // The VEK passed RFC 3394's integrity check under a KEK the credential opened, so it is the
+        // volume's key: a root tree that then fails its checksum or structure check is damage, not
+        // a hardware-bound key (those fail earlier, as `.unsupported`). Fail closed either way.
         guard let context = try await attempt({ try await self.volumeContext(volume, xid: superblock.header.xid) }) else {
             activeCipher = nil; activeKeyID = nil
-            credential.record(.failure(.unsupported))
+            credential.record(.failure(.damaged))
             return nil
         }
         credential.record(.success(cipher))
         return context
     }
+
+    /// The `.volumeSkipped` reason for an unlocked volume whose file tree is damaged.
+    static let damagedUnlockedVolumeReason = "Salvage unlocked this volume but its file list is damaged, so its files can't be listed."
 
     /// Unwraps the volume's key with `credential` (see `APFSKeyUnwrapper` for what each failure means).
     func unlock(_ volume: APFSVolumeSuperblock, superblock: APFSContainerSuperblock,

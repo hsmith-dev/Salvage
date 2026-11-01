@@ -33,6 +33,8 @@ public enum UnlockError: Error, Sendable, Equatable {
     /// The volume's key isn't protected by a password Salvage can use: hardware encryption tied to
     /// the Mac it came from (T2 / Apple silicon internal storage), or a layout Salvage doesn't read.
     case unsupported
+    /// The credential unwrapped the volume key, but the volume's file tree failed its checksum or structure check.
+    case damaged
 }
 
 public struct LostPartitionCandidate: Identifiable, Sendable, Equatable {

@@ -19,15 +19,50 @@ public final class VolumeCredential: @unchecked Sendable, CustomStringConvertibl
     /// Copies `secret`'s UTF-8 bytes into erasable storage. With `trimmingWhitespace`, leading and
     /// trailing ASCII whitespace is dropped on the bytes, so no trimmed `String` copy is made (a
     /// recovery key is read out and typed; a password may legitimately start or end with a space).
+    ///
+    /// A recovery key is also normalized on the bytes: without its whitespace and hyphens and in
+    /// capitals, a 24-character key of letters and digits is stored in Apple's personal recovery
+    /// key form, six groups of four joined by hyphens (`ABCD-EFGH-…`), however it was typed. Any
+    /// other recovery-key text is kept as typed (after the trim).
     public init(kind: Kind, secret: String, trimmingWhitespace: Bool = false) {
         self.kind = kind
         var utf8 = secret.utf8[...]
         if trimmingWhitespace {
-            let isSpace: (UInt8) -> Bool = { $0 == 0x20 || $0 == 0x09 || $0 == 0x0a || $0 == 0x0d }
-            while let first = utf8.first, isSpace(first) { utf8 = utf8.dropFirst() }
-            while let last = utf8.last, isSpace(last) { utf8 = utf8.dropLast() }
+            while let first = utf8.first, Self.isSpace(first) { utf8 = utf8.dropFirst() }
+            while let last = utf8.last, Self.isSpace(last) { utf8 = utf8.dropLast() }
         }
-        self.secret = SecretBytes(copying: utf8)
+        if kind == .recoveryKey, let canonical = Self.canonicalRecoveryKey(utf8) {
+            self.secret = canonical
+        } else {
+            self.secret = SecretBytes(copying: utf8)
+        }
+    }
+
+    static let recoveryKeyCharacters = 24, recoveryKeyGroup = 4
+
+    private static func isSpace(_ byte: UInt8) -> Bool { byte == 0x20 || (0x09...0x0d).contains(byte) }
+    private static func isSeparator(_ byte: UInt8) -> Bool { isSpace(byte) || byte == 0x2d }
+    private static func uppercased(_ byte: UInt8) -> UInt8 { (0x61...0x7a).contains(byte) ? byte - 0x20 : byte }
+    private static func isKeyCharacter(_ byte: UInt8) -> Bool { (0x30...0x39).contains(byte) || (0x41...0x5a).contains(uppercased(byte)) }
+
+    /// The typed key in the personal recovery key form, written straight into erasable bytes (no
+    /// intermediate copy); nil when it isn't 24 letters and digits once separators are dropped.
+    private static func canonicalRecoveryKey(_ typed: Substring.UTF8View) -> SecretBytes? {
+        var characters = 0
+        for byte in typed where !isSeparator(byte) {
+            guard isKeyCharacter(byte), characters < recoveryKeyCharacters else { return nil }
+            characters += 1
+        }
+        guard characters == recoveryKeyCharacters else { return nil }
+        let canonical = SecretBytes(count: recoveryKeyCharacters + recoveryKeyCharacters / recoveryKeyGroup - 1)
+        canonical.withMutableBytes { out in
+            var index = 0, written = 0
+            for byte in typed where !isSeparator(byte) {
+                if written > 0, written % recoveryKeyGroup == 0 { out[index] = 0x2d; index += 1 }
+                out[index] = uppercased(byte); index += 1; written += 1
+            }
+        }
+        return canonical
     }
 
     /// The secret's length in bytes (0 once zeroed).
@@ -35,8 +70,15 @@ public final class VolumeCredential: @unchecked Sendable, CustomStringConvertibl
     public var isZeroed: Bool { lock.withLock { secret.isZeroed } }
 
     /// Erases the secret. Idempotent. A recorded decryptor is kept (it holds the volume key, not
-    /// the secret) until the caller drops it.
+    /// the secret) until `discardKeys()`.
     public func zero() { lock.withLock { secret.zero() } }
+
+    /// Erases the secret and drops the recorded volume key. The decryptor holds no raw key bytes
+    /// (only CommonCrypto key schedules, cleared when it is released), so it is gone once its last
+    /// holder (e.g. a closed `SourceSession`) lets go. Idempotent.
+    public func discardKeys() {
+        lock.withLock { secret.zero(); recordedDecryptor = nil }
+    }
 
     deinit { secret.zero() }
 

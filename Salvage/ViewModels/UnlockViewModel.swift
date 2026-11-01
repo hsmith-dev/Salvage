@@ -60,6 +60,8 @@ final class UnlockViewModel {
         static let toolFailure = "Couldn't unlock this volume — try again or use your recovery key."
         /// Hardware-bound encryption (the internal storage of a Mac with a T2 or Apple silicon chip).
         static let unsupported = "This volume's encryption is tied to the Mac it came from, so Salvage can't unlock it on this Mac. The rest of the drive can still be scanned."
+        /// The credential was right, but the volume's file list failed its checks.
+        static let damaged = "Salvage unlocked this volume but its file list is damaged, so its files can't be listed. The rest of the drive can still be scanned."
         /// Shown instead of the sheet while `FileVaultUnlockFeature.canReadUnlockedVolumes` is off.
         static let encryptedNotSupported = "This drive has a FileVault-encrypted volume. Salvage can't recover files from encrypted volumes yet; its unencrypted volumes are scanned as usual."
     }
@@ -73,6 +75,8 @@ final class UnlockViewModel {
     private(set) var request: Request?
     private(set) var phase: Phase = .entering
     var credentialKind: VolumeCredential.Kind = .password
+    /// The kind of credential whose check failed (the toggle may have moved since).
+    private(set) var failedKind: VolumeCredential.Kind = .password
     /// Bound to the secure field. Moved into erasable bytes and cleared by `submit()`.
     var secret = ""
     /// Volumes already offered (or explained) in the current flow.
@@ -164,11 +168,20 @@ final class UnlockViewModel {
         phase = .entering; secret = ""; credentialKind = .password
     }
 
-    /// Drops the keys of a finished flow. A scan already started with them keeps its own copies
-    /// for its session; the model forgets them.
+    /// Drops the keys of a finished flow: every secret is erased and every recorded volume key
+    /// discarded. A scan's session holds its own decryptors and drops them when it closes.
     private func endFlowKeys() {
-        for credential in unlockedCredentials.values { credential.zero() }
+        for credential in unlockedCredentials.values { credential.discardKeys() }
         unlockedCredentials = [:]; pendingRescan = nil
+    }
+
+    /// Window teardown: cancels a check in flight, closes the sheet without starting anything, and
+    /// drops the flow's keys.
+    func tearDown() {
+        pending?.cancel()
+        liveAttempt = nil; request = nil; queue = []
+        phase = .entering; secret = ""
+        endFlowKeys()
     }
 
     var isUnlocking: Bool { phase == .unlocking }
@@ -183,9 +196,10 @@ final class UnlockViewModel {
     var failureMessage: String? {
         guard case .failed(let error) = phase else { return nil }
         switch error {
-        case .wrongPassword: return credentialKind == .recoveryKey ? Copy.wrongRecoveryKey : Copy.wrongPassword
+        case .wrongPassword: return failedKind == .recoveryKey ? Copy.wrongRecoveryKey : Copy.wrongPassword
         case .toolFailure: return Copy.toolFailure
         case .unsupported: return Copy.unsupported
+        case .damaged: return Copy.damaged
         }
     }
 
@@ -227,6 +241,7 @@ final class UnlockViewModel {
             phase = .entering
             presentNextIfIdle()
         case .failure(let error):
+            failedKind = credential.kind
             phase = .failed(error)
         }
     }
@@ -237,13 +252,15 @@ final class UnlockViewModel {
         while let task = pending { await task.value }
     }
 
-    /// Cancel: closes the sheet. An attempt still running finishes and is dropped. The next
+    /// Cancel: closes the sheet and cancels an attempt still running (the Core check stops between
+    /// key derivations), whose result is dropped. The next
     /// queued volume from the scan, if any, is offered; once none is left, volumes unlocked in this
     /// flow are re-scanned. Returns the device whose scan was waiting on this sheet (pre-scan
     /// path); the caller starts it after `waitForPendingUnlock()`.
     @discardableResult
     func resolve() -> BlockDevice? {
         guard let request else { return nil }
+        pending?.cancel()
         liveAttempt = nil
         self.request = nil
         phase = .entering; secret = ""
