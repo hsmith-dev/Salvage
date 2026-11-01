@@ -189,3 +189,21 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             build-for-testing
+
+  # spec-tech-batch-6 §A: parser fuzz smoke test, in its own job so its release build runs in
+  # parallel with the main checks. 500 mutated images per format with a fixed seed, each a full
+  # ScanSession in a child process, so a trap or hang fails this job with its seed.
+  fuzz-smoke:
+    name: Parser fuzz smoke test
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode version
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.6'
+
+      - name: Parser fuzz smoke test (500 iterations per format, fixed seed)
+        run: ./scripts/fuzz-parsers.sh --smoke
