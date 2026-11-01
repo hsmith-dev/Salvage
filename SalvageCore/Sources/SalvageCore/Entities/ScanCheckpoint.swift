@@ -39,6 +39,18 @@ public struct ScanCheckpoint: Codable, Sendable, Equatable {
         self.carveBackfillOffset = carveBackfillOffset
     }
 
+    /// How far the sweep has read and carved, as a position in the concatenated `extents`: every
+    /// byte of earlier extents plus `sweepOffset` of the current one. `bytesScanned` can run up to
+    /// a chunk past it (the sweep reads one chunk ahead of the carver) and also counts metadata
+    /// read beyond it, so this is the figure to show as "how far the scan got".
+    public var sweptBytes: Int64 {
+        var total: Int64 = 0
+        for extent in extents.prefix(max(0, min(sweepVolumeIndex, extents.count))) {
+            total = total.addingReportingOverflow(extent.length).partialValue
+        }
+        return min(max(0, total.addingReportingOverflow(sweepOffset).partialValue), totalBytes)
+    }
+
     /// Structural sanity that does not depend on the device being scanned.
     public var isWellFormed: Bool {
         version == Self.currentVersion && deviceSizeBytes > 0 && totalBytes > 0

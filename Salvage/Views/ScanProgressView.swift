@@ -108,7 +108,7 @@ struct ScanProgressView: View {
     }
     @ViewBuilder private var resumeOffer: some View {
         if let checkpoint = model.pendingCheckpoint {
-            Text("A previous scan of this device stopped before it finished, at \(percent(checkpoint.bytesScanned, of: checkpoint.totalBytes))% of supported volume bytes. Resume to continue from there, or start over.")
+            Text("A previous scan of this device stopped before it finished, at \(percent(checkpoint.sweptBytes, of: checkpoint.totalBytes))% of supported volume bytes. Resume to continue from there, or start over.")
             HStack {
                 Button("Resume scan") { model.resumeInterruptedScan() }
                     .keyboardShortcut(.defaultAction)
