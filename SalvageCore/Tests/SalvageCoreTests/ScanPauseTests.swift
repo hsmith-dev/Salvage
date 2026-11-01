@@ -92,12 +92,15 @@ struct ScanPauseTests {
         #expect(resumed.contains(.progress(bytesScanned: Int64(image.count), totalBytes: Int64(image.count))))
         #expect(paths(resumed) == paths(fullEvents))
         #expect(paths(resumed) == ["/HELLO.TXT", "/FOLDER/NESTED.TXT"])
-        let sweep = reader.reads.filter { $0.count == 1024 * 1024 }.map(\.offset)
+        // The sweep starts at the checkpoint; the carve backfill then re-reads the bytes before it.
+        let (sweep, backfill) = sweepAndBackfill(reader.reads.filter { $0.count == 1024 * 1024 }.map(\.offset))
         #expect(sweep.first == checkpoint.sweepOffset)
         #expect(sweep.allSatisfy { $0 >= checkpoint.sweepOffset })
+        #expect(backfill.first == 0 && backfill.contains(checkpoint.sweepOffset - 1024 * 1024))
+        #expect(progressNeverMovesBackOrPastTotal(resumed, total: Int64(image.count)))
     }
 
-    @Test func resumingFromFinalExFATCheckpointSkipsTheSweep() async throws {
+    @Test func resumingFromFinalExFATCheckpointSkipsTheSweepButCarvesAgain() async throws {
         let image = exfatImage()
         let (fullEvents, checkpoints) = await scanCollectingCheckpoints(image)
         let checkpoint = try #require(checkpoints.last)
@@ -108,7 +111,9 @@ struct ScanPauseTests {
         for await event in stream { resumed.append(event) }
         #expect(resumed.last == .completed)
         #expect(paths(resumed) == paths(fullEvents))
-        #expect(!reader.reads.contains { $0.count == image.count })
+        #expect(resumed.first == .progress(bytesScanned: Int64(image.count), totalBytes: Int64(image.count)))
+        // No sweep; the one whole-volume read is the carve-only backfill.
+        #expect(reader.reads.filter { $0.count == image.count }.count == 1)
     }
 
     @Test(arguments: [
@@ -120,6 +125,11 @@ struct ScanPauseTests {
         ScanCheckpoint(deviceSizeBytes: 66560 * 512, totalBytes: 66560 * 512, extents: fatExtents, sweepVolumeIndex: 0, sweepOffset: 1 << 40, bytesScanned: 0),
         // Same device size, total and volume count, but the single volume sits elsewhere.
         ScanCheckpoint(deviceSizeBytes: 66560 * 512, totalBytes: 66560 * 512, extents: [.init(offset: 512, length: 66560 * 512)], sweepVolumeIndex: 0, sweepOffset: 4 << 20, bytesScanned: 4 << 20),
+        // Version 2 predates the carve backfill.
+        ScanCheckpoint(version: 2, deviceSizeBytes: 66560 * 512, totalBytes: 66560 * 512, extents: fatExtents, sweepVolumeIndex: 0, sweepOffset: 4 << 20, bytesScanned: 4 << 20),
+        // A backfill checkpoint whose sweep had not finished, or whose backfill runs past the total.
+        ScanCheckpoint(deviceSizeBytes: 66560 * 512, totalBytes: 66560 * 512, extents: fatExtents, sweepVolumeIndex: 0, sweepOffset: 4 << 20, bytesScanned: 4 << 20, carveBackfillOffset: 0),
+        ScanCheckpoint(deviceSizeBytes: 66560 * 512, totalBytes: 66560 * 512, extents: fatExtents, sweepVolumeIndex: 0, sweepOffset: 66560 * 512, bytesScanned: 66560 * 512, carveBackfillOffset: 66561 * 512),
     ])
     func mismatchedCheckpointIsIgnoredAndScanStartsFromZero(_ checkpoint: ScanCheckpoint) async {
         let reader = RecordingReader(data: fatImage())
@@ -136,6 +146,9 @@ struct ScanPauseTests {
         let json = try JSONEncoder().encode(ScanCheckpoint(deviceSizeBytes: 10, totalBytes: 10, extents: [.init(offset: 0, length: 10)], sweepVolumeIndex: 0, sweepOffset: 5, bytesScanned: 5))
         let keys = try #require(JSONSerialization.jsonObject(with: json) as? [String: Any]).keys.sorted()
         #expect(keys == ["bytesScanned", "deviceSizeBytes", "extents", "sweepOffset", "sweepVolumeIndex", "totalBytes", "version"])
+        let backfill = ScanCheckpoint(deviceSizeBytes: 10, totalBytes: 10, extents: [.init(offset: 0, length: 10)], sweepVolumeIndex: 0, sweepOffset: 10, bytesScanned: 10, carveBackfillOffset: 4)
+        let decoded = try JSONDecoder().decode(ScanCheckpoint.self, from: JSONEncoder().encode(backfill))
+        #expect(decoded == backfill && decoded.carveBackfillOffset == 4)
     }
 
     @Test func checkpointFingerprintsTheDiscoveredLayout() async {
@@ -189,11 +202,146 @@ struct ScanPauseTests {
         #expect(!resumed.contains { if case .progress(let bytes, let all) = $0 { bytes > all || all != total } else { false } })
         #expect(Set(paths(resumed)) == Set(paths(fullEvents)))
         #expect(paths(resumed).count == 3)
-        // No sweep of volume 0, and volume 1's sweep restarts exactly at the checkpoint.
-        #expect(!reader.reads.contains { $0.offset == 512 && $0.count == Int(first) })
-        let sweep = reader.reads.filter { $0.count == 1024 * 1024 }.map(\.offset)
+        // Volume 1's sweep restarts exactly at the checkpoint; only afterwards does the carve
+        // backfill read volume 0 (once) and volume 1 up to the checkpoint.
+        let volumeZero = reader.reads.firstIndex { $0.offset == 512 && $0.count == Int(first) }
+        let firstSweep = reader.reads.firstIndex { $0.offset == 129 * 512 + checkpoint.sweepOffset && $0.count == 1024 * 1024 }
+        #expect(reader.reads.filter { $0.offset == 512 && $0.count == Int(first) }.count == 1)
+        #expect(try #require(volumeZero) > (try #require(firstSweep)))
+        let (sweep, backfill) = sweepAndBackfill(reader.reads.filter { $0.count == 1024 * 1024 }.map(\.offset))
         #expect(sweep.first == 129 * 512 + checkpoint.sweepOffset)
         #expect(sweep.allSatisfy { $0 >= 129 * 512 + checkpoint.sweepOffset })
+        #expect(backfill.first == Int64(129 * 512))
+    }
+
+    // MARK: Carve backfill on resume
+
+    @Test func fileWhoseHeaderLiesBeforeTheCheckpointIsCarvedOnResume() async throws {
+        var image = fatImage()
+        let png = pngBytes(body: 3000)
+        image.replaceSubrange(600 * 512..<600 * 512 + png.count, with: png)
+        let (fullEvents, checkpoints) = await scanCollectingCheckpoints(image)
+        let checkpoint = try #require(checkpoints.first { $0.sweepOffset >= 4 << 20 })
+        let reader = RecordingReader(data: image)
+        let (stream, events) = AsyncStream<ScanEvent>.makeStream()
+        await ScanSession(reader: reader).run(events: events, resumingFrom: checkpoint)
+        var resumed: [ScanEvent] = []
+        for await event in stream { resumed.append(event) }
+        #expect(resumed.last == .completed)
+        let carved = carvedFiles(resumed)
+        #expect(carved.map(\.sizeBytes) == [Int64(png.count)])
+        #expect(carved.first?.isPartial == false)
+        #expect(carved.map(\.name) == carvedFiles(fullEvents).map(\.name))
+        // Progress totals are unchanged: the first event counts the checkpoint, the last reaches
+        // the total, and the backfill's re-reads never move it.
+        #expect(resumed.first == .progress(bytesScanned: checkpoint.sweepOffset, totalBytes: Int64(image.count)))
+        #expect(lastProgress(resumed) == .progress(bytesScanned: Int64(image.count), totalBytes: Int64(image.count)))
+        #expect(progressNeverMovesBackOrPastTotal(resumed, total: Int64(image.count)))
+    }
+
+    @Test func fileStraddlingTheResumePointIsCarvedWholeAndOnce() async throws {
+        var image = fatImage()
+        let png = pngBytes(body: 6000)
+        let at = 4 * 1024 * 1024 - 2 * 512
+        image.replaceSubrange(at..<at + png.count, with: png)
+        let (fullEvents, checkpoints) = await scanCollectingCheckpoints(image)
+        #expect(carvedFiles(fullEvents).map(\.isPartial) == [false])
+        let checkpoint = try #require(checkpoints.first { $0.sweepOffset == 4 << 20 })
+        let (stream, events) = AsyncStream<ScanEvent>.makeStream()
+        await ScanSession(reader: ImageReader(data: image)).run(events: events, resumingFrom: checkpoint)
+        var resumed: [ScanEvent] = []
+        for await event in stream { resumed.append(event) }
+        #expect(resumed.last == .completed)
+        let carved = carvedFiles(resumed)
+        #expect(carved.count == 1)
+        #expect(carved.first?.sizeBytes == Int64(png.count) && carved.first?.isPartial == false)
+    }
+
+    @Test func fileAfterTheResumePointIsNotReportedTwice() async throws {
+        var image = fatImage()
+        let png = pngBytes(body: 3000)
+        let at = 4 * 1024 * 1024 + 8 * 512
+        image.replaceSubrange(at..<at + png.count, with: png)
+        let (_, checkpoints) = await scanCollectingCheckpoints(image)
+        let checkpoint = try #require(checkpoints.first { $0.sweepOffset == 4 << 20 })
+        let (stream, events) = AsyncStream<ScanEvent>.makeStream()
+        await ScanSession(reader: ImageReader(data: image)).run(events: events, resumingFrom: checkpoint)
+        var resumed: [ScanEvent] = []
+        for await event in stream { resumed.append(event) }
+        #expect(carvedFiles(resumed).map(\.sizeBytes) == [Int64(png.count)])
+    }
+
+    @Test func pauseDuringTheBackfillIssuesNoReadsAndResumeCompletes() async throws {
+        var image = fatImage()
+        let png = pngBytes(body: 3000)
+        image.replaceSubrange(600 * 512..<600 * 512 + png.count, with: png)
+        let (_, checkpoints) = await scanCollectingCheckpoints(image)
+        let checkpoint = try #require(checkpoints.first { $0.sweepOffset >= 4 << 20 })
+        let gate = ScanPauseGate()
+        // In a resumed scan the only full-chunk read at offset 0 is the backfill's first.
+        let reader = RecordingReader(data: image) { reads in
+            if let last = reads.last, last.offset == 0, last.count == 1024 * 1024 { gate.pause() }
+        }
+        let (stream, events) = AsyncStream<ScanEvent>.makeStream()
+        let task = Task { await ScanSession(reader: reader).run(events: events, pauseGate: gate, resumingFrom: checkpoint) }
+        try await waitUntil { gate.waiterCount == 1 }
+        let readsWhilePaused = reader.reads.count
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(reader.reads.count == readsWhilePaused)
+        gate.resume()
+        await task.value
+        var collected: [ScanEvent] = []
+        for await event in stream { collected.append(event) }
+        #expect(collected.last == .completed)
+        #expect(carvedFiles(collected).map(\.sizeBytes) == [Int64(png.count)])
+    }
+
+    @Test func cancelledBackfillSaysCarvingWasPartialAndItsCheckpointResumes() async throws {
+        var image = fatImage()
+        let png = pngBytes(body: 3000)
+        image.replaceSubrange(2 * 1024 * 1024..<2 * 1024 * 1024 + png.count, with: png)
+        let (_, checkpoints) = await scanCollectingCheckpoints(image)
+        let checkpoint = try #require(checkpoints.first { $0.sweepOffset >= 4 << 20 })
+        let gate = ScanPauseGate()
+        let reader = RecordingReader(data: image) { reads in
+            if let last = reads.last, last.offset == 0, last.count == 1024 * 1024 { gate.pause() }
+        }
+        let (stream, events) = AsyncStream<ScanEvent>.makeStream()
+        let (noticeStream, notices) = AsyncStream<ScanNotice>.makeStream()
+        let (pointStream, points) = AsyncStream<ScanCheckpoint>.makeStream()
+        let task = Task {
+            await ScanSession(reader: reader).run(events: events, pauseGate: gate, checkpoints: points,
+                                                  notices: notices, resumingFrom: checkpoint)
+        }
+        try await waitUntil { gate.waiterCount == 1 }
+        task.cancel()
+        await task.value
+        var collected: [ScanEvent] = [], said: [ScanNotice] = [], taken: [ScanCheckpoint] = []
+        for await event in stream { collected.append(event) }
+        for await notice in noticeStream { said.append(notice) }
+        for await point in pointStream { taken.append(point) }
+        #expect(!collected.contains(.completed))
+        #expect(carvedFiles(collected).isEmpty)
+        #expect(said == [.resumedCarvingPartial])
+        // The interrupted backfill left a checkpoint: sweep finished, carving 1 MiB in.
+        let interrupted = try #require(taken.last)
+        #expect(interrupted.carveBackfillOffset == 1024 * 1024 && interrupted.isWellFormed)
+        #expect(interrupted.sweepVolumeIndex == 0 && interrupted.sweepOffset == Int64(image.count))
+        #expect(interrupted.bytesScanned == Int64(image.count))
+
+        // Resuming it skips the sweep and carves again; carved files don't survive a cold start.
+        let again = RecordingReader(data: image)
+        let (stream2, events2) = AsyncStream<ScanEvent>.makeStream()
+        let (noticeStream2, notices2) = AsyncStream<ScanNotice>.makeStream()
+        await ScanSession(reader: again).run(events: events2, notices: notices2, resumingFrom: interrupted)
+        var resumed: [ScanEvent] = [], said2: [ScanNotice] = []
+        for await event in stream2 { resumed.append(event) }
+        for await notice in noticeStream2 { said2.append(notice) }
+        #expect(resumed.last == .completed)
+        #expect(said2.isEmpty)
+        #expect(resumed.first == .progress(bytesScanned: Int64(image.count), totalBytes: Int64(image.count)))
+        #expect(carvedFiles(resumed).map(\.sizeBytes) == [Int64(png.count)])
+        #expect(paths(resumed).contains("/HELLO.TXT"))
     }
 
     @Test func deviceRemovedWhilePausedFailsOnResumeAndKeepsDiscoveries() async throws {
@@ -232,6 +380,30 @@ private final class Flag: @unchecked Sendable {
     private var value = false
     var isSet: Bool { lock.withLock { value } }
     func set() { lock.withLock { value = true } }
+}
+
+private func carvedFiles(_ events: [ScanEvent]) -> [RecoveredFile] {
+    events.compactMap { if case .found(let file) = $0, file.recoveryMethod == .carved { file } else { nil } }
+}
+
+private func lastProgress(_ events: [ScanEvent]) -> ScanEvent? {
+    events.last { if case .progress = $0 { true } else { false } }
+}
+
+private func progressNeverMovesBackOrPastTotal(_ events: [ScanEvent], total: Int64) -> Bool {
+    var previous: Int64 = 0
+    for case .progress(let bytes, let all) in events {
+        guard all == total, bytes <= all, bytes >= previous else { return false }
+        previous = bytes
+    }
+    return true
+}
+
+/// Splits full-chunk read offsets into the sweep (ascending from the resume point) and the carve
+/// backfill that follows it (starting over from a lower offset).
+private func sweepAndBackfill(_ offsets: [Int64]) -> (sweep: [Int64], backfill: [Int64]) {
+    let split = offsets.indices.dropFirst().first { offsets[$0] < offsets[$0 - 1] } ?? offsets.count
+    return (Array(offsets[..<split]), Array(offsets[split...]))
 }
 
 private func paths(_ events: [ScanEvent]) -> [String] {

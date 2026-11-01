@@ -8,6 +8,10 @@ public struct ScanSession: Sendable, Identifiable {
     /// The carver's signatures and limits. Tests inject small ones to reach the `ScanNotice` producers.
     var signatureLibrary: SignatureLibrary = .bundled
     var carverLimits: SignatureCarver.Limits = .default
+    /// How far the carve backfill reads past the point a resumed sweep began, so a file that
+    /// starts before that point is not cut there. Carves that start at or after it were already
+    /// found by the sweep and are dropped.
+    var backfillOverrunBytes: Int64 = 256 * 1024 * 1024
     public init(reader: any BlockReader) {
         self.reader = reader
         let start = ContinuousClock.now
@@ -24,7 +28,8 @@ public struct ScanSession: Sendable, Identifiable {
     /// `pauseGate` suspends the scan between units of work without cancelling it (AD-11).
     /// `checkpoints` receives a resume point after each sweep unit; use `bufferingNewest(1)`.
     /// `resumingFrom` re-runs metadata traversal (rebuilding discoveries) but skips sweep bytes the
-    /// checkpoint already covered, counting them as scanned. A checkpoint that does not fit this
+    /// checkpoint already covered, counting them as scanned; after the sweep it carves those bytes
+    /// in a carve-only pass that leaves progress unchanged. A checkpoint that does not fit this
     /// device's volumes is ignored and the scan starts from zero.
     /// `notices` receives what the scan could not do (`ScanNotice`), beside the closed `ScanEvent`
     /// stream (AD-11); a notice never duplicates an `.error`. It is finished when the scan ends.
@@ -37,8 +42,13 @@ public struct ScanSession: Sendable, Identifiable {
         let emit: @Sendable (ScanEvent) async throws -> Void = { try await events.send($0) }
         // Byte ranges owned by files found through metadata; the carver skips them.
         let claimed = ClaimedRuns()
-        let carver: any Carver = SignatureCarver(emit: { try await emit(.found($0)) },
-                                                 library: signatureLibrary, limits: carverLimits)
+        let dropped = CarveDropRange()
+        let carver: any Carver = SignatureCarver(emit: { file in
+            if await dropped.drops(file) { return }
+            try await emit(.found(file))
+        }, library: signatureLibrary, limits: carverLimits)
+        // A resumed scan owes a carve-only pass over the bytes it skipped until that pass ends.
+        var backfillOutstanding = false
         do {
             try Task.checkCancellation()
             let discovery = try await VolumeDiscovery(reader: reader).discover()
@@ -56,7 +66,7 @@ public struct ScanSession: Sendable, Identifiable {
                     if covered > 0 { await measured.cover(extent.offset..<(extent.offset + covered)) }
                 }
             }
-            if let start, start.volume > 0 || start.offset > 0 { notices?.yield(.resumedCarvingPartial) }
+            backfillOutstanding = start.map { $0.volume > 0 || $0.offset > 0 } ?? false
             try await emit(.progress(bytesScanned: await measured.measured, totalBytes: total))
             // Per lost extent: whether its own parser finished, and whether the device failed to read
             // inside it (then nothing more is read there).
@@ -98,7 +108,7 @@ public struct ScanSession: Sendable, Identifiable {
             }
             // Finish a bounded, read-only pass over supported volumes. Progress measures unique
             // source bytes actually read, including metadata; unsupported partitions are skipped.
-            // The carver sees every swept chunk (a resumed scan carves only the remaining bytes).
+            // The carver sees every swept chunk; a resumed scan then carves the skipped bytes too.
             if !signatureLibrary.skipped.isEmpty { notices?.yield(.signaturesSkipped(signatureLibrary.skipped.map(\.file))) }
             try await carver.begin(claimed: await claimed.runs, deviceSizeBytes: reader.sizeBytes)
             for (index, extent) in extents.enumerated() {
@@ -127,18 +137,80 @@ public struct ScanSession: Sendable, Identifiable {
                                                       bytesScanned: await measured.measured))
                 }
             }
+            if let start, backfillOutstanding {
+                try await carveBackfill(before: start, extents: extents, unreadable: unreadable, carver: carver,
+                                        dropped: dropped, pauseGate: pauseGate, checkpoint: { carved in
+                    checkpoints?.yield(ScanCheckpoint(deviceSizeBytes: reader.sizeBytes, totalBytes: total, extents: fingerprint,
+                                                      sweepVolumeIndex: extents.count - 1, sweepOffset: extents[extents.count - 1].length,
+                                                      bytesScanned: await measured.measured, carveBackfillOffset: carved))
+                })
+            }
             try await carver.finish()
+            backfillOutstanding = false
             if await carver.hitFileLimit { notices?.yield(.carvingLimitReached(count: carverLimits.maxCarvedFiles)) }
             try Task.checkCancellation()
             try await emit(.completed)
         } catch is CancellationError {
-            // Cancellation has no completed event; the app retains previous discoveries.
+            // Cancellation has no completed event; the app retains previous discoveries. Stopping a
+            // resumed scan before its backfill ended leaves carving incomplete, so say so.
+            if backfillOutstanding { notices?.yield(.resumedCarvingPartial) }
         } catch {
             if !Task.isCancelled { try? await emit(.error((error as? ScanError) ?? .io(error.localizedDescription))) }
         }
         checkpoints?.finish()
         notices?.finish()
         events.finish()
+    }
+
+    /// The carve backfill of a resumed scan: a carve-only pass over every byte before the point the
+    /// sweep resumed from. Those bytes were counted as scanned when the checkpoint was applied, so
+    /// they are read from the source directly and progress does not move; `.completed` follows the
+    /// pass, so the scan shows as running until it ends. Pause and cancellation are honoured per chunk.
+    ///
+    /// Every extent is a hard cut for the carver, as in the sweep. On the extent the sweep resumed
+    /// inside, carving reads on for up to `backfillOverrunBytes` past the resume point, so a file
+    /// that straddles it is carved whole; files that start at or after it came from the sweep and
+    /// are dropped by `dropped`.
+    ///
+    /// `checkpoint` receives how far the pass has carved, as a position in the concatenated extents.
+    /// Carved files don't survive a cold start (the app clears its results), so a scan resumed from
+    /// such a checkpoint skips the finished sweep and carves every byte again.
+    private func carveBackfill(before start: (volume: Int, offset: Int64), extents: [VolumeExtent],
+                               unreadable: Set<Int>, carver: any Carver, dropped: CarveDropRange,
+                               pauseGate: ScanPauseGate?,
+                               checkpoint: (Int64) async -> Void) async throws {
+        var base: Int64 = 0
+        for (index, extent) in extents.enumerated() where index <= start.volume {
+            let extentBase = base
+            base = try checkedAdd(base, extent.length)
+            let region = index < start.volume ? extent.length : start.offset
+            // A lost extent the device couldn't read is left alone, as in the sweep.
+            guard region > 0, !unreadable.contains(index) else { continue }
+            let overrunEnd = try checkedAdd(region, max(0, backfillOverrunBytes))
+            let readEnd = index < start.volume ? extent.length : min(extent.length, overrunEnd)
+            if readEnd > region {
+                let from = try checkedAdd(extent.offset, region), to = try checkedAdd(extent.offset, extent.length)
+                await dropped.set(from..<to)
+            }
+            try await carver.beginExtent(offset: extent.offset, length: extent.length)
+            var offset: Int64 = 0
+            while offset < readEnd {
+                try Task.checkCancellation()
+                try await pauseGate?.wait()
+                let count = Int(min(1024 * 1024, readEnd - offset))
+                let deviceOffset = try checkedAdd(extent.offset, offset)
+                let chunk: Data
+                do { chunk = try await reader.read(at: deviceOffset, count: count) }
+                catch ScanError.io(let reason) {
+                    guard extent.isLost else { throw ScanError.io(reason) }
+                    break
+                }
+                guard chunk.count == count else { throw ScanError.malformed("Truncated device.") }
+                try await carver.consume(chunk, at: deviceOffset)
+                offset += Int64(count)
+                await checkpoint(extentBase + min(offset, region))
+            }
+        }
     }
 
     /// What discovery says it could not do: an ignored partition table, a lost-partition search
@@ -164,6 +236,7 @@ public struct ScanSession: Sendable, Identifiable {
     static let damagedSuffix = " (damaged)"
 
     /// The sweep position a checkpoint resumes from, or nil when it does not fit this device's layout.
+    /// Everything before it is carved again after the sweep (`carveBackfill`).
     /// The checkpoint's extent fingerprint must equal the freshly discovered layout exactly, so a
     /// re-partitioned device with the same size, total and volume count still scans from zero.
     static func sweepStart(_ checkpoint: ScanCheckpoint, extents: [VolumeExtent], total: Int64,
@@ -172,6 +245,11 @@ public struct ScanSession: Sendable, Identifiable {
               checkpoint.extents == extents.map({ ScanCheckpoint.Extent(offset: $0.offset, length: $0.length) }),
               extents.indices.contains(checkpoint.sweepVolumeIndex),
               checkpoint.sweepOffset <= extents[checkpoint.sweepVolumeIndex].length else { return nil }
+        // A backfill checkpoint is only ever taken once the sweep has finished.
+        if checkpoint.carveBackfillOffset != nil {
+            guard checkpoint.sweepVolumeIndex == extents.count - 1,
+                  checkpoint.sweepOffset == extents[checkpoint.sweepVolumeIndex].length else { return nil }
+        }
         return (checkpoint.sweepVolumeIndex, checkpoint.sweepOffset)
     }
 }
@@ -264,6 +342,17 @@ extension ScanError {
     var isContainedInLostExtent: Bool {
         if case .io = self { return true }
         return isMetadataFailure
+    }
+}
+
+/// Carved files starting inside `range` are not emitted: the carve backfill's overrun past the
+/// resume point finds again what the resumed sweep already reported.
+actor CarveDropRange {
+    private var range: Range<Int64>?
+    func set(_ range: Range<Int64>) { self.range = range }
+    func drops(_ file: RecoveredFile) -> Bool {
+        guard let range, case .runs(let runs) = file.content, let first = runs.first?.deviceOffset else { return false }
+        return range.contains(first)
     }
 }
 
