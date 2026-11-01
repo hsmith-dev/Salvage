@@ -40,16 +40,71 @@ struct DriveImagerTests {
         #expect(result.sha256 == SHA256.hash(data: expected).map { String(format: "%02x", $0) }.joined())
     }
 
-    @Test func aSolidlyBadChunkIsMarkedInAFewReadsNotOnePerSector() async throws {
+    @Test func aSolidlyBadChunkIsMarkedInBoundedReadsNotOnePerSector() async throws {
         let source = FakeSource(size: 8 * Self.mib, bad: Set(0..<8192))  // the whole first 4 MiB
         let sink = MemorySink()
         let result = await DriveImager().run(reader: source, sink: sink)
         #expect(result.outcome == .completed)
         #expect(result.badRanges == [ImagingBadRange(offset: 0, length: Int64(4 * Self.mib))])
-        // The 4 MiB read, then its 64 KiB pieces once each; the good second chunk is one read.
-        #expect(source.readCount == 1 + 64 + 1)
+        // The 4 MiB read; the first 64 KiB piece split to sectors until 32 KiB in a row failed
+        // (1 + 8 × (1 + 8) + 8 more 4 KiB reads), then the other 63 pieces once each; the good
+        // second chunk is one read.
+        #expect(source.readCount == 1 + (1 + 72 + 8) + 63 + 1)
         #expect(sink.bytes.prefix(4 * Self.mib) == Data(count: 4 * Self.mib))
         #expect(sink.bytes.suffix(4 * Self.mib) == source.bytes.suffix(4 * Self.mib))
+    }
+
+    @Test func failedPiecesAreAlwaysSplitDownToSectorsSoScatteredBadSectorsLoseNothingElse() async throws {
+        // One bad sector in every 4 KiB of the first 64 KiB: every 4 KiB piece fails, but only
+        // the 16 sectors themselves are lost.
+        let bad = Set(stride(from: Int64(0), to: 128, by: 8))
+        let source = FakeSource(size: 4 * Self.mib, bad: bad)
+        let sink = MemorySink()
+        let result = await DriveImager().run(reader: source, sink: sink)
+        #expect(result.outcome == .completed)
+        #expect(result.badRanges == bad.sorted().map { ImagingBadRange(offset: $0 * 512, length: 512) })
+        var expected = source.bytes
+        for block in bad { expected.replaceSubrange(Int(block) * 512..<Int(block + 1) * 512, with: Data(count: 512)) }
+        #expect(sink.bytes == expected)
+    }
+
+    @Test func aDriveReturningOnlyErrorsStopsInsteadOfCompleting() async throws {
+        let source = FakeSource(size: 32 * Self.mib, bad: Set(0..<Int64(32 * Self.mib / 512)))
+        var imager = DriveImager()
+        imager.stopAfterUnreadable = Int64(8 * Self.mib)
+        let checks = Collected()
+        imager.stillPresent = { checks.add(ImagingProgress(totalBytes: 0)); return true }
+        let result = await imager.run(reader: source, sink: MemorySink())
+        guard case .stopped(let reason) = result.outcome else { Issue.record("expected stopped, got \(result.outcome)"); return }
+        #expect(reason.contains("stopped returning data"))
+        #expect(result.progress.bytesDone == Int64(8 * Self.mib))
+        #expect(checks.values.count == 1, "the device is re-checked before stopping")
+        // After the first chunk, a dead chunk costs one read plus one per 64 KiB piece.
+        #expect(source.readCount == 145 + 65)
+
+        imager.stillPresent = { false }
+        let gone = await imager.run(reader: FakeSource(size: 32 * Self.mib, bad: Set(0..<Int64(32 * Self.mib / 512))), sink: MemorySink())
+        #expect(gone.outcome == .stopped(ScanError.deviceChanged.description))
+    }
+
+    @Test func aZeroByteReadIsABadSectorOnlyWhileTheDriveIsStillThere() async throws {
+        var imager = DriveImager()
+        imager.stillPresent = { true }
+        let present = await imager.run(reader: FakeSource(size: 4 * Self.mib, short: 100), sink: MemorySink())
+        #expect(present.outcome == .completed)
+        #expect(present.badRanges == [ImagingBadRange(offset: 100 * 512, length: 512)])
+
+        imager.stillPresent = { false }
+        let gone = await imager.run(reader: FakeSource(size: 4 * Self.mib, short: 100), sink: MemorySink())
+        #expect(gone.outcome == .stopped(ScanError.deviceChanged.description))
+        #expect(gone.badRanges.isEmpty)
+    }
+
+    @Test func aClosedSessionEndsTheCopy() async throws {
+        let result = await DriveImager().run(reader: FakeSource(size: 8 * Self.mib, closed: 9000), sink: MemorySink())
+        guard case .stopped = result.outcome else { Issue.record("expected stopped"); return }
+        #expect(result.badRanges.isEmpty)
+        #expect(result.progress.bytesDone == Int64(4 * Self.mib))
     }
 
     @Test func aReadThatNeverReturnsStopsTheCopyInsteadOfHanging() async throws {
@@ -80,7 +135,7 @@ struct DriveImagerTests {
         #expect(result.progress.bytesDone == Int64(8 * Self.mib))
         #expect(sink.bytes == source.bytes.prefix(8 * Self.mib))
         #expect(result.sha256 == nil)
-        #expect(!sink.synced)
+        #expect(sink.synced, "the partial image is flushed too")
     }
 
     @Test func aDriveThatGoesAwayStopsTheCopyAndIsNotCountedAsBadBlocks() async throws {
@@ -202,17 +257,20 @@ final class FakeSource: BlockReader, @unchecked Sendable {
     private let bad: Set<Int64>
     private let hang: Int64?
     private let gone: Int64?
+    private let short: Int64?
+    private let closed: Int64?
     private let lock = NSLock()
     private var reads = 0
     private var largest = 0
     private var hung: [CheckedContinuation<Void, Never>] = []
 
-    init(size: Int, bad: Set<Int64> = [], hang: Int64? = nil, gone: Int64? = nil) {
+    init(size: Int, bad: Set<Int64> = [], hang: Int64? = nil, gone: Int64? = nil, short: Int64? = nil, closed: Int64? = nil) {
         var data = Data(count: size)
         data.withUnsafeMutableBytes { raw in
             for index in 0..<size { raw[index] = UInt8(truncatingIfNeeded: index &* 31 &+ index >> 9) }
         }
         bytes = data; sizeBytes = Int64(size); self.bad = bad; self.hang = hang; self.gone = gone
+        self.short = short; self.closed = closed
     }
 
     var readCount: Int { lock.withLock { reads } }
@@ -231,6 +289,8 @@ final class FakeSource: BlockReader, @unchecked Sendable {
             throw ScanError.io("released")
         }
         if let gone, blocks.contains(gone) { throw ScanError.deviceChanged }
+        if let short, blocks.contains(short) { throw ScanError.io("Short raw-device read.") }
+        if let closed, blocks.contains(closed) { throw ScanError.io("The read session is closed.") }
         if blocks.contains(where: bad.contains) { throw ScanError.io("Input/output error") }
         return bytes.subdata(in: Int(offset)..<Int(offset) + count)
     }
