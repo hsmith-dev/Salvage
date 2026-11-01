@@ -53,7 +53,7 @@ struct TrustPanelView: View {
                     .disabled(isScanning || checker.isChecking)
                 if isScanning {
                     Text("Checking for updates is unavailable while a scan is running.")
-                        .font(.callout).foregroundStyle(.secondary)
+                        .font(.callout).foregroundStyle(.inkSecondary)
                 } else {
                     UpdateCheckStatus(checker: checker).font(.callout)
                 }

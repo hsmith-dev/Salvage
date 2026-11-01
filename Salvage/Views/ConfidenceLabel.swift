@@ -8,10 +8,10 @@ struct ConfidenceLabel: View {
     var body: some View {
         Group {
             switch confidence {
-            case .high: Text("High").font(.body).fontWeight(.semibold).foregroundStyle(.primary)
-            case .medium: Text("Medium").font(.subheadline).foregroundStyle(.secondary)
-            case .low: Text("Low").font(.caption).foregroundStyle(.tertiary)
-            case nil: Text("Can't be recovered").font(.caption).foregroundStyle(.tertiary)
+            case .high: Text("High").font(.body).fontWeight(.semibold).foregroundStyle(.inkPrimary)
+            case .medium: Text("Medium").font(.subheadline).foregroundStyle(.inkSecondary)
+            case .low: Text("Low").font(.caption).foregroundStyle(.inkTertiary)
+            case nil: Text("Can't be recovered").font(.caption).foregroundStyle(.inkTertiary)
             }
         }
         .accessibilityLabel(accessibilityText)

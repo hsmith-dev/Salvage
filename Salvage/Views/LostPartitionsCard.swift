@@ -14,13 +14,13 @@ struct LostPartitionsCard: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Lost partitions").font(.headline)
             Text("Found in unallocated space, outside the current partition table. Their files are listed separately from the mounted volumes; the partition table itself is never modified.")
-                .font(.subheadline).foregroundStyle(.secondary)
+                .font(.subheadline).foregroundStyle(.inkSecondary)
             // Lazy, and capped at `lostPartitionRowLimit` rows: a damaged disk can yield hundreds.
             LazyVStack(alignment: .leading, spacing: 12) {
                 ForEach(model.displayedLostPartitions) { partition in row(partition) }
             }
             if let more = model.moreLostPartitionsText {
-                Text(more).font(.subheadline).foregroundStyle(.secondary)
+                Text(more).font(.subheadline).foregroundStyle(.inkSecondary)
             }
         }
         .accessibilityElement(children: .contain)
@@ -37,7 +37,7 @@ struct LostPartitionsCard: View {
                 Image(systemName: "externaldrive.badge.questionmark").font(.title2).foregroundStyle(.secondary)
                 VStack(alignment: .leading, spacing: 4) {
                     Text(title).font(.headline)
-                    Text("\(files) · \(location)").font(.caption).foregroundStyle(.secondary)
+                    Text("\(files) · \(location)").font(.caption).foregroundStyle(.inkSecondary)
                 }
                 Spacer(minLength: 0)
                 if summary.opens { Image(systemName: "chevron.forward").foregroundStyle(.tertiary) }

@@ -15,7 +15,7 @@ struct PartitionsSection: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Partitions").font(.headline)
             Text("Recover every file from one partition into a folder on another drive, keeping its folders.")
-                .font(.subheadline).foregroundStyle(.secondary)
+                .font(.subheadline).foregroundStyle(.inkSecondary)
             LazyVStack(alignment: .leading, spacing: 12) {
                 ForEach(summaries) { summary in row(summary) }
             }
@@ -30,7 +30,7 @@ struct PartitionsSection: View {
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 4) {
                 Text(summary.title).font(.headline)
-                Text(summary.countsText).font(.caption).foregroundStyle(.secondary)
+                Text(summary.countsText).font(.caption).foregroundStyle(.inkSecondary)
             }
             .accessibilityElement(children: .combine)
             Spacer(minLength: 8)

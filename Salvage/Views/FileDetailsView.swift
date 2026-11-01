@@ -18,7 +18,7 @@ struct FileDetailsView: View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
-                    Text("Recovery confidence:").foregroundStyle(.secondary)
+                    Text("Recovery confidence:").foregroundStyle(.inkSecondary)
                     ConfidenceLabel(confidence: details.confidence)
                 }
                 Text(details.explanation)
@@ -46,16 +46,16 @@ struct FileDetailsView: View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Where its bytes are").font(.headline)
             if let storage = details.storage {
-                Text(storage).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Text(storage).foregroundStyle(.inkSecondary).fixedSize(horizontal: false, vertical: true)
             }
             let limit = showsAllRuns ? Self.maxShownRuns : Self.compactRuns
             ForEach(details.runs.prefix(limit)) { run in
-                Text(run.text).monospacedDigit().foregroundStyle(run.deviceOffset == nil ? .secondary : .primary)
+                Text(run.text).monospacedDigit().foregroundStyle(run.deviceOffset == nil ? InkStyle.secondary : InkStyle.primary)
                     .textSelection(.enabled)
             }
             if details.runs.count > limit {
                 Text("… and \((details.runs.count - limit).formatted()) more runs. Copy Details includes them.")
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.inkSecondary)
             }
         }
     }

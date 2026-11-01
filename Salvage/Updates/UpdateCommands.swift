@@ -56,7 +56,7 @@ struct UpdateWindow: View {
             }
             if activity.isAnyScanActive {
                 Text("Checking for updates is unavailable while a scan is running.")
-                    .font(.callout).foregroundStyle(.secondary)
+                    .font(.callout).foregroundStyle(.inkSecondary)
             }
         }
         .padding(24)
@@ -73,7 +73,7 @@ struct UpdateCheckStatus: View {
         switch checker.state {
         case .idle:
             Text("Salvage only checks for updates when you ask it to.")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.inkSecondary)
         case .checking:
             HStack(spacing: 8) {
                 ProgressView().controlSize(.small)

@@ -65,7 +65,7 @@ struct RecoverySheet: View {
                         .toggleStyle(.checkbox)
                         .disabled(!coordinator.isConfirming)
                     Text("Rebuilt from raw bytes: they have generated names and some may be incomplete.")
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(.caption).foregroundStyle(.inkSecondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -75,14 +75,14 @@ struct RecoverySheet: View {
                 .disabled(!coordinator.isConfirming)
                 .accessibilityIdentifier("recovery-report-toggle")
             Text("\(byteString(coordinator.totalBytes)) will be copied into a new folder inside the destination you choose. Nothing is written to the drive you're recovering from.")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.inkSecondary)
                 .fixedSize(horizontal: false, vertical: true)
 
             HStack(spacing: 12) {
                 Image(systemName: "folder").accessibilityHidden(true)
                 Text(coordinator.destination?.path ?? "No destination chosen")
                     .lineLimit(1).truncationMode(.middle)
-                    .foregroundStyle(coordinator.destination == nil ? .secondary : .primary)
+                    .foregroundStyle(coordinator.destination == nil ? InkStyle.secondary : InkStyle.primary)
                 Spacer()
                 if coordinator.destinationStatus == .checking { ProgressView().controlSize(.small) }
                 Button("Choose…", action: chooseDestination)
@@ -152,7 +152,7 @@ struct RecoverySheet: View {
             Text("\(coordinator.progress.filesFinished) of \(coordinator.files.count) files · \(byteString(coordinator.progress.bytesDone)) of \(byteString(coordinator.totalBytes))")
                 .monospacedDigit()
             if let name = coordinator.progress.currentName {
-                Text(name).lineLimit(1).truncationMode(.middle).foregroundStyle(.secondary)
+                Text(name).lineLimit(1).truncationMode(.middle).foregroundStyle(.inkSecondary)
             }
             HStack {
                 Spacer()
@@ -211,7 +211,7 @@ struct RecoverySummaryView: View {
                 .accessibilityAddTraits(.isHeader)
             Text(Self.headline(summary, sourceName: sourceName)).fixedSize(horizontal: false, vertical: true)
                 .accessibilityIdentifier("recovery-summary-headline")
-            Text(summary.root.path).font(.callout).foregroundStyle(.secondary)
+            Text(summary.root.path).font(.callout).foregroundStyle(.inkSecondary)
                 .lineLimit(2).truncationMode(.middle).textSelection(.enabled)
 
             if !summary.failed.isEmpty {
@@ -221,7 +221,7 @@ struct RecoverySummaryView: View {
                         ForEach(summary.failed) { failure in
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(failure.name).fontWeight(.medium)
-                                Text(failure.reason).foregroundStyle(.secondary)
+                                Text(failure.reason).foregroundStyle(.inkSecondary)
                                     .fixedSize(horizontal: false, vertical: true)
                             }
                             .accessibilityElement(children: .combine)
@@ -234,7 +234,7 @@ struct RecoverySummaryView: View {
 
             if let failure = summary.attachmentFailure {
                 Text("The recovery report couldn't be saved. \(failure)")
-                    .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    .foregroundStyle(.inkSecondary).fixedSize(horizontal: false, vertical: true)
             }
 
             HStack {
