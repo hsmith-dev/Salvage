@@ -5,27 +5,36 @@ import UniformTypeIdentifiers
 
 /// A saved scan (spec-tech-batch-7 §B): a `.salvagescan` package, a folder holding
 ///
-/// - `Info.json`: the format version, the scanned device's identity (media identity, size, model
-///   name and partitions), the extent fingerprint (the scan's newest checkpoint, offsets and sizes
-///   only), the outcome, notices, lost partitions, and the file count and SHA-256 of the file list;
-/// - `Files.bin`: every `RecoveredFile` in a compact binary list, content runs included.
+/// - `Info.json`: the format version, the scanned device's identity (media identity, its
+///   replug-stable identity, size, model name and partitions), the extent fingerprint (the scan's
+///   newest checkpoint, offsets and sizes only), the outcome, notices, lost partitions, and the file
+///   count and SHA-256 of the file list;
+/// - `Files.bin`: every `RecoveredFile`'s name, path, size, date, flags and where its bytes are on
+///   the device (offsets and lengths). It holds no file contents (version 2): no raw metadata
+///   records, no reconstructed files' first bytes, no NTFS resident data. A small NTFS file whose
+///   bytes live inside its MFT record is saved as the device ranges that hold them, and is
+///   re-read and checked against its record on reconnect (`NTFSResidentData`, `ResidentRecordGuard`).
 ///
 /// It never holds credentials or keys. A scan's passwords, recovery keys and volume decryptors live
 /// only in `ScanRun.credentials` and `SourceSession.decryptors`, and nothing here reads either: an
 /// encrypted file is saved as its ciphertext runs and its volume UUID (`keyID`), so it needs the
 /// password again after reopening.
 ///
-/// A reopened scan has no source. `ScanViewModel.reconnect` adopts a device only once its media
-/// identity and size match (checked before anything is opened) and its freshly read extent
-/// fingerprint equals the saved one (`ScanArchive.admits`, `ExtentFingerprint`).
+/// A reopened scan has no source. `ScanViewModel.reconnect` adopts a device only once it is the
+/// same drive (`ScanArchive.admits`, checked before anything is opened) and its freshly read
+/// extent fingerprint equals the saved one (`ExtentFingerprint`).
 struct ScanArchive: Equatable, Sendable {
-    /// Bumped on any incompatible change; any other version is refused (`ArchiveError.unsupportedVersion`).
-    static let formatVersion = 1
+    /// Bumped on any incompatible change. Version 1 (media identity only; file contents kept) is
+    /// still read; any other version is refused (`ArchiveError.unsupportedVersion`).
+    static let formatVersion = 2
+    static let readableVersions: Set<Int> = [1, 2]
     static let fileExtension = "salvagescan"
     static let infoFileName = "Info.json"
     static let filesFileName = "Files.bin"
     /// The one privacy warning, shown in the save panel. Kept here so it is written once.
-    static let privacyNotice = "This file lists the names of the files Salvage found."
+    static let privacyNotice = "This file lists the names, folders, sizes and dates of the files Salvage found, and where each one is on the drive. It doesn't contain the files themselves."
+    /// Why a small NTFS file of a reopened scan can't be read: its record no longer holds it.
+    static let rescanToRecover = "Rescan to recover this file."
     static var contentType: UTType { UTType(filenameExtension: fileExtension, conformingTo: .package) ?? .package }
 
     enum Outcome: Equatable, Sendable { case completed, cancelled, failed(ScanError) }
@@ -43,15 +52,33 @@ struct ScanArchive: Equatable, Sendable {
     var startedAt: Date?
     var endedAt: Date?
     var savedAt: Date
+    /// Files whose content runs point inside their own NTFS MFT record (resident data), by file ID,
+    /// with the record's size in bytes. Their runs are checked against the record before use.
+    var residentRecords: [UUID: Int] = [:]
 
     var fingerprint: [ScanCheckpoint.Extent]? { checkpoint?.extents }
 
-    /// True when `candidate` may be opened to check its fingerprint: the same attachment (media
-    /// identity) of a device of the same size. A device without a media identity never matches.
+    /// True when `candidate` may be opened to check its fingerprint. It must not be the startup
+    /// drive, must have the saved size, and must be the same drive:
+    /// - the same attachment (an equal media identity), or
+    /// - after an unplug or restart, the same replug-stable identity (`sameDrive`).
+    /// A saved scan without a stable identity (version 1, or a drive that has none) matches only
+    /// by media identity, and a device with neither never matches. The fingerprint check after
+    /// opening is still required either way.
     static func admits(_ candidate: BlockDevice, for archived: BlockDevice) -> Bool {
-        guard let identity = archived.mediaIdentity, candidate.mediaIdentity == identity,
-              candidate.sizeBytes == archived.sizeBytes, !candidate.isBootVolume else { return false }
-        return true
+        guard !candidate.isBootVolume, candidate.sizeBytes == archived.sizeBytes else { return false }
+        if let identity = archived.mediaIdentity, candidate.mediaIdentity == identity { return true }
+        guard let saved = archived.stableIdentity, let current = candidate.stableIdentity else { return false }
+        return sameDrive(saved, current)
+    }
+
+    /// The same GPT disk GUID (or, for a drive without one, the same volume UUIDs at the same
+    /// offsets), the same size, and the same serial number when both report one.
+    static func sameDrive(_ a: BlockDevice.StableIdentity, _ b: BlockDevice.StableIdentity) -> Bool {
+        guard a.sizeBytes > 0, a.sizeBytes == b.sizeBytes else { return false }
+        if let x = a.serial, let y = b.serial, x != y { return false }
+        if let guid = a.diskGUID { return b.diskGUID?.uppercased() == guid.uppercased() }
+        return b.diskGUID == nil && !a.volumes.isEmpty && a.volumes == b.volumes
     }
 
     /// True when encrypted files are listed: they need the password again after reopening.
@@ -84,7 +111,7 @@ extension ScanArchive {
     /// Writes the package to `url`, replacing what is there (the save panel has asked). The package
     /// is built beside `url` and moved into place, so a failed save never leaves half a package.
     func write(to url: URL) throws {
-        let fileList = FileListCodec.encode(files)
+        let fileList = FileListCodec.encode(files, residentRecords: residentRecords)
         let info = Info(archive: self, fileListDigest: Self.digest(fileList))
         let encoder = JSONEncoder()
         // Dates keep the default encoding (seconds since 2001, as a double), which round-trips exactly.
@@ -122,13 +149,16 @@ extension ScanArchive {
         let decoder = JSONDecoder()
         guard let header = try? decoder.decode(VersionHeader.self, from: infoData),
               header.format == Info.formatName else { throw ScanArchiveError.notAScan }
-        guard header.formatVersion == formatVersion else { throw ScanArchiveError.unsupportedVersion(header.formatVersion) }
+        guard readableVersions.contains(header.formatVersion) else { throw ScanArchiveError.unsupportedVersion(header.formatVersion) }
         guard let info = try? decoder.decode(Info.self, from: infoData),
               let fileList = try? Data(contentsOf: url.appending(path: filesFileName, directoryHint: .notDirectory)),
               digest(fileList) == info.fileListSHA256 else { throw ScanArchiveError.damaged }
-        let files = try FileListCodec.decode(fileList)
-        guard files.count == info.fileCount else { throw ScanArchiveError.damaged }
-        return try info.archive(files: files)
+        let list = try FileListCodec.decodeList(fileList)
+        guard list.version == header.formatVersion, list.files.count == info.fileCount else { throw ScanArchiveError.damaged }
+        // A version 1 package never held a stable identity; it reconnects by media identity only.
+        var archive = try info.archive(files: list.files, stableIdentity: header.formatVersion >= 2)
+        archive.residentRecords = list.residentRecords
+        return archive
     }
 
     static func digest(_ data: Data) -> String {
@@ -153,6 +183,8 @@ private struct Info: Codable {
         let isInternal: Bool
         /// A string: IORegistry IDs are 64-bit, and JSON numbers are not exact past 2^53.
         let mediaIdentity: String?
+        /// Version 2: the GPT disk GUID or volume UUIDs, size, model and serial. Absent in version 1.
+        let stableIdentity: BlockDevice.StableIdentity?
         let partitions: [Partition]
     }
     struct Partition: Codable {
@@ -235,7 +267,8 @@ private struct Info: Codable {
         appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
         let d = a.device
         device = Device(bsdName: d.bsdName, displayName: d.displayName, sizeBytes: d.sizeBytes, isInternal: d.isInternal,
-                        mediaIdentity: d.mediaIdentity.map(String.init), partitions: d.partitions.map(Partition.init))
+                        mediaIdentity: d.mediaIdentity.map(String.init), stableIdentity: d.stableIdentity,
+                        partitions: d.partitions.map(Partition.init))
         checkpoint = a.checkpoint
         outcome = switch a.outcome {
         case .completed: .completed
@@ -250,7 +283,7 @@ private struct Info: Codable {
         fileListSHA256 = fileListDigest
     }
 
-    func archive(files: [RecoveredFile]) throws -> ScanArchive {
+    func archive(files: [RecoveredFile], stableIdentity readStable: Bool) throws -> ScanArchive {
         var identity: UInt64?
         if let text = device.mediaIdentity {
             guard let value = UInt64(text) else { throw ScanArchiveError.damaged }
@@ -258,9 +291,11 @@ private struct Info: Codable {
         }
         guard device.sizeBytes > 0, bytesScanned >= 0, totalBytes >= 0, checkpoint?.isWellFormed ?? true,
               checkpoint.map({ $0.deviceSizeBytes == device.sizeBytes }) ?? true else { throw ScanArchiveError.damaged }
+        let stable = readStable ? device.stableIdentity : nil
+        if let stable { guard stable.sizeBytes == device.sizeBytes else { throw ScanArchiveError.damaged } }
         let blockDevice = BlockDevice(bsdName: device.bsdName, displayName: device.displayName, sizeBytes: device.sizeBytes,
                                       isInternal: device.isInternal, isBootVolume: false, mediaIdentity: identity,
-                                      partitions: device.partitions.map(\.value))
+                                      partitions: device.partitions.map(\.value), stableIdentity: stable)
         let outcome: ScanArchive.Outcome = switch self.outcome {
         case .completed: .completed
         case .cancelled: .cancelled
@@ -332,8 +367,19 @@ private struct Info: Codable {
 /// The binary file list: an 8-byte magic, the format version (UInt32 LE) and the file count
 /// (UInt64 LE), then one record per file. Integers are LEB128 varints (signed ones zigzagged),
 /// doubles their 8-byte bit pattern, the filesystem its raw name, strings and byte blobs a varint length then the bytes.
+///
+/// Version 2 holds no file contents. A record has no metadata-record blob, and its content is
+/// unmapped (0), runs (2), encrypted runs (3), or runs inside the file's own NTFS MFT record (4,
+/// preceded by the record's size), which is how resident data is kept: as where it is, not what it
+/// is. Version 1 records (still read) carried the metadata record's bytes and resident data (1).
 enum FileListCodec {
     static let magic = Array("SLVGFLST".utf8)
+
+    struct List: Equatable {
+        var version: Int
+        var files: [RecoveredFile]
+        var residentRecords: [UUID: Int]
+    }
 
     private struct Flags: OptionSet {
         let rawValue: UInt8
@@ -351,9 +397,11 @@ enum FileListCodec {
         static let hasDataUnit = RunFlags(rawValue: 1 << 1)
     }
 
-    static func encode(_ files: [RecoveredFile]) -> Data {
+    /// Encodes the current version. `residentRecords` names files (by ID) whose runs already point
+    /// inside their MFT record, as a reopened scan's do.
+    static func encode(_ files: [RecoveredFile], residentRecords: [UUID: Int] = [:]) -> Data {
         var out = Writer()
-        out.bytes.reserveCapacity(64 + files.count * 160)
+        out.bytes.reserveCapacity(64 + files.count * 120)
         out.bytes += magic
         out.fixed(UInt64(ScanArchive.formatVersion), width: 4)
         out.fixed(UInt64(files.count), width: 8)
@@ -378,28 +426,59 @@ enum FileListCodec {
             out.signed(meta.volumeOffset)
             out.signed(meta.recordOffset)
             out.varint(meta.allocationStart)
-            out.blob(meta.rawRecord)
             if let name = meta.volumeName { out.string(name) }
             if let id = meta.volumeID { out.string(id) }
             switch file.content {
             case .unmapped: out.bytes.append(0)
-            case .resident(let data): out.bytes.append(1); out.blob(data)
-            case .runs(let runs): out.bytes.append(2); out.runs(runs)
+            case .resident(let data):
+                if let runs = residentRuns(file, data) {
+                    out.bytes.append(4); out.varint(UInt64(meta.rawRecord.count)); out.runs(runs)
+                } else {
+                    // Not locatable in its record: saved as unmapped rather than with its bytes.
+                    out.bytes.append(0)
+                }
+            case .runs(let runs):
+                if let recordBytes = residentRecords[file.id] {
+                    out.bytes.append(4); out.varint(UInt64(recordBytes)); out.runs(runs)
+                } else {
+                    out.bytes.append(2); out.runs(runs)
+                }
             case .encryptedRuns(let runs, let keyID): out.bytes.append(3); out.string(keyID); out.runs(runs)
             }
         }
         return Data(out.bytes)
     }
 
-    static func decode(_ data: Data) throws -> [RecoveredFile] {
+    /// Where a freshly scanned NTFS file's resident data is on the device, from its fixed-up MFT
+    /// record, checked by rebuilding the data from those runs within the record.
+    static func residentRuns(_ file: RecoveredFile, _ data: Data) -> [DataRun]? {
+        let meta = file.sourceMetadata
+        guard meta.filesystem == .ntfs, Int64(data.count) >= file.sizeBytes,
+              let runs = NTFSResidentData.runs(inRecord: meta.rawRecord, at: meta.recordOffset) else { return nil }
+        let record = Data(meta.rawRecord)
+        var rebuilt = Data()
+        for run in runs {
+            guard let offset = run.deviceOffset else { return nil }
+            let start = Int(offset - meta.recordOffset)
+            rebuilt += record[start..<start + Int(run.length)]
+        }
+        return rebuilt == data ? runs : nil
+    }
+
+    static func decode(_ data: Data) throws -> [RecoveredFile] { try decodeList(data).files }
+
+    static func decodeList(_ data: Data) throws -> List {
         var input = Reader(bytes: [UInt8](data))
         guard Array(try input.take(magic.count)) == magic else { throw ScanArchiveError.damaged }
-        let version = try input.fixed(width: 4)
-        guard version == UInt64(ScanArchive.formatVersion) else { throw ScanArchiveError.unsupportedVersion(Int(clamping: version)) }
+        let rawVersion = try input.fixed(width: 4)
+        guard let version = Int(exactly: rawVersion), ScanArchive.readableVersions.contains(version) else {
+            throw ScanArchiveError.unsupportedVersion(Int(clamping: rawVersion))
+        }
         let count = try input.fixed(width: 8)
         // Every record takes well over 16 bytes, so a count the data can't hold is damage, not a reason to reserve.
         guard count <= UInt64(input.remaining / 16) else { throw ScanArchiveError.damaged }
         var files: [RecoveredFile] = []
+        var residentRecords: [UUID: Int] = [:]
         files.reserveCapacity(Int(count))
         for _ in 0..<count {
             let idBytes = Array(try input.take(16))
@@ -416,17 +495,29 @@ enum FileListCodec {
             let volumeOffset = try input.signed()
             let recordOffset = try input.signed()
             let allocationStart = try input.varint()
-            let rawRecord = try input.blob()
+            let rawRecord = version == 1 ? try input.blob() : Data()
             let volumeName = flags.contains(.hasVolumeName) ? try input.string() : nil
             let volumeID = flags.contains(.hasVolumeID) ? try input.string() : nil
             let content: FileContent
             switch try input.byte() {
             case 0: content = .unmapped
-            case 1: content = .resident(try input.blob())
+            case 1 where version == 1: content = .resident(try input.blob())
             case 2: content = .runs(try input.runs())
             case 3:
                 let keyID = try input.string()
                 content = .encryptedRuns(try input.runs(), keyID: keyID)
+            case 4 where version >= 2:
+                let recordBytes = try input.varint()
+                guard (512...65536).contains(recordBytes), recordBytes & (recordBytes - 1) == 0, filesystem == .ntfs, recordOffset >= 0 else {
+                    throw ScanArchiveError.damaged
+                }
+                let runs = try input.runs()
+                // Resident data never leaves its record.
+                guard !runs.isEmpty, runs.allSatisfy({ run in
+                    run.deviceOffset.map { $0 >= recordOffset && run.length <= Int64(recordBytes) - ($0 - recordOffset) } ?? false
+                }) else { throw ScanArchiveError.damaged }
+                residentRecords[id] = Int(recordBytes)
+                content = .runs(runs)
             default: throw ScanArchiveError.damaged
             }
             guard size >= 0, overwrite.isFinite else { throw ScanArchiveError.damaged }
@@ -440,7 +531,7 @@ enum FileListCodec {
                 isPartial: flags.contains(.partial), overwriteConfidence: overwrite))
         }
         guard input.remaining == 0 else { throw ScanArchiveError.damaged }
-        return files
+        return List(version: version, files: files, residentRecords: residentRecords)
     }
 
     private struct Writer {

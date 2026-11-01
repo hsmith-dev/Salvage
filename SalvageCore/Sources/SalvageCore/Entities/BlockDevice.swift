@@ -45,6 +45,36 @@ public struct BlockDevice: Identifiable, Equatable, Sendable {
     /// the tree is unknown or couldn't be read.
     public let partitions: [DevicePartition]
 
+    /// What identifies this drive across unplugging and restarts (spec-tech-batch-7 §B), read by
+    /// `SalvageDiskIO` from DiskArbitration and IORegistry metadata only, never from the device's
+    /// bytes. Nil when the adapter couldn't read one (or for a value built without it).
+    public let stableIdentity: StableIdentity?
+
+    /// A drive's metadata-level identity. `mediaIdentity` changes on every attachment; this doesn't.
+    public struct StableIdentity: Equatable, Sendable, Codable {
+        /// The GPT disk GUID (uppercased), when the drive has a GUID partition table.
+        public let diskGUID: String?
+        /// For a drive without a GPT (an MBR drive, or one with no partition table), which has no disk
+        /// GUID: each volume's byte offset and the filesystem volume UUID macOS reports for it
+        /// (`DAVolumeUUID`), in offset order. Empty for a GPT drive.
+        public let volumes: [Volume]
+        public let sizeBytes: Int64
+        public let model: String?
+        /// The device's serial number, when its interface reports one (USB, NVMe, SATA).
+        public let serial: String?
+
+        public struct Volume: Equatable, Sendable, Codable {
+            public let offsetBytes: Int64
+            public let volumeUUID: String
+            public init(offsetBytes: Int64, volumeUUID: String) { self.offsetBytes = offsetBytes; self.volumeUUID = volumeUUID }
+        }
+
+        public init(diskGUID: String?, volumes: [Volume] = [], sizeBytes: Int64, model: String?, serial: String?) {
+            self.diskGUID = diskGUID; self.volumes = volumes; self.sizeBytes = sizeBytes
+            self.model = model; self.serial = serial
+        }
+    }
+
     public init(
         bsdName: String,
         displayName: String,
@@ -54,7 +84,8 @@ public struct BlockDevice: Identifiable, Equatable, Sendable {
         mediaIdentity: UInt64? = nil,
         encryptedVolumeUUID: String? = nil,
         encryptedVolumeName: String? = nil,
-        partitions: [DevicePartition] = []
+        partitions: [DevicePartition] = [],
+        stableIdentity: StableIdentity? = nil
     ) {
         self.bsdName = bsdName
         self.mediaIdentity = mediaIdentity
@@ -65,13 +96,15 @@ public struct BlockDevice: Identifiable, Equatable, Sendable {
         self.encryptedVolumeUUID = encryptedVolumeUUID
         self.encryptedVolumeName = encryptedVolumeName
         self.partitions = partitions
+        self.stableIdentity = stableIdentity
     }
 
     /// The same device, annotated with the encrypted volume that blocked part of its scan.
     public func requiringUnlock(volumeUUID: String, volumeName: String?) -> BlockDevice {
         BlockDevice(bsdName: bsdName, displayName: displayName, sizeBytes: sizeBytes, isInternal: isInternal,
                     isBootVolume: isBootVolume, mediaIdentity: mediaIdentity,
-                    encryptedVolumeUUID: volumeUUID, encryptedVolumeName: volumeName, partitions: partitions)
+                    encryptedVolumeUUID: volumeUUID, encryptedVolumeName: volumeName, partitions: partitions,
+                    stableIdentity: stableIdentity)
     }
 
     public var id: String { bsdName }

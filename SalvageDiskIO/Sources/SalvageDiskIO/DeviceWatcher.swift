@@ -337,7 +337,10 @@ final class DiskWatchRegistration: @unchecked Sendable {
     /// Picker's tree from it (`buildDeviceTree`): each physical drive or disk image with its
     /// partitions, APFS containers and volumes nested beneath it.
     fileprivate static func enumerateDevices(session: DASession, bootDisks: Set<String>) -> [BlockDevice] {
-        buildDeviceTree(readDiskDescriptions(session: session), bootDisks: bootDisks)
+        let descriptions = readDiskDescriptions(session: session)
+        // spec-tech-batch-7 §B: each drive's replug-stable identity, for reconnecting saved scans.
+        return StableDiskIdentity.annotate(buildDeviceTree(descriptions, bootDisks: bootDisks),
+                                           descriptions: descriptions, session: session)
     }
 
     /// Reads the descriptions `buildDeviceTree` needs. Whole disks are probed by name over the
