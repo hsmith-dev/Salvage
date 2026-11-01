@@ -28,6 +28,8 @@ struct RecoveredCopy: Sendable, Equatable {
     let bytes: Int64
     /// Lowercase hex SHA-256 of exactly the bytes written, computed while streaming.
     let sha256: String
+    /// The `RecoveredFile.id` this copy came from (pairs copies with files, e.g. in the report).
+    var fileID: UUID? = nil
 }
 
 /// One file that couldn't be recovered, and why.
@@ -47,7 +49,18 @@ struct RecoverySummary: Sendable, Equatable {
     /// Files never finished because the user cancelled (including the one in progress).
     let notAttempted: Int
     let cancelled: Bool
+    /// Extra files written into the root after the copies (the recovery report), in order.
+    var attachments: [URL] = []
+    /// Why an extra file couldn't be written; nil when all were (or none was asked for).
+    var attachmentFailure: String? = nil
     var bytesWritten: Int64 { written.reduce(0) { $0 + $1.bytes } }
+}
+
+/// A file written into the recovery root once the copies are done (the recovery report), with
+/// the same no-overwrite publishing and containment rules as a recovered file.
+struct RootAttachment: Sendable, Equatable {
+    let name: String
+    let data: Data
 }
 
 struct RecoveryProgress: Sendable, Equatable {
@@ -179,7 +192,10 @@ struct RecoveryEngine: Sendable {
     var sync: @Sendable (Int32) -> Int32? = { RecoveryEngine.durableSync($0) }
     var publishOps = PublishOps.live
 
+    /// `attachments`, when given, is called with the finished summary (also after a cancel) and
+    /// its files are written into the root folder last; see `writeAttachment`.
     func run(files: [RecoveredFile], rootName: String, in destination: URL, checked: DestinationAssessment,
+             attachments: (@Sendable (RecoverySummary) -> [RootAttachment])? = nil,
              progress: @Sendable (RecoveryProgress) -> Void) async -> Result<RecoverySummary, RecoveryStartError> {
         let destinationPath = destination.resolvingSymlinksInPath().path
         let destinationFD = open(destinationPath, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
@@ -238,8 +254,46 @@ struct RecoveryEngine: Sendable {
         state.currentName = nil
         progress(state)
         let notAttempted = files.count - written.count - failed.count
-        return .success(RecoverySummary(root: rootURL, selectedCount: files.count, written: written, failed: failed,
-                                        notAttempted: notAttempted, cancelled: cancelled))
+        var summary = RecoverySummary(root: rootURL, selectedCount: files.count, written: written, failed: failed,
+                                      notAttempted: notAttempted, cancelled: cancelled)
+        for attachment in attachments?(summary) ?? [] {
+            switch Self.writeAttachment(attachment, root: Root(fd: rootFD, id: rootID, path: rootPath), sync: sync, ops: publishOps) {
+            case .success(let url): summary.attachments.append(url)
+            case .failure(let error): summary.attachmentFailure = summary.attachmentFailure ?? Self.describe(errno: error.code)
+            }
+        }
+        return .success(summary)
+    }
+
+    /// Writes one attachment directly into the root folder: sanitized name, `O_EXCL | O_NOFOLLOW`
+    /// temporary file, durable sync, then `publish` (never replaces an existing file; a recovered
+    /// file that already took the name pushes the attachment to "name (2).ext"). The root is
+    /// confirmed by identity first, exactly like a recovered file's folder. Ignores cancellation:
+    /// a cancelled run still gets its record.
+    static func writeAttachment(_ attachment: RootAttachment, root: Root, sync: (Int32) -> Int32?,
+                                ops: PublishOps) -> Result<URL, Errno> {
+        let finalName = RecoveryPaths.sanitize(attachment.name)
+        guard RecoveryPaths.fitsPathLimit(RecoveryPaths.join(root.path, [finalName])) else {
+            return .failure(Errno(code: ENAMETOOLONG))
+        }
+        guard isInside(root.fd, root: root.id, maxLevels: 0) else { return .failure(Errno(code: EACCES)) }
+        let partialName = RecoveryPaths.partialName(for: finalName)
+        let fd = openat(root.fd, partialName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o644)
+        guard fd >= 0 else { return .failure(Errno(code: errno)) }
+        if let code = writeAll(attachment.data, to: fd) ?? sync(fd) {
+            close(fd); _ = unlinkat(root.fd, partialName, 0)
+            return .failure(Errno(code: code))
+        }
+        close(fd)
+        switch publish(partialName, as: finalName, in: root.fd, ops: ops,
+                       fits: { RecoveryPaths.fitsPathLimit(RecoveryPaths.join(root.path, [$0])) }) {
+        case .success(let name):
+            _ = fsync(root.fd)
+            return .success(URL(fileURLWithPath: root.path, isDirectory: true).appendingPathComponent(name, isDirectory: false))
+        case .failure(let error):
+            _ = unlinkat(root.fd, partialName, 0)
+            return .failure(error)
+        }
     }
 
     // MARK: One file
@@ -355,7 +409,7 @@ struct RecoveryEngine: Sendable {
             _ = fsync(dirFD)
             let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
             let url = URL(fileURLWithPath: dirPath, isDirectory: true).appendingPathComponent(name, isDirectory: false)
-            return .success(RecoveredCopy(sourcePath: file.path, url: url, bytes: total, sha256: digest))
+            return .success(RecoveredCopy(sourcePath: file.path, url: url, bytes: total, sha256: digest, fileID: file.id))
         case .failure(let error):
             discard(); return .failure(.destination(error.code))
         }
