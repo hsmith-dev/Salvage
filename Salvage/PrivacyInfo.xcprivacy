@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Salvage privacy manifest. It ships at Salvage.app/Contents/Resources/PrivacyInfo.xcprivacy and
+  covers everything inside the app bundle, including the embedded SalvageHelper (a bare executable
+  in Contents/MacOS with no bundle of its own) and the SalvageCore / SalvageDiskIO packages, which
+  are linked statically.
+
+  No tracking, no tracking domains, no collected data: Salvage has no analytics, no account and no
+  network code apart from the manual update check (docs/PRIVACY.md, scripts/check-no-network.sh).
+
+  Required-reason APIs actually used (keep in sync with the code; re-grep before each release):
+
+  - File timestamp APIs (stat / fstat / lstat):
+      Salvage/ViewModels/RecoveryCoordinator.swift (fstat of files it writes into the folder the
+      user chose), SalvageDiskIO ImageFileReader / DiskImageSource / ImageFileDestinationSafety
+      (stat/fstat of a disk image the user picked), RawBlockReader and HelperShared (fstat/lstat of
+      the device node the user picked, to confirm it is the expected character device).
+      Only st_dev / st_ino / st_rdev / st_mode / st_size are read, never timestamps, but the API is listed.
+      3B52.1: files and directories the user specifically granted access to.
+  - System boot time (kern.boottime, mach_absolute_time via DispatchTime):
+      Salvage/ViewModels/ScanArchive.swift (was a saved scan made in this boot?) and
+      SalvageHelper/main.swift (idle-exit timer).
+      35F9.1: measuring time elapsed between events within the app.
+  - Disk space (volumeAvailableCapacity*Key, statfs / fstatfs / getfsstat):
+      RecoveryCoordinator (free space on the recovery destination, shown to the user as a shortfall
+      warning before recovering) and SalvageDiskIO DestinationSafety / BootDiskSafety /
+      PrivilegedDiskQueries (which device a volume lives on).
+      E174.1: checking there is enough space before writing files.
+      85F4.1: showing disk-space information to the user.
+
+  Not used, so not declared: UserDefaults / @AppStorage, active keyboard APIs.
+-->
+<plist version="1.0">
+<dict>
+	<key>NSPrivacyTracking</key>
+	<false/>
+	<key>NSPrivacyTrackingDomains</key>
+	<array/>
+	<key>NSPrivacyCollectedDataTypes</key>
+	<array/>
+	<key>NSPrivacyAccessedAPITypes</key>
+	<array>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>3B52.1</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategorySystemBootTime</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>35F9.1</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryDiskSpace</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>E174.1</string>
+				<string>85F4.1</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>
