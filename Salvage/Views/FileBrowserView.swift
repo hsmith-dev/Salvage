@@ -66,6 +66,7 @@ struct FileBrowserView: View {
             .tint(.salvageAccent)
             .disabled(model.visibleCheckedCount == 0 || source == nil)
             .help(source == nil ? "The device is no longer available. Scan it again to recover files." : "")
+            .accessibilityIdentifier("recover-button")
         }
     }
 
@@ -147,6 +148,7 @@ struct FileBrowserView: View {
             }
         }
         .focused($tableFocused)
+        .accessibilityIdentifier("file-table")
         // Space previews, like Quick Look: it shows a hidden preview and never hides a shown one.
         .onKeyPress(.space) {
             guard !model.selection.isEmpty else { return .ignored }

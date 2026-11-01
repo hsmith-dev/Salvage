@@ -132,6 +132,24 @@ targets:
       - package: SalvageDiskIO
         product: SalvageDiskIO
 
+  # spec-tech-batch-5 §C: end-to-end UI tests. They launch the Debug app with
+  # `-SalvageUITestFixture <name>` (Salvage/Testing/UITestFixtures.swift, DEBUG only), which swaps
+  # the device watcher, scan runner and recovery destination for in-memory fakes: no real device is
+  # listed or read, and recovery writes only to a temporary folder the test creates.
+  SalvageUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - path: SalvageUITests
+    settings:
+      base:
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: Salvage
+    dependencies:
+      - target: Salvage
+
 schemes:
   Salvage:
     build:
@@ -144,6 +162,7 @@ schemes:
       config: Debug
       targets:
         - SalvageTests
+        - SalvageUITests
         - package: SalvageCore/SalvageCoreTests
         - package: SalvageDiskIO/SalvageDiskIOTests
     archive:

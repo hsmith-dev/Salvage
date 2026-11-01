@@ -48,6 +48,7 @@ struct ResultsDashboardView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(scan.device?.displayName ?? "Scan results").font(.largeTitle).bold()
                     Text(statusLine).foregroundStyle(.secondary)
+                        .accessibilityIdentifier("results-status")
                 }
                 if case .failed(let error) = scan.state {
                     VStack(alignment: .leading, spacing: 8) {
@@ -137,6 +138,7 @@ struct ResultsDashboardView: View {
         .disabled(bucket.count == 0)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(Self.tileAccessibilityLabel(bucket))
+        .accessibilityIdentifier("bucket-\(bucket.category.rawValue)")
     }
 
     private var statusLine: String {
