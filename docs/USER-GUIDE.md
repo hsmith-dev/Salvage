@@ -250,6 +250,35 @@ offered once per selection of the drive.
 
 Your password or recovery key is never saved. See [PRIVACY.md](PRIVACY.md#passwords-and-recovery-keys).
 
+## Save and reopen a scan
+
+A finished scan (or one you cancelled, or one that stopped early with files found) can be saved,
+so you can come back to its results without scanning again.
+
+- **Save Scan…** (⌘S, in the File menu or at the top of the results) saves a `.salvagescan` file
+  where you choose. The save panel says: "This file lists the names of the files Salvage found."
+  The file holds the file list, where each file's bytes are on the drive, the scan's notices and
+  lost partitions, and the drive's name, size and identity. Only your user account can read it.
+  It never holds a password, recovery key or decryption key.
+- **Open Scan…** (⇧⌘O) shows the saved results again. Until the drive is reconnected, the results
+  say "Reconnect <drive name> to preview or recover these files." and Preview and Recover are off.
+
+**Reconnecting.** When the same drive is attached, a **Reconnect** button appears next to that
+message. Salvage then opens the drive read-only, as a scan does (its volumes are unmounted), and
+checks it's the same drive before it reads any file from it: the same attachment, the same size,
+and the same partition layout as when it was scanned. If the layout is different, the results say
+the drive "has changed since this scan was saved", and Salvage won't read from it. Scan it again
+instead.
+
+Salvage recognises a drive by its current connection. If the drive was unplugged, or the Mac was
+restarted, since the scan, the saved scan can't be reconnected: scan the drive again.
+
+Files on encrypted (FileVault) volumes need the password again after reopening. Scan the drive
+again and unlock the volume to preview or recover them.
+
+A saved scan made by a different version of Salvage is refused: "This saved scan was made by a
+different version of Salvage and can't be opened here."
+
 ## Lost partitions
 
 Salvage also searches the drive's unallocated space, outside the current partition table, for

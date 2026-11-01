@@ -16,6 +16,7 @@ struct SalvageApp: App {
                 .environment(scanActivity)
         }
         .commands { UpdateCommands(checker: updates, activity: scanActivity) }
+        .commands { ScanArchiveCommands() }
 
         Window("Check for Updates", id: UpdateWindow.id) {
             UpdateWindow()

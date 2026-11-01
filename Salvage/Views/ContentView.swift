@@ -90,6 +90,7 @@ struct ContentView: View {
         .sheet(item: unlockRequest) { _ in FileVaultUnlockSheet(model: unlock) { device in startAfterPendingUnlock(device) } }
         // Every scan's encrypted volumes, each once per flow (queued by the model).
         .onChange(of: scan.endedAt) { _, ended in if ended != nil, !scan.isActive { unlock.offer(fromScan: scan.unlockRequests) } }
+        .focusedSceneValue(\.scanArchiveTarget, scan)
         .frame(minWidth: 760, minHeight: 480)
     }
 
