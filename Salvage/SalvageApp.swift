@@ -19,6 +19,7 @@ struct SalvageApp: App {
             UpdateCommands(checker: updates, activity: scanActivity)
             OpenImageCommand()
         }
+        .commands { ScanArchiveCommands() }
 
         Window("Check for Updates", id: UpdateWindow.id) {
             UpdateWindow()

@@ -299,3 +299,52 @@ The spec's sample High sentence ended "and wasn't overwritten". I didn't use tha
 - The Release build succeeded.
 - `SalvageUITests/RecoveryReportUITests` passed, 2 of 2.
 - **Interference:** while other agents' UI test runners were driving the screen, `testRecoveryWritesReportByDefaultAndOffersShowReport` failed three times. Once it couldn't find the hit point for the device row; twice the sheet's toggle didn't appear in time. Each time the other test passed in the same run. After those runners exited, the test passed alone and then both passed together. I also raised the toggle wait from 5 s to 15 s.
+
+## Implementation Notes — B
+
+**Format.** A `.salvagescan` package is a folder holding `Info.json` and `Files.bin` (`Salvage/ViewModels/ScanArchive.swift`).
+- `Info.json` holds the format name and version, the save date and app version, and the device identity: BSD name, model/display name, size, media identity (written as a string so all 64 bits survive) and the partition tree. It also holds the scan's newest `ScanCheckpoint` (offsets and sizes only; its `extents` are the fingerprint), the outcome (completed, cancelled, or failed with its `ScanError`), byte counts, start and end times, notices, lost partitions, the file count and the SHA-256 of `Files.bin`.
+- `Files.bin` starts with a magic and a version, then holds one record per `RecoveredFile` with every field: ID, name, path, size, date, flags, method, overwrite estimate, all source metadata (including `rawRecord`), and content (unmapped, resident, runs with holes, or encrypted runs with their data-unit numbers and volume UUID). It uses varints throughout. 100k files round-trip in about 1.4 s in a Debug build.
+- **Versioning.** The version in `Info.json` is checked before anything else is decoded, and `Files.bin` checks it again. Any version other than 1 is refused with "This saved scan was made by a different version of Salvage and can't be opened here." A folder that isn't a saved scan, or one whose file list fails its checksum, count or bounds checks, is refused plainly. Truncated or hostile lists throw rather than crash or over-allocate.
+- Saving builds the package in a hidden sibling folder and then moves or replaces it into place. Permissions are 0700 on the folder and 0600 on its files.
+
+**No credentials or keys.** `ScanViewModel.makeArchive()` reads only `files`, `lostPartitions`, `notices`, `latestCheckpoint`, the device and timing. It never reads `source` (whose decryptors hold volume keys) or a run's credentials. `archiveHoldsNoCredentialsOrKeys` runs a scan through the view model with a password and a recovery key, keeps a session with a decryptor holding known key bytes, saves, and then greps every byte of the package for each secret: raw, UTF-16, hex (both cases), base64, each key half, and the recovery key without hyphens. Encrypted files are saved as ciphertext runs plus the volume UUID, so they need the password again: the banner says to scan again and unlock. There is no in-place unlock for a reopened scan.
+
+**Reconnecting** (`ScanViewModel.reconnect`, `SavedScanBanner`):
+1. A reopened scan has no source, so Preview and Recover are off. The banner (stacked above the results content in `ResultsView`, so it shows on the dashboard and in the browser) says "Reconnect <device name> to preview or recover these files."
+2. The banner watches the attached devices. A device whose media identity and size match (and which is not the boot volume) gets a **Reconnect** button. Nothing is opened before then.
+3. On Reconnect, the device is opened read-only, the same way a scan opens it (`RawBlockReader.prepare`, which unmounts it). This is why reconnecting is a click rather than automatic. Its extent fingerprint is then read fresh by the new public `SalvageCore/ExtentFingerprint.swift`, which runs the same `VolumeDiscovery` the scan uses.
+4. Only an exact fingerprint match adopts the session. A mismatch closes the session at once and shows "<device> has changed since this scan was saved, so Salvage won't read from it."
+5. A saved scan with no checkpoint (stopped before mapping) can never be reconnected.
+6. Each reopening carries a token, so a reconnect that finishes after another scan or saved scan replaced it is closed and dropped.
+
+**Privacy warning.** It appears once, in the save panel's message ("This file lists the names of the files Salvage found."), and is defined once as `ScanArchive.privacyNotice`. The package stores what the spec asks for ("every `RecoveredFile`"). Besides names and paths, that includes `rawRecord` (metadata record bytes; for carved files, their first 64 bytes) and NTFS resident data (the contents of very small files). The warning mentions only names. A reviewer may want the wording widened or those fields dropped.
+
+**Commands.** File → **Open Scan…** (⇧⌘O) and **Save Scan…** (⌘S) live in `Salvage/Views/ScanArchiveCommands.swift`, reaching the window's scan through `focusedSceneValue`. The dashboard also has a **Save Scan…** button.
+- Without a UTI declaration (that would need an Info.plist entry in `project.yml`, which this item doesn't own), macOS treats the package as an ordinary folder. The open panel therefore allows choosing folders and validates the `.salvagescan` extension.
+- Declaring `UTExportedTypeDeclarations` later would make Finder show it as one file.
+
+**Edits outside B's listed files (all minimal and additive):**
+- `SalvageApp.swift`: a second `.commands { ScanArchiveCommands() }` line.
+- `ContentView.swift`: one `.focusedSceneValue` line.
+- `UITestFixtures.swift`: the fixture drive gets a `mediaIdentity`, without which nothing can match it.
+- New Core file `ExtentFingerprint.swift` plus `ExtentFingerprintTests.swift`.
+- `docs/USER-GUIDE.md`: a new section, "Save and reopen a scan".
+- `Salvage.xcodeproj` regenerated.
+
+**Known limitation (important).** `BlockDevice.mediaIdentity` is the IORegistry entry ID. It is stable only while the drive stays attached during one boot; unplugging the drive or restarting the Mac gives it a new ID. Because identity matching is mandatory, a saved scan reconnects only while the drive has stayed connected, for example after quitting and reopening Salvage. After a replug it is refused, safely, and the user must scan again. Making the "rescan takes hours" case work across replugs needs a stable identity, such as a disk or partition-table UUID or a media serial number, from SalvageDiskIO. That is a decision for the spec owner.
+
+**Tests.**
+- `SalvageTests/ScanArchiveTests.swift` (14 tests): 100k-file round trip; every outcome and notice; version rejection in JSON and binary; damaged and foreign packages and truncation; no key material; reopened state; reconnecting the same device; refusing another identity, a missing identity, another size or a boot volume without opening it; refusing a changed layout and closing its session; a scan without a checkpoint; a failed open; a real `ScanSession` scan saved, reopened and reconnected end to end; reconnects superseded by a new archive or scan; the privacy sentence.
+- `SalvageCore/Tests/SalvageCoreTests/ExtentFingerprintTests.swift` (2 tests): the fingerprint equals the scan-recorded checkpoint extents, and it changes with the layout.
+- `SalvageUITests/ScanArchiveUITests.swift`: scan, then Save Scan…, then relaunch and Open Scan… from the File menu. Then: reconnect message and 5 items shown, Recover disabled, click Reconnect, Recover enabled, recover all 5 files and check them byte for byte. The DEBUG `-SalvageUITestArchive <path>` argument (honored only with a UI-test fixture) replaces both panels, so the UI test does not see the save panel's warning text.
+
+**Verification.**
+- `swift test`: SalvageCore passed (412 tests, including the 2 new ones). SalvageDiskIO passed (168 tests).
+- `check-core-boundary`, `check-no-network` and `check-xcodeproj-sync` all passed.
+- The Debug `SalvageTests` run passed (194 tests, including the 14 new ones).
+- The Release build succeeded.
+- The UI test `ScanArchiveUITests` passed on its final run (21.7 s), with no other Salvage instance or test runner running. It failed in eight earlier runs; the failures had two causes.
+  - **Interference.** Four failures came from other agents' Salvage UI tests running at the same time. Every worktree builds the same bundle ID, so concurrent runs launch and terminate each other's apps and windows. Another session's Xcode also held the foreground throughout.
+  - **A real bug.** Run 1 and the runs from the gated retry onward also failed at Reconnect. That was a bug of mine: the banner was first a top `safeAreaInset`, which pushed the File Browser's header and the Reconnect button out of the window (the button's frame was about 280 pt above the window). It is now a plain `VStack` row, and the test asserts the button is hittable.
+  - The test re-activates Salvage before clicks and presses Reconnect a second time if the first click was lost. A second press is harmless.

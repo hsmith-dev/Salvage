@@ -12,6 +12,8 @@ struct ResultsView: View {
     @State private var partitionPlan: PartitionRecoveryPlan?
 
     var body: some View {
+        VStack(spacing: 0) {
+        SavedScanBanner(scan: scan)
         Group {
             if let model {
                 if browsing {
@@ -35,6 +37,8 @@ struct ResultsView: View {
             } else {
                 ProgressView("Organizing results…").frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+        }
+        .frame(maxHeight: .infinity)
         }
         .task { if model == nil { model = await ResultsViewModel.build(files: scan.files, lostPartitions: scan.lostPartitions) } }
         .onChange(of: partitionRequest.wrappedValue) { _, _ in takePartitionRequest() }
@@ -76,6 +80,7 @@ struct ResultsDashboardView: View {
                     Text(statusLine).foregroundStyle(.secondary)
                         .accessibilityIdentifier("results-status")
                 }
+                Button("Save Scan…") { ScanArchiveActions.save(scan) }.disabled(!scan.canSaveArchive).accessibilityIdentifier("save-scan")
                 if case .failed(let error) = scan.state {
                     VStack(alignment: .leading, spacing: 8) {
                         Text(error.description).textSelection(.enabled)

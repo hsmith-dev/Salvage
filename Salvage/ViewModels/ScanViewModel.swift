@@ -68,6 +68,8 @@ final class ScanViewModel {
     private let runner: Runner
     private let now: () -> Date
     private let checkpointStore: ScanCheckpointStore?
+    /// spec-tech-batch-7 §B: set while the results on screen came from a saved scan (`openArchive`).
+    private(set) var reopened: ReopenedScan?
 
     init(runner: @escaping Runner, now: @escaping () -> Date = { Date() }, checkpointStore: ScanCheckpointStore? = nil) {
         self.runner = runner; self.now = now; self.checkpointStore = checkpointStore
@@ -141,6 +143,7 @@ final class ScanViewModel {
         pausedAt = nil; pausedTotal = 0; latestCheckpoint = nil; lastCheckpointSave = nil
         pendingCheckpoint = nil; resumedFromCheckpoint = false; canRetryFromCheckpoint = false
         requestedResume = false; stopReason = nil
+        reopened = nil
     }
 
     /// Closes the kept source session (e.g. leaving results, or before scanning again).
@@ -270,6 +273,102 @@ final class ScanViewModel {
         guard let checkpointStore else { return }
         checkpointStore.save(checkpoint, for: device)
         lastCheckpointSave = now()
+    }
+
+    // MARK: Saved scans (spec-tech-batch-7 §B)
+
+    /// A saved scan on screen. `token` tells one opening from the next, so a reconnect that
+    /// finishes after another scan or saved scan replaced it is dropped.
+    struct ReopenedScan: Equatable {
+        enum Status: Equatable {
+            /// No source yet: "Reconnect <device> to preview or recover these files."
+            case waiting
+            /// Opening a matching device and reading its fingerprint.
+            case checking
+            /// A device with the saved identity and size has a different layout; it is never read from.
+            case changed
+            /// The scan was saved before the device was mapped, so no device can be verified.
+            case unverifiable
+            case connected
+        }
+        let token = UUID()
+        let fingerprint: [ScanCheckpoint.Extent]?
+        let hasEncryptedFiles: Bool
+        var status: Status
+    }
+
+    /// Why `reconnect` did or didn't adopt a device.
+    enum ReconnectResult: Equatable { case connected, notThisDevice, changed, unverifiable, unavailable, superseded }
+
+    var canSaveArchive: Bool {
+        !isActive && device != nil && ResultsViewModel.showsResults(state: state, isActive: isActive, fileCount: files.count)
+    }
+
+    /// The finished scan's results as a saved scan. It never takes anything from `source` (whose
+    /// decryptors hold volume keys) or from a run's credentials.
+    func makeArchive(savedAt: Date = Date()) -> ScanArchive? {
+        guard canSaveArchive, let device else { return nil }
+        let outcome: ScanArchive.Outcome
+        switch state {
+        case .completed: outcome = .completed
+        case .cancelled: outcome = .cancelled
+        case .failed(let error): outcome = .failed(error)
+        default: return nil
+        }
+        return ScanArchive(device: device, files: files, lostPartitions: lostPartitions, notices: notices,
+                           checkpoint: latestCheckpoint, outcome: outcome, bytesScanned: bytesScanned,
+                           totalBytes: totalBytes, startedAt: startedAt, endedAt: endedAt, savedAt: savedAt)
+    }
+
+    /// Shows a saved scan's results with no source session. Preview and recovery stay off until
+    /// `reconnect` adopts the same device.
+    func openArchive(_ archive: ScanArchive) {
+        guard !isActive else { return }
+        releaseSource()
+        reset(for: archive.device)
+        files = archive.files
+        lostPartitions = archive.lostPartitions
+        notices = archive.notices
+        latestCheckpoint = archive.checkpoint
+        bytesScanned = archive.bytesScanned; totalBytes = archive.totalBytes
+        startedAt = archive.startedAt
+        endedAt = archive.endedAt ?? archive.savedAt
+        switch archive.outcome {
+        case .completed: state = .completed
+        case .cancelled: state = .cancelled
+        case .failed(let error): state = .failed(error)
+        }
+        reopened = ReopenedScan(fingerprint: archive.fingerprint, hasEncryptedFiles: archive.hasEncryptedFiles,
+                                status: archive.fingerprint == nil ? .unverifiable : .waiting)
+    }
+
+    /// Adopts `candidate` as the reopened scan's source, only when it is the same device: its media
+    /// identity and size are checked before it is opened, and its freshly read extent fingerprint
+    /// must equal the saved one before the session is kept. A device that fails either check is
+    /// never read from for preview or recovery.
+    func reconnect(_ candidate: BlockDevice, open: @Sendable (BlockDevice) async throws -> SourceSession) async -> ReconnectResult {
+        guard let reopened, source == nil, !isActive, let device else { return .superseded }
+        guard ScanArchive.admits(candidate, for: device) else { return .notThisDevice }
+        guard let expected = reopened.fingerprint else { return .unverifiable }
+        guard reopened.status != .checking else { return .superseded }
+        let token = reopened.token
+        self.reopened?.status = .checking
+        let session: SourceSession
+        do { session = try await open(candidate) } catch {
+            if self.reopened?.token == token { self.reopened?.status = .waiting }
+            return .unavailable
+        }
+        guard self.reopened?.token == token else { await session.close(); return .superseded }
+        let fresh = try? await ExtentFingerprint.of(session.reader)
+        guard self.reopened?.token == token, source == nil, !isActive else { await session.close(); return .superseded }
+        guard let fresh, fresh == expected else {
+            await session.close()
+            if self.reopened?.token == token { self.reopened?.status = fresh == nil ? .waiting : .changed }
+            return fresh == nil ? .unavailable : .changed
+        }
+        source = session
+        self.reopened?.status = .connected
+        return .connected
     }
 
     var sourceVolumeLabels: [Int64: String] { Self.volumeLabels(for: files) }

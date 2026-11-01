@@ -49,6 +49,7 @@ struct UITestFixture: Sendable {
                                        partitions: [DevicePartition(bsdName: "disk990s1", displayName: "Macintosh HD",
                                                                     sizeBytes: 499_000_000_000, formatName: "APFS")])
     static let lockedVolumeUUID = "5A1A6E00-F1C7-4E5A-9C0D-0000000000F1"
+    static let fixtureDriveIdentity: UInt64 = 0x5A17_0991
 
     /// The fixture launched with, if any; parsed once from the process arguments.
     static let active: UITestFixture? = UITestFixture(arguments: ProcessInfo.processInfo.arguments)
@@ -72,7 +73,9 @@ struct UITestFixture: Sendable {
         image = ExFATFixtureImage.build(files: files, sizeBytes: size)
         let partition = DevicePartition(bsdName: "disk991s1", displayName: "FIXTURE", sizeBytes: Int64(size), formatName: "exFAT")
         fixtureDrive = BlockDevice(bsdName: "disk991", displayName: "Salvage Fixture Drive", sizeBytes: Int64(size),
-                                   isInternal: false, isBootVolume: false, partitions: [partition])
+                                   isInternal: false, isBootVolume: false,
+                                   mediaIdentity: Self.fixtureDriveIdentity, // a saved scan reconnects by it (batch 7 §B)
+                                   partitions: [partition])
         lockedDrive = BlockDevice(bsdName: "disk992", displayName: "Locked Fixture Drive", sizeBytes: Int64(size),
                                   isInternal: false, isBootVolume: false,
                                   encryptedVolumeUUID: Self.lockedVolumeUUID, encryptedVolumeName: "Fixture Vault",
