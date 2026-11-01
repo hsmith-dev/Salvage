@@ -195,7 +195,7 @@ struct LostPartitionTests {
     }
 
     @Test func damagedLostPartitionStopsOnlyItsOwnParser() async {
-        var damaged = exfatImage(); damaged[25 * 512 + 66] ^= 1   // corrupt entry-set checksum
+        var damaged = exfatImage(); damaged.put(25 * 512 + 120, 14, 8)   // invalid allocation bitmap length
         let known = exfatImage()
         let events = await scan(device(size: 4 * mib, [(mib, damaged), (2 * mib, known)], mbr: [(2 * mib / 512, known.count / 512)]))
         #expect(lost(events).map(\.offset) == [Int64(mib)])

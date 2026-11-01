@@ -16,7 +16,21 @@ actor FATVolume {
     var visitedDirectories: Set<UInt32> = []
     var fatPageOffset: Int64 = -1
     var fatPage = Data()
-    var owners: [UInt32: String] = [:]
+    /// Cluster -> index into `ownerList` of the file, directory or metadata that claimed it.
+    var owners: [UInt32: Int] = [:]
+    var ownerList: [Owner] = []
+    /// Clusters chained past a file's declared size. They carry none of its bytes, so they are not
+    /// claimed; they are remembered only as evidence when they run into another file's clusters.
+    var tailOwners: [UInt32: Int] = [:]
+    /// Owners already recorded in `skipped` (skipped themselves, or flagged as suspect).
+    var flagged: Set<Int> = []
+    /// Per-file damage found on this volume, in discovery order, capped at `maxSkippedRecords`.
+    /// Each entry is either a file or directory subtree that was skipped (never emitted), or an
+    /// already-emitted file flagged suspect by a later cross-link (its reason says so).
+    private(set) var skipped: [(path: String, reason: String)] = []
+    /// Total number of skip records, including those past the `skipped` cap.
+    private(set) var skippedCount = 0
+    static let maxSkippedRecords = 1000
     var activeFat: UInt8 = 0
     var bitmapClusters: [UInt32] = []
     var bitmapLength: Int64 = 0
@@ -45,7 +59,33 @@ actor FATVolume {
         guard data.count == count else { throw ScanError.malformed("Truncated structure.") }
         return data
     }
+    struct Owner { let path: String; let isFile: Bool }
+    /// Damage confined to one file, directory subtree or entry: it is skipped and the scan goes on.
+    /// Thrown only by per-file checks; anything that escapes to `scan()` (the root directory, the
+    /// allocation bitmap, the up-case table) is structural and becomes `ScanError.malformed`.
+    struct FileDamage: Error { let reason: String; init(_ reason: String) { self.reason = reason } }
+
     func scan() async throws {
+        do { try await traverse() } catch let damage as FileDamage { throw ScanError.malformed(damage.reason) }
+    }
+    func newOwner(_ path: String, isFile: Bool) -> Int {
+        ownerList.append(Owner(path: path, isFile: isFile)); return ownerList.count - 1
+    }
+    func record(_ path: String, _ reason: String) {
+        skippedCount += 1
+        if skipped.count < Self.maxSkippedRecords { skipped.append((path: path, reason: reason)) }
+    }
+    /// Records a file that is not emitted.
+    func skipFile(_ owner: Int, _ reason: String) {
+        flagged.insert(owner); record(ownerList[owner].path, reason)
+    }
+    /// Records an already-emitted file that a later file's allocation casts doubt on (once per file).
+    func flagSuspect(_ owner: Int, _ reason: String) {
+        guard ownerList[owner].isFile, flagged.insert(owner).inserted else { return }
+        record(ownerList[owner].path, reason)
+    }
+    func unnamed(_ path: String, _ location: Int64) -> String { "\(path)/<entry at byte \(location)>" }
+    func traverse() async throws {
         let b = try await read(0, 512)
         guard try b.number(510, 2) == 0xaa55 else { throw ScanError.malformed("Missing boot signature.") }
         exfat = String(decoding: b[3..<11], as: UTF8.self) == "EXFAT   "
@@ -58,12 +98,21 @@ actor FATVolume {
         try validCluster(root)
         deletedLookupBudget = 4 * clusterCount + 1_000_000
         if exfat { try await loadBitmap() }
-        var pending: [(UInt32, String, Int64?, Bool)] = [(root, "", nil, false)]
+        // The root directory's chain is structural: any damage to it fails the volume.
+        visitedDirectories.insert(root)
+        try await validateFile(root, length: 1, contiguous: false, owner: newOwner("/", isFile: false), wholeChain: true)
+        var pending = try await directory(root, path: "", length: nil, contiguous: false)
         while let (cluster, path, length, contiguous) = pending.popLast() {
-            guard visitedDirectories.insert(cluster).inserted else { throw ScanError.malformed("Directory cycle or shared directory.") }
-            try await validateFile(cluster, length: length ?? 1, contiguous: contiguous, owner: "directory:\(cluster)")
-            let children = try await directory(cluster, path: path, length: length, contiguous: contiguous)
-            pending.append(contentsOf: children)
+            // A damaged subdirectory is skipped with its whole subtree. Its chain is validated and
+            // claimed before any entry is read, so nothing in it has been emitted yet.
+            do {
+                guard visitedDirectories.insert(cluster).inserted else { throw FileDamage("Directory cycle or shared directory.") }
+                let owner = newOwner(path, isFile: false)
+                try await validateFile(cluster, length: length ?? 1, contiguous: contiguous, owner: owner, wholeChain: length == nil)
+                pending.append(contentsOf: try await directory(cluster, path: path, length: length, contiguous: contiguous))
+            } catch let damage as FileDamage {
+                record(path, "Directory skipped with its contents: \(damage.reason)")
+            }
         }
         // Deleted files are emitted only after the live traversal, once overlaps are known.
         for file in Self.withoutOverlaps(deletedCandidates) {
@@ -177,7 +226,8 @@ actor FATVolume {
         guard Int64(bitmapClusters.count) == (bitmapLength - 1) / clusterBytes + 1 else {
             throw ScanError.malformed("Truncated allocation bitmap.")
         }
-        for cluster in bitmapClusters { try await claim(cluster, owner: "allocation bitmap") }
+        let bitmapOwner = newOwner("allocation bitmap", isFile: false)
+        for cluster in bitmapClusters { try await claim(cluster, owner: bitmapOwner) }
         // The up-case table is FAT-chained metadata like the bitmap; claiming it makes a file
         // chain that overlaps it a detected cross-link instead of silently shared clusters.
         if let upcase {
@@ -195,18 +245,41 @@ actor FATVolume {
                 current = try await next(cluster)
             }
             guard Int64(clusters.count) == required else { throw ScanError.malformed("Truncated up-case table.") }
-            for cluster in clusters { try await claim(cluster, owner: "up-case table") }
+            let upcaseOwner = newOwner("up-case table", isFile: false)
+            for cluster in clusters { try await claim(cluster, owner: upcaseOwner) }
         }
     }
-    func claim(_ cluster: UInt32, owner: String) async throws {
+    /// Claims `cluster` for `owner`. A cluster already owned by someone else is a cross-link: the
+    /// claimant (always the later of the two) is damaged, and the earlier owner, already emitted
+    /// if it is a file, is flagged suspect since either of them may hold the other's data.
+    func claim(_ cluster: UInt32, owner: Int) async throws {
         try validCluster(cluster)
-        if let previous = owners[cluster], previous != owner { throw ScanError.malformed("Cross-linked allocations.") }
+        if let previous = owners[cluster], previous != owner {
+            flagSuspect(previous, "Recovered before a cross-link with \(ownerList[owner].path) was found; its content may belong to the other file.")
+            throw FileDamage("Cross-linked allocations with \(ownerList[previous].path).")
+        }
         if exfat {
             guard try await allocatedInBitmap(cluster) else {
-                throw ScanError.malformed("Live entry references a free allocation cluster.")
+                throw FileDamage("Live entry references a free allocation cluster.")
             }
         }
+        if let tail = tailOwners[cluster], tail != owner {
+            flagSuspect(tail, "Its allocation chain runs past its size into \(ownerList[owner].path); its content may be wrong.")
+        }
         owners[cluster] = owner
+    }
+    /// Notes a cluster chained past a file's size. Returns false when the walk should stop: the
+    /// rest of the chain was already walked, as another file's clusters or another file's tail.
+    func noteTail(_ cluster: UInt32, owner: Int) -> Bool {
+        if let previous = owners[cluster] {
+            if previous != owner {
+                flagSuspect(previous, "A later file's allocation chain (\(ownerList[owner].path)) runs past its size into this file's clusters; its content may be wrong.")
+            }
+            return false
+        }
+        if let previous = tailOwners[cluster], previous != owner { return false }
+        tailOwners[cluster] = owner
+        return true
     }
     /// The active exFAT allocation bitmap's bit for `cluster`, read through a bounded page cache.
     func allocatedInBitmap(_ cluster: UInt32) async throws -> Bool {
@@ -223,7 +296,7 @@ actor FATVolume {
         return bitmapPage[Int(within - page)] & (UInt8(1) << UInt8(index % 8)) != 0
     }
     func validCluster(_ cluster: UInt32) throws {
-        guard cluster >= 2, cluster < (exfat ? 0xfffffff7 : 0x0ffffff0), Int64(cluster) - 2 < clusterCount else { throw ScanError.malformed("Invalid cluster.") }
+        guard cluster >= 2, cluster < (exfat ? 0xfffffff7 : 0x0ffffff0), Int64(cluster) - 2 < clusterCount else { throw FileDamage("Invalid cluster.") }
     }
     func clusterOffset(_ cluster: UInt32) throws -> Int64 {
         try validCluster(cluster)
@@ -248,15 +321,17 @@ actor FATVolume {
         return UInt32(try fatPage.number(Int(position - pageOffset), 4)) & (exfat ? 0xffffffff : 0x0fffffff)
     }
     /// Claims the allocation and returns the device-absolute runs of the clusters holding its first
-    /// `length` bytes, in file order with physically adjacent clusters coalesced.
+    /// `length` bytes, in file order with physically adjacent clusters coalesced. The whole chain is
+    /// validated before anything is returned, so a damaged file is never emitted. Only clusters
+    /// within the size are claimed, unless `wholeChain` (a FAT32 directory, which has no size).
     @discardableResult
-    func validateFile(_ cluster: UInt32, length: Int64, contiguous: Bool, owner: String) async throws -> [DataRun] {
+    func validateFile(_ cluster: UInt32, length: Int64, contiguous: Bool, owner: Int, wholeChain: Bool = false) async throws -> [DataRun] {
         if length == 0 { return [] }
         try validCluster(cluster)
         let required = (length - 1) / clusterBytes + 1
-        guard required <= clusterCount else { throw ScanError.malformed("File exceeds volume.") }
+        guard required <= clusterCount else { throw FileDamage("File exceeds volume.") }
         if contiguous {
-            guard Int64(cluster) - 2 <= clusterCount - required else { throw ScanError.malformed("Contiguous file exceeds volume.") }
+            guard Int64(cluster) - 2 <= clusterCount - required else { throw FileDamage("Contiguous file exceeds volume.") }
             for offset in 0..<required { try await claim(cluster + UInt32(offset), owner: owner) }
             return try contiguousRuns(from: cluster, count: required)
         }
@@ -265,14 +340,19 @@ actor FATVolume {
         var runs: [DataRun] = []
         while let value = current {
             try Task.checkCancellation()
-            guard seen.insert(value).inserted, count < clusterCount else { throw ScanError.malformed("Allocation cycle.") }
-            try await claim(value, owner: owner)
-            // Clusters chained past the file's size are claimed but carry none of its bytes.
-            if count < required { try appendCluster(value, to: &runs) }
+            guard seen.insert(value).inserted, count < clusterCount else { throw FileDamage("Allocation cycle.") }
+            if count < required || wholeChain {
+                try await claim(value, owner: owner)
+                if count < required { try appendCluster(value, to: &runs) }
+            } else if !noteTail(value, owner: owner) {
+                // Clusters chained past the size carry none of the file's bytes; a collision there
+                // is evidence against the other file, not an error for this one.
+                break
+            }
             count += 1
             current = try await next(value)
         }
-        guard count >= required else { throw ScanError.malformed("Truncated file allocation.") }
+        guard count >= required else { throw FileDamage("Truncated file allocation.") }
         return runs
     }
 
@@ -312,15 +392,19 @@ actor FATVolume {
         if sizeBytes > validBytes { result.append(DataRun(deviceOffset: nil, length: sizeBytes - validBytes)) }
         return .runs(result)
     }
+    /// Reads one directory, emitting its live files and returning its subdirectories. Damage to a
+    /// single entry (a bad entry set, an orphaned long name, an unreadable name, a damaged file
+    /// chain) is recorded in `skipped` and the entry dropped; the rest of the directory is still read.
     func directory(_ first: UInt32, path: String, length: Int64?, contiguous: Bool) async throws -> [(UInt32, String, Int64?, Bool)] {
         var current: UInt32? = first, seen: Set<UInt32> = []
         var children: [(UInt32, String, Int64?, Bool)] = []
-        var lfn: [Data] = [], entries: [Data] = [], entryOffset: Int64 = 0
+        var lfn: [Data] = [], lfnOffset: Int64 = 0, entries: [Data] = [], entryOffset: Int64 = 0
         // Deleted metadata is collected separately: it is validated per entry and never aborts the scan.
         var deletedLfn: [Data] = [], deletedSet: [Data] = [], deletedOffset: Int64 = 0
         var bytes: Int64 = 0
+        func orphaned(_ long: [Data]) -> String { lfnName(long).map { path + "/" + $0 } ?? unnamed(path, lfnOffset) }
         while let cluster = current {
-            guard seen.insert(cluster).inserted, Int64(seen.count) <= clusterCount else { throw ScanError.malformed("Directory allocation cycle.") }
+            guard seen.insert(cluster).inserted, Int64(seen.count) <= clusterCount else { throw FileDamage("Directory allocation cycle.") }
             let offset = try clusterOffset(cluster)
             // Read directories in bounded chunks, even when exFAT clusters are large.
             var within: Int64 = 0
@@ -334,8 +418,8 @@ actor FATVolume {
                     bytes += 32
                     let type = entry[0]
                     if type == 0 {
-                        guard entries.isEmpty else { throw ScanError.malformed("Truncated exFAT entry set.") }
-                        guard lfn.isEmpty else { throw ScanError.malformed("Unterminated long filename entries.") }
+                        if !entries.isEmpty { record(unnamed(path, entryOffset), "Truncated exFAT entry set.") }
+                        if !lfn.isEmpty { record(orphaned(lfn), "Orphaned long filename entries.") }
                         return children
                     }
                     if exfat {
@@ -353,6 +437,12 @@ actor FATVolume {
                             // drop it and process this entry normally.
                             deletedSet = []
                         }
+                        // Anything but an in-use secondary ends a live set early: drop the set and
+                        // process this entry on its own, so a short set can't swallow its neighbours.
+                        if !entries.isEmpty && type & 0xc0 != 0xc0 {
+                            record(unnamed(path, entryOffset), "Truncated exFAT entry set.")
+                            entries = []
+                        }
                         if !entries.isEmpty {
                             entries.append(entry)
                             let needed = Int(entries[0][1]) + 1
@@ -361,12 +451,15 @@ actor FATVolume {
                                 entries = []
                             }
                         } else if type == 0x85 {
-                            guard entry[1] >= 2 else { throw ScanError.malformed("Missing exFAT secondary entries.") }
-                            entries = [entry]; entryOffset = location
+                            if entry[1] >= 2 { entries = [entry]; entryOffset = location }
+                            else { record(unnamed(path, location), "Missing exFAT secondary entries.") }
                         } else if type == 0x05 {
                             if entry[1] >= 2 { deletedSet = [entry]; deletedOffset = location }
+                        } else if type & 0xc0 == 0xc0 {
+                            // A secondary with no primary: the primary that owned it was damaged
+                            // (and recorded) or overwritten. There is nothing to recover from it.
                         } else if type & 0x80 != 0 && type & 0x20 == 0 && ![0x81,0x82,0x83].contains(type) {
-                            throw ScanError.malformed("Unsupported critical exFAT entry.")
+                            record(unnamed(path, location), "Unsupported critical exFAT entry.")
                         }
                     } else {
                         // Deleted (0xE5) slots reset any live run without error: deleted LFN slots
@@ -382,26 +475,38 @@ actor FATVolume {
                             continue
                         }
                         deletedLfn = []
-                        if entry[11] == 0x0f { lfn.append(entry); if lfn.count > 20 { lfn = [] }; continue }
+                        if entry[11] == 0x0f {
+                            if lfn.isEmpty { lfnOffset = location }
+                            lfn.append(entry); if lfn.count > 20 { lfn = [] }
+                            continue
+                        }
                         defer { lfn = [] }
                         // A live LFN run must be owned by a live short entry, never a volume label or dot entry.
                         if entry[11] & 8 != 0 {
-                            guard lfn.isEmpty else { throw ScanError.malformed("Orphaned long filename entries.") }
+                            if !lfn.isEmpty { record(orphaned(lfn), "Orphaned long filename entries.") }
                             continue
                         }
-                        let name = fatName(entry, long: lfn)
+                        var name = fatName(entry, long: lfn)
                         if name == "." || name == ".." {
-                            guard lfn.isEmpty else { throw ScanError.malformed("Orphaned long filename entries.") }
+                            if !lfn.isEmpty { record(orphaned(lfn), "Orphaned long filename entries.") }
                             continue
                         }
-                        try validName(name)
+                        // An unusable long name falls back to the 8.3 name; with neither, the entry is skipped.
+                        if (try? validName(name)) == nil { name = shortName(entry) }
+                        guard (try? validName(name)) != nil else {
+                            record(unnamed(path, location), "Invalid filename."); continue
+                        }
                         let cluster = UInt32(try entry.number(20, 2)) << 16 | UInt32(try entry.number(26, 2))
                         let size = try signed(entry.number(28, 4))
                         let fullPath = path + "/" + name
                         if entry[11] & 0x10 != 0 {
-                            try validCluster(cluster); children.append((cluster, fullPath, nil, false))
+                            // The first cluster is validated (and the subtree skipped if bad) when it is read.
+                            children.append((cluster, fullPath, nil, false))
                         } else {
-                            let runs = try await validateFile(cluster, length: size, contiguous: false, owner: "file:\(location)")
+                            let owner = newOwner(fullPath, isFile: true)
+                            let runs: [DataRun]
+                            do { runs = try await validateFile(cluster, length: size, contiguous: false, owner: owner) }
+                            catch let damage as FileDamage { skipFile(owner, damage.reason); continue }
                             try await emit(RecoveredFile(name: name, path: fullPath, sizeBytes: size,
                                 modified: Self.fatTimestamp(entry, localZone: localTimeZone),
                                 sourceMetadata: SourceMetadata(filesystem: .fat32, volumeOffset: extent.offset,
@@ -415,20 +520,20 @@ actor FATVolume {
             }
             if let length, bytes >= length { current = nil }
             else if contiguous {
-                guard length != nil else { throw ScanError.malformed("Contiguous directory has no length.") }
+                guard length != nil else { throw FileDamage("Contiguous directory has no length.") }
                 let (following, overflow) = cluster.addingReportingOverflow(1)
-                guard !overflow else { throw ScanError.malformed("Cluster overflow.") }
+                guard !overflow else { throw FileDamage("Cluster overflow.") }
                 try validCluster(following); current = following
             } else { current = try await next(cluster) }
         }
-        guard entries.isEmpty else { throw ScanError.malformed("Truncated exFAT entry set.") }
-        guard lfn.isEmpty else { throw ScanError.malformed("Unterminated long filename entries.") }
-        if let length, bytes < length { throw ScanError.malformed("Truncated directory allocation.") }
+        if !entries.isEmpty { record(unnamed(path, entryOffset), "Truncated exFAT entry set.") }
+        if !lfn.isEmpty { record(orphaned(lfn), "Orphaned long filename entries.") }
+        if let length, bytes < length { throw FileDamage("Truncated directory allocation.") }
         return children
     }
     func validName(_ name: String) throws {
         guard !name.isEmpty, !name.contains("/"), !name.contains("\0"), name != ".", name != ".." else {
-            throw ScanError.malformed("Invalid filename.")
+            throw FileDamage("Invalid filename.")
         }
     }
     func fatName(_ entry: Data, long: [Data]) -> String {
@@ -471,8 +576,12 @@ actor FATVolume {
         let name: String, sizeBytes: Int64, validBytes: Int64, cluster: UInt32
         let contiguous: Bool, isDirectory: Bool, modified: Date?
     }
-    /// Validates and decodes a file entry set. Entries must carry their in-use bits.
+    /// Validates and decodes a file entry set. Entries must carry their in-use bits. Every failure
+    /// is `FileDamage`: the set is pure on-disk data, so a bad one only costs this entry.
     func parseExfatSet(_ entries: [Data]) throws -> ExfatSet {
+        do { return try decodeExfatSet(entries) } catch ScanError.malformed(let reason) { throw FileDamage(reason) }
+    }
+    func decodeExfatSet(_ entries: [Data]) throws -> ExfatSet {
         let raw = entries.reduce(Data(), +)
         var checksum: UInt16 = 0
         for (index, byte) in raw.enumerated() where index != 2 && index != 3 {
@@ -502,17 +611,24 @@ actor FATVolume {
                         modified: Self.exfatTimestamp(UInt32(try primary.number(12, 4)), tenMs: primary[21],
                                                       utcOffset: primary[23], localZone: localTimeZone))
     }
+    /// Emits a live file or returns a subdirectory; a damaged set or file is recorded and dropped.
     func exfatEntry(_ entries: [Data], at location: Int64, path: String) async throws -> (UInt32, String, Int64?, Bool)? {
         let raw = entries.reduce(Data(), +)
-        let set = try parseExfatSet(entries)
+        let set: ExfatSet
+        do { set = try parseExfatSet(entries) } catch let damage as FileDamage { record(unnamed(path, location), damage.reason); return nil }
         let size = set.sizeBytes, cluster = set.cluster, contiguous = set.contiguous
         let fullPath = path + "/" + set.name
         if set.isDirectory {
-            guard size > 0, size % clusterBytes == 0, set.validBytes == size else { throw ScanError.malformed("Invalid exFAT directory size.") }
-            try validCluster(cluster)
+            guard size > 0, size % clusterBytes == 0, set.validBytes == size else {
+                record(fullPath, "Directory skipped with its contents: Invalid exFAT directory size."); return nil
+            }
+            // The first cluster is validated (and the subtree skipped if bad) when it is read.
             return (cluster, fullPath, size, contiguous)
         }
-        let runs = try await validateFile(cluster, length: size, contiguous: contiguous, owner: "file:\(location)")
+        let owner = newOwner(fullPath, isFile: true)
+        let runs: [DataRun]
+        do { runs = try await validateFile(cluster, length: size, contiguous: contiguous, owner: owner) }
+        catch let damage as FileDamage { skipFile(owner, damage.reason); return nil }
         try await emit(RecoveredFile(name: set.name, path: fullPath, sizeBytes: size, modified: set.modified,
              sourceMetadata: SourceMetadata(filesystem: .exfat, volumeOffset: extent.offset,
                 recordOffset: location, allocationStart: UInt64(cluster), contiguous: contiguous, rawRecord: raw),
