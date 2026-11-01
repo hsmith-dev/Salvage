@@ -28,10 +28,12 @@ public struct ScanSession: Sendable, Identifiable {
     /// device's volumes is ignored and the scan starts from zero.
     /// `notices` receives what the scan could not do (`ScanNotice`), beside the closed `ScanEvent`
     /// stream (AD-11); a notice never duplicates an `.error`. It is finished when the scan ends.
+    /// `credentials` (by encrypted APFS volume UUID) unlock FileVault volumes; each records its outcome.
     public func run(events: AsyncStream<ScanEvent>.Continuation, pauseGate: ScanPauseGate? = nil,
                     checkpoints: AsyncStream<ScanCheckpoint>.Continuation? = nil,
                     notices: AsyncStream<ScanNotice>.Continuation? = nil,
-                    resumingFrom checkpoint: ScanCheckpoint? = nil, device: BlockDevice? = nil) async {
+                    resumingFrom checkpoint: ScanCheckpoint? = nil, device: BlockDevice? = nil,
+                    credentials: [String: VolumeCredential] = [:]) async {
         let emit: @Sendable (ScanEvent) async throws -> Void = { try await events.send($0) }
         // Byte ranges owned by files found through metadata; the carver skips them.
         let claimed = ClaimedRuns()
@@ -61,8 +63,14 @@ public struct ScanSession: Sendable, Identifiable {
             var parserFailed = Set<Int>(), unreadable = Set<Int>()
             for (index, extent) in extents.enumerated() {
                 do {
-                    try await scanVolume(extent, reader: measured, device: device, notice: { notices?.yield($0) }, emit: { event in
-                        if case .found(let file) = event, case .runs(let runs) = file.content { await claimed.add(runs) }
+                    try await scanVolume(extent, reader: measured, device: device, credentials: credentials, notice: { notices?.yield($0) }, emit: { event in
+                        // Encrypted files' blocks are claimed too, so carving never reads ciphertext as content.
+                        if case .found(let file) = event {
+                            switch file.content {
+                            case .runs(let runs), .encryptedRuns(let runs, _): await claimed.add(runs)
+                            case .unmapped, .resident: break
+                            }
+                        }
                         try await emit(event)
                     })
                 } catch let error as ScanError where extent.isLost && error.isContainedInLostExtent {

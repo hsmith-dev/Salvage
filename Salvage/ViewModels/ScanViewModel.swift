@@ -11,6 +11,8 @@ struct ScanRun: Sendable {
     /// Where the scan reports what it could not do (`ScanNotice`); the view model finishes it.
     let notices: AsyncStream<ScanNotice>.Continuation
     let resumeFrom: ScanCheckpoint?
+    /// Passwords or recovery keys (by volume UUID) for FileVault volumes the user unlocked (Story 2.5).
+    var credentials: [String: VolumeCredential] = [:]
     /// Hands the still-open source reader to the view model when the scan ends, for preview and recovery.
     let keepSource: @Sendable (SourceSession) async -> Void
 }
@@ -72,8 +74,11 @@ final class ScanViewModel {
     }
 
     /// Starts a scan, or offers to resume one when an interrupted scan of this device left a checkpoint.
-    func start(_ device: BlockDevice) {
+    /// With `credentials` (FileVault volumes just unlocked, Story 2.5) it always scans afresh, since
+    /// the unlocked volumes' files are new to this device's results.
+    func start(_ device: BlockDevice, credentials: [String: VolumeCredential] = [:]) {
         guard !isActive, !device.isBootVolume else { return }
+        if !credentials.isEmpty { begin(device, from: nil, credentials: credentials); return }
         if let checkpoint = checkpointStore?.load(for: device) {
             reset(for: device)
             pendingCheckpoint = checkpoint; state = .resumable
@@ -152,7 +157,7 @@ final class ScanViewModel {
         await previous?.close()
     }
 
-    private func begin(_ device: BlockDevice, from checkpoint: ScanCheckpoint?) {
+    private func begin(_ device: BlockDevice, from checkpoint: ScanCheckpoint?, credentials: [String: VolumeCredential] = [:]) {
         // The previous device session must be released before a new scan reserves a device.
         let previous = source
         source = nil
@@ -168,7 +173,7 @@ final class ScanViewModel {
             let (noticeStream, notices) = AsyncStream<ScanNotice>.makeStream()
             let run = ScanRun(device: device, pauseGate: gate, checkpoints: checkpoints,
                               notices: notices,
-                              resumeFrom: checkpoint,
+                              resumeFrom: checkpoint, credentials: credentials,
                               keepSource: { session in await self.adopt(session) })
             var completed = false
             await withTaskGroup(of: Void.self) { group in

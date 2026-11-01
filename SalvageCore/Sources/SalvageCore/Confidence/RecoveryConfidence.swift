@@ -65,7 +65,7 @@ extension RecoveredFile {
             return false
         case .resident(let data):
             return Int64(data.count) >= sizeBytes
-        case .runs(let runs):
+        case .runs(let runs), .encryptedRuns(let runs, _):
             var covered: Int64 = 0
             for run in runs {
                 guard run.length >= 0 else { return false }
@@ -86,7 +86,7 @@ extension RecoveredFile {
         switch content {
         case .unmapped: fragments = 0
         case .resident: fragments = 1
-        case .runs(let runs): fragments = runs.lazy.filter { $0.deviceOffset != nil }.count
+        case .runs(let runs), .encryptedRuns(let runs, _): fragments = runs.lazy.filter { $0.deviceOffset != nil }.count
         }
         return RecoveryEvidence(fragmentCount: fragments, overwriteConfidence: overwriteConfidence)
     }

@@ -122,6 +122,9 @@ struct APFSContainerSuperblock: Sendable {
     let spacemanOID: UInt64
     let omapAddress: Int64
     let fsOIDs: [UInt64]
+    /// `nx_keylocker`: the container keybag's first block and block count (0 when there is none).
+    let keylockerStart: Int64
+    let keylockerCount: Int64
 
     /// The block size from the first 4096 bytes, validated before the whole block is read.
     static func blockSize(of prefix: Data) throws -> Int64 {
@@ -165,6 +168,9 @@ struct APFSContainerSuperblock: Sendable {
             if oid != 0 { oids.append(oid) }
         }
         fsOIDs = oids
+        // Validated where it's used (only an encrypted volume's unlock reads it).
+        keylockerStart = Int64(bitPattern: try data.number(APFS.keylockerOffset, 8))
+        keylockerCount = Int64(bitPattern: try data.number(APFS.keylockerOffset + 8, 8))
     }
 }
 

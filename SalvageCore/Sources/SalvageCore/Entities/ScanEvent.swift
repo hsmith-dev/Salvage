@@ -24,7 +24,16 @@ public enum ScanError: Error, Sendable, Equatable, CustomStringConvertible {
     }
 }
 
-public enum UnlockError: Error, Sendable, Equatable { case wrongPassword, toolFailure }
+/// Why an encrypted volume couldn't be unlocked. Never carries the credential.
+public enum UnlockError: Error, Sendable, Equatable {
+    /// The password or recovery key doesn't unwrap any of the volume's keys.
+    case wrongPassword
+    /// The unlock couldn't be attempted or didn't finish (unreadable or damaged keybag, volume not found).
+    case toolFailure
+    /// The volume's key isn't protected by a password Salvage can use: hardware encryption tied to
+    /// the Mac it came from (T2 / Apple silicon internal storage), or a layout Salvage doesn't read.
+    case unsupported
+}
 
 public struct LostPartitionCandidate: Identifiable, Sendable, Equatable {
     public let id: UUID
@@ -77,7 +86,12 @@ public struct RecoveredFile: Identifiable, Sendable, Equatable {
 public struct DataRun: Sendable, Equatable {
     public let deviceOffset: Int64?
     public let length: Int64
-    public init(deviceOffset: Int64?, length: Int64) { self.deviceOffset = deviceOffset; self.length = length }
+    /// Only inside `FileContent.encryptedRuns`: the cipher's data-unit number (tweak) of the
+    /// first `contentDataUnitSize`-byte unit at `deviceOffset`; later units count up from it.
+    public let firstDataUnit: UInt64?
+    public init(deviceOffset: Int64?, length: Int64, firstDataUnit: UInt64? = nil) {
+        self.deviceOffset = deviceOffset; self.length = length; self.firstDataUnit = firstDataUnit
+    }
 }
 
 public enum FileContent: Sendable, Equatable {
@@ -87,6 +101,11 @@ public enum FileContent: Sendable, Equatable {
     case resident(Data)
     /// Device-absolute runs covering at least `sizeBytes` in file order; reads stop at `sizeBytes`.
     case runs([DataRun])
+    /// Like `runs`, but the bytes on the device are ciphertext (an unlocked FileVault volume, Story
+    /// 2.5). Every placed run carries its `firstDataUnit`, and its device range, rounded up to whole
+    /// data units, holds the ciphertext. Reads decrypt through the `ContentDecryptor` registered
+    /// for `keyID` (the volume UUID) with `FileContentReader`; without one the content is locked.
+    case encryptedRuns([DataRun], keyID: String)
 }
 
 public struct SourceMetadata: Sendable, Equatable {
