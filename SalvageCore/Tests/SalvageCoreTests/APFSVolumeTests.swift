@@ -36,6 +36,29 @@ private func containerEvents(_ image: Data, offset: Int64 = 0, device: BlockDevi
     return await collected.events
 }
 
+/// Like `containerEvents`, also returning the container for its recorded state.
+private func containerScan(_ image: Data, reader: (any BlockReader)? = nil) async throws -> ([ScanEvent], APFSContainer) {
+    let collected = Collected()
+    let container = APFSContainer(reader: reader ?? ImageReader(data: image),
+                                  extent: VolumeExtent(offset: 0, length: Int64(image.count), format: .apfs),
+                                  device: nil, emit: { await collected.add($0) })
+    try await container.scan()
+    return (await collected.events, container)
+}
+
+/// Records the offset of every read.
+private actor RecordingReader: BlockReader {
+    let data: Data
+    nonisolated let sizeBytes: Int64
+    var offsets: [Int64] = []
+    init(data: Data) { self.data = data; sizeBytes = Int64(data.count) }
+    func read(at offset: Int64, count: Int) async throws -> Data {
+        offsets.append(offset)
+        return try await ImageReader(data: data).read(at: offset, count: count)
+    }
+    func reads(ofBlock block: Int) -> Int { offsets.filter { $0 == Int64(block * APFSImageBuilder.blockSize) }.count }
+}
+
 // MARK: - Synthetic image builder
 
 /// A file in a synthetic volume state. Blocks are assigned by the builder.
@@ -52,6 +75,12 @@ private struct SynthFile {
     var cloneOf: UInt64?
     /// Blocks assigned by the builder (or by a test, to alias another file's blocks).
     var firstBlock: Int?
+    /// The extent's `crypto_id`.
+    var cryptoID: UInt64 = 0
+    /// Overrides the inode's sparse flag (by default set exactly when there is a leading hole).
+    var sparse: Bool?
+    /// Blocks left off the end of the extent, so it covers less than the file's size.
+    var extentShortfallBlocks = 0
 }
 private struct SynthDirectory { var id: UInt64; var parent: UInt64; var name: String }
 
@@ -67,12 +96,18 @@ private struct SynthVolume {
     var uuid = UUID()
     var encrypted = false
     var caseInsensitive = true
+    /// `om_flags` of the volume's object map (0x2 encrypting, 0x4 decrypting).
+    var omapFlags: UInt32 = 0
+    /// Flags every entry of the volume's object map `OMAP_VAL_ENCRYPTED`.
+    var omapEntriesEncrypted = false
     /// Replaces the filesystem tree root with a hostile node.
     var hostileRoot: HostileRoot?
     /// States per transaction; the last one is live, earlier ones belong to older checkpoints.
     var states: [UInt64: SynthVolumeState]
 }
-private enum HostileRoot { case tooDeep, selfCycle, oversizedKey }
+private enum HostileRoot { case tooDeep, selfCycle, ancestorCycle, oversizedKey, wrongIdentity }
+/// How a block in an older checkpoint's tree was reused by a node that checksums but isn't it.
+private enum ReusedNode { case rootWithAnotherOID, rootWithAnotherXID, leafWithAnotherXID }
 
 /// Writes an APFS container (or bare volume) image with 4096-byte blocks.
 private final class APFSImageBuilder {
@@ -85,9 +120,21 @@ private final class APFSImageBuilder {
     let containerUUID = UUID()
     /// Blocks the main free queue reports as pending frees, by freeing transaction.
     var pendingFrees: [(xid: UInt64, block: Int, count: Int)] = []
+    /// Replaces the free-queue contents written at a checkpoint (by default, `pendingFrees` up to it).
+    var freeQueueOverride: [UInt64: [(xid: UInt64, block: Int, count: Int)]] = [:]
     /// Where each volume's tree root and superblock landed, keyed "fsOID@xid".
     var fsRootBlocks: [String: Int] = [:]
     var apsbBlocks: [String: Int] = [:]
+    /// Leaf blocks of split filesystem trees, keyed "fsOID@xid".
+    var fsLeafBlocks: [String: [Int]] = [:]
+    /// Each checkpoint's space manager and checkpoint-map block, by xid.
+    var spacemanBlocks: [UInt64: Int] = [:]
+    var checkpointMapBlocks: [UInt64: Int] = [:]
+    /// Splits every object map and filesystem tree with two or more records into a root index
+    /// node over two leaves.
+    var splitTrees = false
+    /// `nx_block_count` recorded in the superblocks, when it should differ from the image's.
+    var claimedBlockCount: Int?
 
     init(blocks: Int = 1024) {
         blockCount = blocks
@@ -107,6 +154,16 @@ private final class APFSImageBuilder {
     func write(_ block: Int, _ data: Data) {
         precondition(data.count <= Self.blockSize)
         image.replaceSubrange(block * Self.blockSize..<block * Self.blockSize + data.count, with: data)
+    }
+
+    func block(_ block: Int) -> Data { image.subdata(in: block * Self.blockSize..<(block + 1) * Self.blockSize) }
+
+    /// Edits an object in place and recomputes its checksum, so only its meaning is wrong.
+    func rewrite(_ block: Int, _ edit: (inout Data) -> Void) {
+        var data = image.subdata(in: block * Self.blockSize..<(block + 1) * Self.blockSize)
+        edit(&data)
+        data.put(0, apfsFletcher64(data), 8)
+        write(block, data)
     }
 
     func writeData(_ data: Data) -> Int {
@@ -151,7 +208,7 @@ private final class APFSImageBuilder {
                 if let fixed {
                     data.put(toc, UInt64(keyOffset), 2)
                     if let value = entry.value {
-                        valueOffset += fixed.value
+                        valueOffset += level == 0 ? fixed.value : 8
                         data.replaceSubrange(valueEnd - valueOffset..<valueEnd - valueOffset + value.count, with: value)
                         data.put(toc + 2, UInt64(valueOffset), 2)
                     } else {
@@ -180,18 +237,33 @@ private final class APFSImageBuilder {
     func uint64(_ value: UInt64) -> Data { var data = Data(count: 8); data.put(0, value, 8); return data }
     func pair(_ a: UInt64, _ b: UInt64) -> Data { uint64(a) + uint64(b) }
 
-    /// An object map whose tree is one root leaf: (oid, xid) → paddr. Returns the omap's address.
-    func omap(xid: UInt64, entries: [(oid: UInt64, xid: UInt64, address: Int)]) -> Int {
+    /// An object map: (oid, xid) → paddr, in one root leaf, or (with `splitTrees`) a root index
+    /// node over two leaves. Returns the omap's address.
+    func omap(xid: UInt64, entries: [(oid: UInt64, xid: UInt64, address: Int)], flags: UInt32 = 0, entryFlags: UInt32 = 0) -> Int {
         let sorted = entries.sorted { ($0.oid, $0.xid) < ($1.oid, $1.xid) }
+        let records = sorted.map { entry in
+            var value = Data(count: 16); value.put(0, UInt64(entryFlags), 4); value.put(8, UInt64(entry.address), 8)
+            return NodeEntry(key: pair(entry.oid, entry.xid), value: value)
+        }
         let root = allocate()
-        write(root, node(oid: UInt64(root), xid: xid, subtype: APFS.ObjectType.omap, level: 0, isRoot: true,
-                         entries: sorted.map { entry in
-                             var value = Data(count: 16); value.put(8, UInt64(entry.address), 8)
-                             return NodeEntry(key: pair(entry.oid, entry.xid), value: value)
-                         }, fixed: (16, 16), treeFlags: 0x10))
+        if splitTrees, records.count >= 2 {
+            let halves = [Array(records[..<(records.count / 2)]), Array(records[(records.count / 2)...])]
+            var index: [NodeEntry] = []
+            for half in halves {
+                let leaf = allocate()
+                write(leaf, node(oid: UInt64(leaf), xid: xid, subtype: APFS.ObjectType.omap, level: 0, isRoot: false,
+                                 entries: half, fixed: (16, 16)))
+                index.append(NodeEntry(key: half[0].key, value: uint64(UInt64(leaf))))
+            }
+            write(root, node(oid: UInt64(root), xid: xid, subtype: APFS.ObjectType.omap, level: 1, isRoot: true,
+                             entries: index, fixed: (16, 16), treeFlags: 0x10, nodeCount: 3))
+        } else {
+            write(root, node(oid: UInt64(root), xid: xid, subtype: APFS.ObjectType.omap, level: 0, isRoot: true,
+                             entries: records, fixed: (16, 16), treeFlags: 0x10))
+        }
         let omapBlock = allocate()
         write(omapBlock, object(oid: UInt64(omapBlock), xid: xid, type: APFS.ObjectType.omap, subtype: 0) { data in
-            data.put(40, UInt64(APFS.ObjectType.btree), 4); data.put(48, UInt64(root), 8)
+            data.put(32, UInt64(flags), 4); data.put(40, UInt64(APFS.ObjectType.btree), 4); data.put(48, UInt64(root), 8)
         })
         return omapBlock
     }
@@ -238,9 +310,9 @@ private final class APFSImageBuilder {
         return NodeEntry(key: key, value: value)
     }
 
-    func extentRecord(streamID: UInt64, logical: Int, length: Int, block: Int) -> NodeEntry {
+    func extentRecord(streamID: UInt64, logical: Int, length: Int, block: Int, cryptoID: UInt64 = 0) -> NodeEntry {
         var key = APFSRecordKey.encode(objectID: streamID, type: APFS.RecordType.fileExtent); key += uint64(UInt64(logical))
-        var value = Data(count: 24); value.put(0, UInt64(length), 8); value.put(8, UInt64(block), 8)
+        var value = Data(count: 24); value.put(0, UInt64(length), 8); value.put(8, UInt64(block), 8); value.put(16, cryptoID, 8)
         return NodeEntry(key: key, value: value)
     }
 
@@ -265,14 +337,15 @@ private final class APFSImageBuilder {
             state.files[index] = file
             let size = file.leadingHole + file.data.count
             let streamID = file.cloneOf ?? file.id
-            let flags: UInt64 = (file.leadingHole > 0 ? APFS.inodeIsSparse : 0) | (file.compressed ? APFS.inodeHasUncompressedSize : 0)
+            let flags: UInt64 = ((file.sparse ?? (file.leadingHole > 0)) ? APFS.inodeIsSparse : 0) | (file.compressed ? APFS.inodeHasUncompressedSize : 0)
             let stream: (Int, Int)? = file.compressed || size == 0 ? nil : (size, allocated + file.leadingHole)
             entries.append(NodeEntry(key: inodeKey(file.id), value: inodeValue(
                 parent: file.parent, privateID: streamID, mode: 0o100644, name: file.name, modified: file.modified, stream: stream,
                 flags: flags, bsdFlags: file.compressed ? APFS.bsdCompressed : 0, uncompressedSize: file.compressed ? UInt64(file.data.count) : 0)))
             entries.append(directoryRecord(parent: file.parent, name: file.name, child: file.id, isDirectory: false, hashed: hashed))
             if let block = file.firstBlock, file.cloneOf == nil, !file.compressed {
-                entries.append(extentRecord(streamID: file.id, logical: file.leadingHole, length: allocated, block: block))
+                entries.append(extentRecord(streamID: file.id, logical: file.leadingHole,
+                                            length: allocated - file.extentShortfallBlocks * blockSize, block: block, cryptoID: file.cryptoID))
             }
         }
         let compare = makeAPFSRecordKeyComparator(hashedDirectoryKeys: hashed)
@@ -283,9 +356,10 @@ private final class APFSImageBuilder {
     func volume(_ volume: inout SynthVolume, xid: UInt64) -> Int {
         var state = volume.states[xid]!
         let hashed = volume.caseInsensitive
-        let rootOID: UInt64 = 0x404
+        let rootOID: UInt64 = 0x404, leafOIDs: [UInt64] = [0x405, 0x406]
         let rootBlock = allocate()
         let selfPointer = [NodeEntry(key: inodeKey(2), value: uint64(rootOID))]
+        var omapEntries: [(oid: UInt64, xid: UInt64, address: Int)] = [(rootOID, xid, rootBlock)]
         let root: Data
         switch volume.hostileRoot {
         case .tooDeep:
@@ -293,17 +367,45 @@ private final class APFSImageBuilder {
         case .selfCycle:
             // An interior node whose only child resolves (through the object map) to itself.
             root = node(oid: rootOID, xid: xid, subtype: APFS.ObjectType.fsTree, level: 1, isRoot: true, entries: selfPointer)
+        case .ancestorCycle:
+            // Root (level 2) → index node A (level 1) whose only child resolves back to A: a cycle
+            // through an ancestor that isn't the root.
+            let inner = allocate()
+            let toInner = [NodeEntry(key: inodeKey(2), value: uint64(leafOIDs[0]))]
+            write(inner, node(oid: leafOIDs[0], xid: xid, subtype: APFS.ObjectType.fsTree, level: 1, isRoot: false, entries: toInner))
+            omapEntries.append((leafOIDs[0], xid, inner))
+            root = node(oid: rootOID, xid: xid, subtype: APFS.ObjectType.fsTree, level: 2, isRoot: true, entries: toInner, nodeCount: 2)
         case .oversizedKey:
             root = node(oid: rootOID, xid: xid, subtype: APFS.ObjectType.fsTree, level: 0, isRoot: true,
                         entries: fsTreeEntries(&state, hashed: hashed), corruptKeyLength: true)
-        case nil:
-            root = node(oid: rootOID, xid: xid, subtype: APFS.ObjectType.fsTree, level: 0, isRoot: true,
+        case .wrongIdentity:
+            // A well-formed root whose transaction isn't the one its object-map entry records.
+            root = node(oid: rootOID, xid: xid + 100, subtype: APFS.ObjectType.fsTree, level: 0, isRoot: true,
                         entries: fsTreeEntries(&state, hashed: hashed), treeFlags: 0x40)
+        case nil:
+            let entries = fsTreeEntries(&state, hashed: hashed)
+            if splitTrees, entries.count >= 2 {
+                let halves = [Array(entries[..<(entries.count / 2)]), Array(entries[(entries.count / 2)...])]
+                var index: [NodeEntry] = [], leaves: [Int] = []
+                for (half, oid) in zip(halves, leafOIDs) {
+                    let leaf = allocate()
+                    write(leaf, node(oid: oid, xid: xid, subtype: APFS.ObjectType.fsTree, level: 0, isRoot: false, entries: half))
+                    omapEntries.append((oid, xid, leaf)); leaves.append(leaf)
+                    index.append(NodeEntry(key: half[0].key, value: uint64(oid)))
+                }
+                fsLeafBlocks["\(volume.fsOID)@\(xid)"] = leaves
+                root = node(oid: rootOID, xid: xid, subtype: APFS.ObjectType.fsTree, level: 1, isRoot: true,
+                            entries: index, treeFlags: 0x40, nodeCount: 3)
+            } else {
+                root = node(oid: rootOID, xid: xid, subtype: APFS.ObjectType.fsTree, level: 0, isRoot: true,
+                            entries: entries, treeFlags: 0x40)
+            }
         }
         write(rootBlock, root)
         volume.states[xid] = state
         fsRootBlocks["\(volume.fsOID)@\(xid)"] = rootBlock
-        let omapBlock = omap(xid: xid, entries: [(rootOID, xid, rootBlock)])
+        let omapBlock = omap(xid: xid, entries: omapEntries, flags: volume.omapFlags,
+                             entryFlags: volume.omapEntriesEncrypted ? APFS.omapValueEncrypted : 0)
         let apsb = allocate()
         apsbBlocks["\(volume.fsOID)@\(xid)"] = apsb
         write(apsb, object(oid: volume.fsOID, xid: xid, type: APFS.ObjectType.fs, subtype: 0) { data in
@@ -355,7 +457,8 @@ private final class APFSImageBuilder {
                 data.put(36, 1, 4); data.put(40, xid, 8); data.put(48, 0, 8)
                 data.put(56, UInt64(self.blockCount), 4); data.put(60, UInt64(self.used.filter { !$0 }.count), 4); data.put(64, UInt64(bitmap), 8)
             })
-            let frees = pendingFrees.filter { $0.xid <= xid }.sorted { ($0.xid, $0.block) < ($1.xid, $1.block) }
+            let frees = (freeQueueOverride[xid] ?? pendingFrees.filter { $0.xid <= xid }).sorted { ($0.xid, $0.block) < ($1.xid, $1.block) }
+            spacemanBlocks[xid] = dataSlot
             write(dataSlot, object(oid: Self.spacemanOID, xid: xid, type: APFS.ObjectType.spaceman, subtype: 0) { data in
                 data.put(32, UInt64(Self.blockSize), 4); data.put(36, UInt64(Self.blockSize * 8), 4); data.put(40, 126, 4); data.put(44, 507, 4)
                 data.put(48, UInt64(self.blockCount), 8); data.put(56, 1, 8); data.put(64, 1, 4); data.put(68, 0, 4)
@@ -366,6 +469,7 @@ private final class APFSImageBuilder {
                                      entries: frees.map { NodeEntry(key: pair($0.xid, UInt64($0.block)), value: $0.count == 1 ? nil : uint64(UInt64($0.count))) },
                                      fixed: (16, 8), treeFlags: 0xe))
             let mapBlock = descriptorBase + slot * 2, superblockBlock = mapBlock + 1
+            checkpointMapBlocks[xid] = mapBlock
             write(mapBlock, object(oid: UInt64(mapBlock), xid: xid, type: APFS.ObjectType.checkpointMap, subtype: 0) { data in
                 data.put(32, 1, 4); data.put(36, 2, 4)
                 for (index, (type, oid, address)) in [(APFS.ObjectType.spaceman, Self.spacemanOID, dataSlot),
@@ -376,7 +480,8 @@ private final class APFSImageBuilder {
                 }
             })
             let superblock = object(oid: 1, xid: xid, type: APFS.ObjectType.nxSuperblock, subtype: 0) { data in
-                data.put(32, APFS.nxMagic, 4); data.put(36, UInt64(Self.blockSize), 4); data.put(40, UInt64(self.blockCount), 8)
+                data.put(32, APFS.nxMagic, 4); data.put(36, UInt64(Self.blockSize), 4)
+                data.put(40, UInt64(self.claimedBlockCount ?? self.blockCount), 8)
                 data.replaceSubrange(72..<88, with: withUnsafeBytes(of: self.containerUUID.uuid) { Data($0) })
                 data.put(104, UInt64(descriptorBlocks), 4); data.put(108, UInt64(dataBlocks), 4)
                 data.put(112, UInt64(descriptorBase), 8); data.put(120, UInt64(dataBase), 8)
@@ -509,10 +614,12 @@ struct APFSSyntheticTests {
         #expect(await scan(stub).contains { if case .error = $0 { true } else { false } })
     }
 
-    @Test(arguments: [HostileRoot.tooDeep, .selfCycle, .oversizedKey])
+    @Test(arguments: [HostileRoot.tooDeep, .selfCycle, .ancestorCycle, .oversizedKey, .wrongIdentity])
     fileprivate func hostileTreesTerminateAsMalformed(_ hostile: HostileRoot) async throws {
-        // Depth beyond 16, a child pointer that resolves to its own parent, and a key length past
-        // the node's end all stop with `malformed`, with a good volume's files already emitted.
+        // Depth beyond 16, a child pointer that resolves to the root, one that resolves to an
+        // ancestor index node below the root, a key length past the node's end, and a live root
+        // whose transaction doesn't match its object-map entry all stop with `malformed`, with a
+        // good volume's files already emitted.
         let builder = APFSImageBuilder()
         var bad = simpleVolume(fsOID: 1027, name: "Bad"); bad.hostileRoot = hostile
         var volumes = [simpleVolume(), bad]
@@ -532,11 +639,125 @@ struct APFSSyntheticTests {
         let files = found(events)
         #expect(files.map(\.path) == ["/hello.txt", "/docs/big.bin", "/docs/nested/empty.txt"])
         #expect(try await bytes(of: files[1], in: builder.image) == volume.states[6]!.files[1].data)
-        var encrypted = SynthVolume(fsOID: 1026, name: "Locked", encrypted: true, states: [6: SynthVolumeState(files: [])])
-        let lockedBuilder = APFSImageBuilder(blocks: 256)
-        lockedBuilder.bareVolume(&encrypted, xid: 6)
-        let locked = await scan(lockedBuilder.image)
-        #expect(unlocks(locked).first?.encryptedVolumeName == "Locked" && locked.last == .completed)
+    }
+
+    @Test func encryptedBareVolumeDeviceIsReadAsPlaintext() async throws {
+        // A bare volume device is the unlocked device (Story 2.4): its superblock still says
+        // encrypted and its object-map entries are flagged encrypted, but what it serves is
+        // plaintext. It is parsed, not reported as needing an unlock, through a split tree so
+        // that child nodes are resolved through encrypted-flagged entries too.
+        let builder = APFSImageBuilder(blocks: 256)
+        builder.splitTrees = true
+        var volume = simpleVolume()
+        volume.name = "Unlocked"; volume.encrypted = true; volume.omapEntriesEncrypted = true
+        volume.states[6]!.files[1].cryptoID = 7
+        builder.bareVolume(&volume, xid: 6)
+        let events = await scan(builder.image)
+        #expect(events.last == .completed)
+        #expect(unlocks(events).isEmpty)
+        let files = found(events)
+        #expect(files.map(\.path) == ["/hello.txt", "/docs/big.bin", "/docs/nested/empty.txt"])
+        for (file, expected) in zip(files, volume.states[6]!.files) {
+            #expect(try await bytes(of: file, in: builder.image) == expected.data)
+        }
+        // In a container the same entry flag means ciphertext, so the volume is refused.
+        let contained = APFSImageBuilder()
+        var flagged = simpleVolume(); flagged.omapEntriesEncrypted = true
+        var volumes = [flagged]
+        contained.container(&volumes)
+        await #expect(throws: ScanError.unsupportedFilesystem) { _ = try await containerEvents(contained.image) }
+        #expect(found(await scan(contained.image)).isEmpty)
+    }
+
+    @Test(arguments: [APFS.omapEncrypting, APFS.omapDecrypting])
+    func volumeBeingEncryptedOrDecryptedIsUnmapped(_ flags: UInt32) async throws {
+        // Mid-conversion, any block may be plaintext or ciphertext and nothing per extent says
+        // which, so no file content is mapped; metadata is still reported.
+        let builder = APFSImageBuilder()
+        var volume = simpleVolume(); volume.omapFlags = flags
+        var volumes = [volume]
+        builder.container(&volumes)
+        let events = await scan(builder.image)
+        #expect(events.last == .completed)
+        let files = found(events)
+        #expect(files.map(\.path) == ["/hello.txt", "/docs/big.bin", "/docs/nested/empty.txt"])
+        #expect(files.map(\.sizeBytes) == [10, 9000, 0])
+        #expect(files[0].content == .unmapped && files[1].content == .unmapped)
+        // The bare-volume path applies the same object-map check.
+        let bare = APFSImageBuilder(blocks: 256)
+        var bareVolume = simpleVolume(); bareVolume.omapFlags = flags
+        bare.bareVolume(&bareVolume, xid: 6)
+        let bareFiles = found(await scan(bare.image))
+        #expect(bareFiles.count == 3 && bareFiles[0].content == .unmapped && bareFiles[1].content == .unmapped)
+    }
+
+    @Test func extentWithACryptoIDIsUnmappedInAContainerButReadOnABareVolume() async throws {
+        let builder = APFSImageBuilder()
+        var volume = simpleVolume(); volume.states[6]!.files[1].cryptoID = 3
+        var volumes = [volume]
+        builder.container(&volumes)
+        let events = await scan(builder.image)
+        #expect(events.last == .completed)
+        let files = found(events)
+        let big = try #require(files.first { $0.name == "big.bin" })
+        #expect(big.sizeBytes == 9000 && big.content == .unmapped)
+        let hello = try #require(files.first { $0.name == "hello.txt" })
+        #expect(try await bytes(of: hello, in: builder.image) == Data("hello apfs".utf8))
+        // On the unlocked device the same crypto_id is expected and the bytes are plaintext.
+        let bare = APFSImageBuilder(blocks: 256)
+        var bareVolume = simpleVolume(); bareVolume.states[6]!.files[1].cryptoID = 3
+        bare.bareVolume(&bareVolume, xid: 6)
+        let bareBig = try #require(found(await scan(bare.image)).first { $0.name == "big.bin" })
+        #expect(try await bytes(of: bareBig, in: bare.image) == bareVolume.states[6]!.files[1].data)
+    }
+
+    @Test func gapsAndShortTailsInNonSparseFilesAreUnmapped() async throws {
+        // Without the sparse flag, a missing extent means the list is incomplete, not zeros.
+        let builder = APFSImageBuilder()
+        var volume = simpleVolume()
+        volume.states[6]!.files += [
+            SynthFile(id: 33, parent: 2, name: "gap.bin", data: Data(repeating: 7, count: 100), leadingHole: 8192, sparse: false),
+            SynthFile(id: 34, parent: 2, name: "short.bin", data: Data(repeating: 9, count: 9000), extentShortfallBlocks: 1),
+            SynthFile(id: 35, parent: 2, name: "sparse-tail.bin", data: Data(repeating: 5, count: 9000), sparse: true, extentShortfallBlocks: 1),
+        ]
+        var volumes = [volume]
+        builder.container(&volumes)
+        let events = await scan(builder.image)
+        #expect(events.last == .completed)
+        let files = found(events)
+        let gap = try #require(files.first { $0.name == "gap.bin" })
+        #expect(gap.sizeBytes == 8292 && gap.content == .unmapped)
+        let short = try #require(files.first { $0.name == "short.bin" })
+        #expect(short.sizeBytes == 9000 && short.content == .unmapped)
+        // A sparse inode's short tail is a hole.
+        let sparseTail = try #require(files.first { $0.name == "sparse-tail.bin" })
+        #expect(try await bytes(of: sparseTail, in: builder.image) == Data(repeating: 5, count: 8192) + Data(count: 808))
+        let big = try #require(files.first { $0.name == "big.bin" })
+        #expect(try await bytes(of: big, in: builder.image) == volume.states[6]!.files[1].data)
+    }
+
+    @Test func multiLevelTreesAreWalkedAndSearched() async throws {
+        // Object maps (fixed-size records) and filesystem trees are each a root index node over
+        // two leaves: lookups go through interior nodes and the walk climbs between leaves.
+        let builder = APFSImageBuilder()
+        builder.splitTrees = true
+        var volumes = [simpleVolume(fsOID: 1026, name: "One"), simpleVolume(fsOID: 1027, name: "Two")]
+        builder.container(&volumes)
+        let fsRoot = builder.fsRootBlocks["1026@6"]!
+        let root = try APFSBTreeNode(builder.block(fsRoot), address: Int64(fsRoot), inheritedInfo: nil)
+        #expect(root.level == 1 && root.keyCount == 2 && builder.fsLeafBlocks["1026@6"]?.count == 2)
+        let containerOmap = Int(try builder.block(0).number(160, 8))
+        let omapRoot = Int(try builder.block(containerOmap).number(48, 8))
+        let omapNode = try APFSBTreeNode(builder.block(omapRoot), address: Int64(omapRoot), inheritedInfo: nil)
+        #expect(omapNode.level == 1 && omapNode.keyCount == 2)
+        let events = await scan(builder.image)
+        #expect(events.last == .completed)
+        let files = found(events)
+        #expect(files.map(\.path) == ["/hello.txt", "/docs/big.bin", "/docs/nested/empty.txt",
+                                       "/hello.txt", "/docs/big.bin", "/docs/nested/empty.txt"])
+        for (file, expected) in zip(files, volumes[0].states[6]!.files + volumes[1].states[6]!.files) {
+            #expect(try await bytes(of: file, in: builder.image) == expected.data)
+        }
     }
 }
 
@@ -554,18 +775,24 @@ struct APFSDeletedFileTests {
         return volume
     }
 
-    @Test func deletedFilesWithFreeBlocksAreRecoveredByteIdentical() async throws {
-        let builder = APFSImageBuilder()
+    /// The deleted files' first blocks in `twoCheckpointVolume`'s xid-5 state (allocation is deterministic).
+    fileprivate func deletedBlocks(splitTrees: Bool = false) -> (gone: Int, goneBig: Int) {
+        let probe = APFSImageBuilder()
+        probe.splitTrees = splitTrees
         var volumes = [twoCheckpointVolume()]
-        // Data blocks are assigned in state order (xid 5 first); mark the deleted files' blocks free.
-        builder.container(&volumes, freeBlocks: [])
-        // Find the deleted files' blocks from the xid-5 state and clear them in the live bitmap.
+        probe.container(&volumes)
         let old = volumes[0].states[5]!.files
-        let gone = old.first { $0.name == "gone.txt" }!, goneBig = old.first { $0.name == "gone-big.bin" }!
-        let frees = [gone.firstBlock!] + Array(goneBig.firstBlock!..<goneBig.firstBlock! + 25)
+        return (old.first { $0.name == "gone.txt" }!.firstBlock!, old.first { $0.name == "gone-big.bin" }!.firstBlock!)
+    }
+
+    @Test func deletedFilesWithPendingFreesAreRecoveredByteIdentical() async throws {
+        // Freed at xid 6, after the xid-5 checkpoint that still lists them; still allocated in the
+        // bitmap and queued, so nothing can have reused them.
+        let (gone, goneBig) = deletedBlocks()
         let rebuilt = APFSImageBuilder()
+        rebuilt.pendingFrees = [(6, gone, 1), (6, goneBig, 25)]
         var again = [twoCheckpointVolume()]
-        rebuilt.container(&again, freeBlocks: frees)
+        rebuilt.container(&again)
         let events = await scan(rebuilt.image)
         #expect(events.last == .completed)
         let deleted = found(events).filter(\.isDeleted)
@@ -610,35 +837,245 @@ struct APFSDeletedFileTests {
     }
 
     @Test func overlappingDeletedCandidatesAreBothSkipped() async throws {
-        let probe = APFSImageBuilder()
-        var probeVolumes = [twoCheckpointVolume()]
-        probe.container(&probeVolumes)
-        let gone = probeVolumes[0].states[5]!.files.first { $0.name == "gone.txt" }!
+        let (gone, _) = deletedBlocks()
         let builder = APFSImageBuilder()
+        builder.pendingFrees = [(6, gone, 1)]
         var volume = twoCheckpointVolume()
         // A second deleted file in the same old checkpoint claiming gone.txt's block.
-        volume.states[5]!.files.append(SynthFile(id: 24, parent: 2, name: "alias.txt", data: Data("aliased".utf8), firstBlock: gone.firstBlock))
+        volume.states[5]!.files.append(SynthFile(id: 24, parent: 2, name: "alias.txt", data: Data("aliased".utf8), firstBlock: gone))
         var volumes = [volume]
-        builder.container(&volumes, freeBlocks: [gone.firstBlock!])
+        builder.container(&volumes)
         let events = await scan(builder.image)
         #expect(events.last == .completed)
         let deleted = found(events).filter(\.isDeleted).map(\.name)
         #expect(!deleted.contains("gone.txt") && !deleted.contains("alias.txt"))
-        #expect(volumes[0].states[5]!.files.first { $0.name == "gone.txt" }!.firstBlock == gone.firstBlock)
+        #expect(volumes[0].states[5]!.files.first { $0.name == "gone.txt" }!.firstBlock == gone)
+    }
+
+    @Test func overlapIsResolvedAcrossVolumes() async throws {
+        // Volumes share the container's blocks: a deleted candidate in another volume claiming
+        // gone.txt's block makes both suspect, so neither is emitted.
+        let (gone, _) = deletedBlocks()
+        let builder = APFSImageBuilder()
+        builder.pendingFrees = [(6, gone, 1)]
+        let other = SynthVolume(fsOID: 1027, name: "Other", states: [
+            5: SynthVolumeState(files: [SynthFile(id: 40, parent: 2, name: "alias.txt", data: Data("aliased".utf8), firstBlock: gone)]),
+            6: SynthVolumeState(files: [])])
+        var volumes = [twoCheckpointVolume(), other]
+        builder.container(&volumes)
+        #expect(volumes[0].states[5]!.files.first { $0.name == "gone.txt" }!.firstBlock == gone)
+        let events = await scan(builder.image)
+        #expect(events.last == .completed)
+        let deleted = found(events).filter(\.isDeleted).map(\.name)
+        #expect(!deleted.contains("gone.txt") && !deleted.contains("alias.txt"))
+        // Without the other volume's claim, gone.txt is recovered from the same layout.
+        let alone = APFSImageBuilder()
+        alone.pendingFrees = [(6, gone, 1)]
+        var single = [twoCheckpointVolume()]
+        alone.container(&single)
+        #expect(found(await scan(alone.image)).filter(\.isDeleted).map(\.name) == ["gone.txt"])
     }
 
     @Test func exhaustedBudgetStopsDeletedRecoveryOnly() async throws {
-        let probe = APFSImageBuilder()
-        var probeVolumes = [twoCheckpointVolume()]
-        probe.container(&probeVolumes)
-        let gone = probeVolumes[0].states[5]!.files.first { $0.name == "gone.txt" }!
+        let (gone, _) = deletedBlocks()
         let builder = APFSImageBuilder()
+        builder.pendingFrees = [(6, gone, 1)]
         var volumes = [twoCheckpointVolume()]
-        builder.container(&volumes, freeBlocks: [gone.firstBlock!])
+        builder.container(&volumes)
         let limited = try await containerEvents(builder.image, deletedBudget: 1)
         #expect(found(limited).count == 3 && found(limited).allSatisfy { !$0.isDeleted })
         let unlimited = try await containerEvents(builder.image)
         #expect(found(unlimited).filter(\.isDeleted).map(\.name) == ["gone.txt"])
+    }
+
+    @Test func blockReusedAndFreedAgainIsNotRecovered() async throws {
+        // Each image keeps gone-big.bin properly pending (the control) and varies gone.txt's block.
+        let (gone, goneBig) = deletedBlocks()
+        func deletedNames(_ configure: (APFSImageBuilder) -> Void, freeBlocks: [Int] = []) async -> [String] {
+            let builder = APFSImageBuilder()
+            builder.pendingFrees = [(6, goneBig, 25)]
+            configure(builder)
+            var volumes = [twoCheckpointVolume()]
+            builder.container(&volumes, freeBlocks: freeBlocks)
+            // Whatever reused the block last left a metadata node there.
+            if freeBlocks.contains(gone) {
+                builder.write(gone, builder.node(oid: UInt64(gone), xid: 6, subtype: APFS.ObjectType.omap, level: 0,
+                                                 isRoot: false, entries: [], fixed: (16, 16)))
+            }
+            return found(await scan(builder.image)).filter(\.isDeleted).map(\.name)
+        }
+        // Freed, reused by a metadata node, freed again: the bit is clear and the queue has no entry.
+        #expect(await deletedNames({ _ in }, freeBlocks: [gone]) == ["gone-big.bin"])
+        // Queued, but the bit is already clear: the free was processed, so it proves nothing.
+        #expect(await deletedNames({ $0.pendingFrees.append((6, gone, 1)) }, freeBlocks: [gone]) == ["gone-big.bin"])
+        // Freed in the candidate's own transaction: not the candidate's block.
+        #expect(await deletedNames({ $0.pendingFrees.append((5, gone, 1)) }) == ["gone-big.bin"])
+        // Freed by a transaction after the current checkpoint: not part of the state being read.
+        #expect(await deletedNames({ $0.freeQueueOverride[6] = [(6, goneBig, 25), (7, gone, 1)] }) == ["gone-big.bin"])
+        // Control: pending, bit set, freed between the two checkpoints.
+        #expect(await deletedNames({ $0.pendingFrees.append((6, gone, 1)) }) == ["gone.txt", "gone-big.bin"])
+    }
+
+    @Test func spaceManagerWithAHugeBlockCountIsSkippedNotTrapped() async throws {
+        let (gone, _) = deletedBlocks()
+        let builder = APFSImageBuilder()
+        builder.pendingFrees = [(6, gone, 1)]
+        var volumes = [twoCheckpointVolume()]
+        builder.container(&volumes)
+        // Checksummed, so only its geometry is hostile: sm_block_count = Int64.max.
+        builder.rewrite(builder.spacemanBlocks[6]!) { $0.put(48, UInt64(Int64.max), 8) }
+        let (events, container) = try await containerScan(builder.image)
+        #expect(found(events).count == 3 && found(events).allSatisfy { !$0.isDeleted })
+        #expect(await container.deletedRecoverySkippedReason == "The space manager couldn't be read.")
+    }
+
+    @Test(arguments: [ReusedNode.rootWithAnotherOID, .rootWithAnotherXID, .leafWithAnotherXID])
+    fileprivate func reusedNodeInAnOlderCheckpointTreeIsNotRead(_ reuse: ReusedNode) async throws {
+        // A block of the xid-5 tree now holds a checksummed node that isn't the one referenced:
+        // another identifier, or another transaction than the object map records. It lists an
+        // "imposter" whose extent points at a block that is genuinely pending free.
+        let (gone, _) = deletedBlocks(splitTrees: true)
+        let builder = APFSImageBuilder()
+        builder.splitTrees = true
+        builder.pendingFrees = [(6, gone, 1)]
+        var volumes = [twoCheckpointVolume()]
+        builder.container(&volumes)
+        let imposter = [APFSImageBuilder.NodeEntry(key: builder.inodeKey(40), value: builder.inodeValue(
+                            parent: 2, privateID: 40, mode: 0o100644, name: "imposter.txt", modified: 1, stream: (13, 4096))),
+                        builder.extentRecord(streamID: 40, logical: 0, length: 4096, block: gone)]
+        let fsTree = APFS.ObjectType.fsTree
+        switch reuse {
+        case .rootWithAnotherOID:
+            builder.write(builder.fsRootBlocks["1026@5"]!, builder.node(oid: 0x999, xid: 5, subtype: fsTree, level: 0, isRoot: true, entries: imposter))
+        case .rootWithAnotherXID:
+            builder.write(builder.fsRootBlocks["1026@5"]!, builder.node(oid: 0x404, xid: 4, subtype: fsTree, level: 0, isRoot: true, entries: imposter))
+        case .leafWithAnotherXID:
+            builder.write(builder.fsLeafBlocks["1026@5"]![1], builder.node(oid: 0x406, xid: 4, subtype: fsTree, level: 0, isRoot: false, entries: imposter))
+        }
+        let events = await scan(builder.image)
+        #expect(events.last == .completed && found(events).filter { !$0.isDeleted }.count == 3)
+        #expect(!found(events).contains { $0.name == "imposter.txt" })
+    }
+
+    @Test func staleCheckpointMapOrSpaceManagerDisablesDeletedRecovery() async throws {
+        // gone.txt is in the xid-4 tree. It was freed at xid 5; by xid 6 that free has been
+        // processed and the block handed out again, so xid 6's queue no longer lists it.
+        func volume() -> SynthVolume {
+            var volume = simpleVolume(xid: 6)
+            volume.states[5] = volume.states[6]!
+            var oldest = volume.states[6]!
+            oldest.files.append(SynthFile(id: 22, parent: 16, name: "gone.txt", data: Data("to be deleted".utf8)))
+            volume.states[4] = oldest
+            return volume
+        }
+        let probe = APFSImageBuilder()
+        var probeVolumes = [volume()]
+        probe.container(&probeVolumes)
+        let gone = probeVolumes[0].states[4]!.files.first { $0.name == "gone.txt" }!.firstBlock!
+        func build() -> APFSImageBuilder {
+            let builder = APFSImageBuilder()
+            builder.freeQueueOverride = [5: [(5, gone, 1)], 6: []]
+            var volumes = [volume()]
+            builder.container(&volumes)
+            return builder
+        }
+        let (honest, _) = try await containerScan(build().image)
+        #expect(found(honest).count == 3 && found(honest).allSatisfy { !$0.isDeleted })
+
+        // xid 5's checkpoint-map block in xid 6's slot (checksummed, o_xid 5): it maps xid 5's
+        // space manager and free queue, which still list the block.
+        let staleMap = build()
+        let slot = staleMap.checkpointMapBlocks[6]!
+        staleMap.write(slot, staleMap.block(staleMap.checkpointMapBlocks[5]!))
+        staleMap.rewrite(slot) { $0.put(8, UInt64(slot), 8) }
+        let (mapEvents, mapContainer) = try await containerScan(staleMap.image)
+        #expect(found(mapEvents).count == 3 && found(mapEvents).allSatisfy { !$0.isDeleted })
+        #expect(await mapContainer.deletedRecoverySkippedReason == "The space manager isn't in the checkpoint maps.")
+
+        // xid 6's own map pointing at xid 5's space manager (o_xid 5) and free queue.
+        let staleManager = build()
+        let oldManager = staleManager.spacemanBlocks[5]!
+        staleManager.rewrite(staleManager.checkpointMapBlocks[6]!) { data in
+            data.put(40 + 32, UInt64(oldManager), 8); data.put(80 + 32, UInt64(oldManager + 1), 8)
+        }
+        let (managerEvents, managerContainer) = try await containerScan(staleManager.image)
+        #expect(found(managerEvents).count == 3 && found(managerEvents).allSatisfy { !$0.isDeleted })
+        #expect(await managerContainer.deletedRecoverySkippedReason == "The space manager couldn't be read.")
+    }
+
+    @Test func chunkInfoAddressBlocksAreBoundedAndNotRepeated() async throws {
+        // The superblock claims four chunks; the live space manager is rewritten for one chunk per
+        // CIB and one CIB per CAB, so it lists four CABs.
+        let blocksPerChunk = APFSImageBuilder.blockSize * 8
+        func build(_ listings: (APFSImageBuilder) -> [Int]) -> APFSImageBuilder {
+            let builder = APFSImageBuilder()
+            builder.claimedBlockCount = blocksPerChunk * 4
+            var volumes = [simpleVolume()]
+            builder.container(&volumes)
+            let cabs = listings(builder)
+            builder.rewrite(builder.spacemanBlocks[6]!) { data in
+                data.put(40, 1, 4); data.put(44, 1, 4); data.put(48, UInt64(blocksPerChunk * 4), 8); data.put(56, 4, 8)
+                data.put(64, 4, 4); data.put(68, UInt64(cabs.count), 4)
+                for (index, cab) in cabs.enumerated() { data.put(0x200 + index * 8, UInt64(cab), 8) }
+            }
+            return builder
+        }
+        func cab(_ builder: APFSImageBuilder, listing count: Int) -> Int {
+            let block = builder.allocate()
+            builder.write(block, builder.object(oid: UInt64(block), xid: 6, type: APFS.ObjectType.spacemanCAB, subtype: 0) { data in
+                data.put(36, UInt64(count), 4)
+                for index in 0..<count { data.put(40 + index * 8, UInt64(900 + index), 8) }
+            })
+            return block
+        }
+        // One CAB repeated four times, each listing one CIB: the totals add up, but it's one block.
+        let repeated = build { builder in let only = cab(builder, listing: 1); return [only, only, only, only] }
+        let (repeatedEvents, repeatedContainer) = try await containerScan(repeated.image)
+        #expect(found(repeatedEvents).count == 3)
+        #expect(await repeatedContainer.deletedRecoverySkippedReason == "The space manager couldn't be read.")
+        // Four CABs each listing 500 CIBs where one is allowed: rejected at the first, before the
+        // others are read or anything from it is kept.
+        var oversized: [Int] = []
+        let crafted = build { builder in oversized = (0..<4).map { _ in cab(builder, listing: 500) }; return oversized }
+        let reader = RecordingReader(data: crafted.image)
+        let (craftedEvents, craftedContainer) = try await containerScan(crafted.image, reader: reader)
+        #expect(found(craftedEvents).count == 3)
+        #expect(await craftedContainer.deletedRecoverySkippedReason == "The space manager couldn't be read.")
+        var cabReads = 0
+        for block in oversized { cabReads += await reader.reads(ofBlock: block) }
+        #expect(cabReads == 1)
+    }
+
+    @Test func deletedExtentWithACryptoIDIsSkipped() async throws {
+        let (gone, goneBig) = deletedBlocks()
+        let builder = APFSImageBuilder()
+        builder.pendingFrees = [(6, gone, 1), (6, goneBig, 25)]
+        var volume = twoCheckpointVolume()
+        let index = volume.states[5]!.files.firstIndex { $0.name == "gone.txt" }!
+        volume.states[5]!.files[index].cryptoID = 5
+        var volumes = [volume]
+        builder.container(&volumes)
+        #expect(found(await scan(builder.image)).filter(\.isDeleted).map(\.name) == ["gone-big.bin"])
+    }
+
+    @Test func deletedFilesAreRecoveredThroughMultiLevelTrees() async throws {
+        // The old tree is walked across two leaves, and the live tree and object maps are searched
+        // through their index nodes (`inodeExists`, directory lookups, node resolution).
+        let (gone, goneBig) = deletedBlocks(splitTrees: true)
+        let builder = APFSImageBuilder()
+        builder.splitTrees = true
+        builder.pendingFrees = [(6, gone, 1), (6, goneBig, 25)]
+        var volumes = [twoCheckpointVolume()]
+        builder.container(&volumes)
+        #expect(builder.fsLeafBlocks["1026@5"]?.count == 2 && builder.fsLeafBlocks["1026@6"]?.count == 2)
+        let events = await scan(builder.image)
+        #expect(events.last == .completed)
+        let deleted = found(events).filter(\.isDeleted)
+        #expect(deleted.map(\.path) == ["/docs/gone.txt", "/docs/nested/gone-big.bin"])
+        for file in deleted {
+            let expected = volumes[0].states[5]!.files.first { $0.name == file.name }!.data
+            #expect(try await bytes(of: file, in: builder.image) == expected)
+        }
     }
 
     @Test func olderCheckpointWithDamagedTreeIsSkippedNotFatal() async throws {

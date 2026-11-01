@@ -122,8 +122,25 @@ enum APFSTreeKind: Sendable {
     case ephemeral([UInt64: Int64])
 }
 
+/// What a reference says the object it points at must be: its `o_oid`, and, for a virtual object,
+/// the `o_xid` its object-map entry records. A block that checksums but doesn't match was reused
+/// (or never belonged to this tree), so it is never read as the referenced object.
+struct APFSObjectReference: Sendable, Equatable {
+    let oid: UInt64
+    let xid: UInt64?
+
+    /// A physical object's identifier is its own block address.
+    static func physical(_ address: Int64) -> APFSObjectReference { APFSObjectReference(oid: UInt64(address), xid: nil) }
+
+    func matches(_ header: APFSObjectHeader) -> Bool {
+        header.oid == oid && (xid.map { $0 == header.xid } ?? true)
+    }
+}
+
 struct APFSTree: Sendable {
     let root: Int64
+    /// The identity the root node must carry.
+    let rootReference: APFSObjectReference
     let kind: APFSTreeKind
     let compare: @Sendable (Data, Data) -> Int
 }

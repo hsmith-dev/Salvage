@@ -32,6 +32,8 @@ enum APFS {
     static let checkpointMapLast: UInt32 = 1
 
     static let omapValueDeleted: UInt32 = 0x1, omapValueEncrypted: UInt32 = 0x4, omapValueNoHeader: UInt32 = 0x8
+    /// `om_flags`: the volume is being encrypted or decrypted, so any block may hold ciphertext.
+    static let omapEncrypting: UInt32 = 0x2, omapDecrypting: UInt32 = 0x4
 
     static let fsUnencrypted: UInt64 = 0x1
     static let incompatCaseInsensitive: UInt64 = 0x1, incompatNormalizationInsensitive: UInt64 = 0x8
@@ -363,15 +365,18 @@ struct APFSFileExtent: Sendable, Equatable {
     let logicalAddress: UInt64
     let length: UInt64
     let physicalBlock: UInt64
+    /// `crypto_id`: non-zero when the extent's blocks are encrypted with a per-file or volume key.
+    let cryptoID: UInt64
 
     init(key: Data, value: Data) throws {
         guard key.count >= 16, value.count >= 24 else { throw ScanError.malformed("Truncated APFS file extent.") }
         logicalAddress = try key.number(8, 8)
         length = try value.number(0, 8) & APFS.fileExtentLengthMask
         physicalBlock = try value.number(8, 8)
+        cryptoID = try value.number(16, 8)
     }
-    init(logicalAddress: UInt64, length: UInt64, physicalBlock: UInt64) {
-        self.logicalAddress = logicalAddress; self.length = length; self.physicalBlock = physicalBlock
+    init(logicalAddress: UInt64, length: UInt64, physicalBlock: UInt64, cryptoID: UInt64 = 0) {
+        self.logicalAddress = logicalAddress; self.length = length; self.physicalBlock = physicalBlock; self.cryptoID = cryptoID
     }
 }
 
@@ -404,7 +409,8 @@ struct APFSSpaceManager: Sendable {
     let mainFreeQueueCount: UInt64
     let mainFreeQueueTreeOID: UInt64
 
-    init(_ data: Data, containerBlockSize: Int64) throws {
+    /// `containerBlockCount` is `nx_block_count`; the space manager may not describe more blocks.
+    init(_ data: Data, containerBlockSize: Int64, containerBlockCount: Int64) throws {
         header = try APFSObjectHeader(data)
         guard header.type == APFS.ObjectType.spaceman else { throw ScanError.malformed("APFS space manager has the wrong object type.") }
         blockSize = try signed(data.number(32, 4))
@@ -419,15 +425,21 @@ struct APFSSpaceManager: Sendable {
         tier2BlockCount = try signed(data.number(96, 8))
         mainFreeQueueCount = try data.number(240, 8)
         mainFreeQueueTreeOID = try data.number(248, 8)
-        // One bitmap block covers one chunk, so the chunk size is fixed by the block size.
-        guard blockSize == containerBlockSize, blocksPerChunk == blockSize * 8, chunksPerCIB > 0, cibsPerCAB > 0,
-              blockCount > 0, chunkCount == (blockCount + blocksPerChunk - 1) / blocksPerChunk,
-              cibCount == (chunkCount + chunksPerCIB - 1) / chunksPerCIB,
-              cabCount == 0 || cabCount == (cibCount + cibsPerCAB - 1) / cibsPerCAB else {
-            throw ScanError.malformed("Invalid APFS space manager geometry.")
-        }
+        let invalid = ScanError.malformed("Invalid APFS space manager geometry.")
+        // Every count is bounded before it takes part in arithmetic, and the arithmetic is checked:
+        // these are on-disk values. One bitmap block covers one chunk, so the chunk size is fixed
+        // by the block size.
+        guard blockSize == containerBlockSize, blocksPerChunk == blockSize * 8,
+              chunksPerCIB > 0, cibsPerCAB > 0, blockCount > 0, blockCount <= containerBlockCount else { throw invalid }
+        let expectedChunks = try checkedAdd(blockCount, blocksPerChunk - 1) / blocksPerChunk
+        guard chunkCount == expectedChunks else { throw invalid }
+        let expectedCIBs = try checkedAdd(chunkCount, chunksPerCIB - 1) / chunksPerCIB
+        guard cibCount == expectedCIBs else { throw invalid }
+        let expectedCABs = try checkedAdd(cibCount, cibsPerCAB - 1) / cibsPerCAB
+        guard cabCount == 0 || cabCount == expectedCABs else { throw invalid }
         let addressCount = cabCount > 0 ? cabCount : cibCount
-        guard addressCount <= 1 << 16, addressOffset >= 32, addressOffset + Int(addressCount) * 8 <= data.count else {
+        guard addressCount <= 1 << 16, addressOffset >= 32, addressOffset <= data.count,
+              Int(addressCount) * 8 <= data.count - addressOffset else {
             throw ScanError.malformed("APFS space manager address table overflows its object.")
         }
         var addresses: [Int64] = []
@@ -458,10 +470,12 @@ struct APFSChunkInfo: Sendable {
         return result
     }
 
-    /// The chunk-info block addresses listed in one chunk-info address block (`cab_addr_block`).
-    static func cibAddresses(in block: Data) throws -> [Int64] {
+    /// The chunk-info block addresses listed in one chunk-info address block (`cab_addr_block`),
+    /// at most `limit` of them (`sm_cibs_per_cab`, or fewer when the running total is near `sm_cib_count`).
+    static func cibAddresses(in block: Data, limit: Int64) throws -> [Int64] {
         let count = Int(try block.number(36, 4))
         guard count <= (block.count - 40) / 8 else { throw ScanError.malformed("APFS chunk-info address block overflows.") }
+        guard Int64(count) <= limit else { throw ScanError.malformed("APFS chunk-info address block lists too many blocks.") }
         return try (0..<count).map { try signed(block.number(40 + $0 * 8, 8)) }
     }
 }
