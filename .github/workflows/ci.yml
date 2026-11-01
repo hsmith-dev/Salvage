@@ -97,6 +97,11 @@ jobs:
       - name: Run SalvageDiskIO tests
         run: swift test --package-path SalvageDiskIO
 
+      # spec-tech-batch-6 §A: parser fuzz smoke test -- 500 mutated images per format, fixed seed, a
+      # full ScanSession each, in child processes so a trap or hang fails this step with its seed.
+      - name: Parser fuzz smoke test (500 iterations per format, fixed seed)
+        run: ./scripts/fuzz-parsers.sh --smoke
+
       # Disposable spike tooling (Story 1.2's FDA/raw-device-access harness, see
       # scripts/spike-raw-device-access/), but it's still real code with safety-critical
       # boot-disk-detection logic -- build and test it like every other package in the repo

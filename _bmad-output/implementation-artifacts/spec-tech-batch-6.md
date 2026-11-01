@@ -127,3 +127,33 @@ The self-test packages an unsigned Debug build in dry-run mode. It then mounts t
 - `xcodebuild -project Salvage.xcodeproj -scheme Salvage -configuration Debug -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO -only-testing:SalvageTests test`
 - `xcodebuild -project Salvage.xcodeproj -scheme Salvage -configuration Release -destination 'platform=macOS' CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO build`
 - Workflow YAML must parse (`python3 -c "import yaml; yaml.safe_load(open(f))"`).
+
+## Implementation Notes — A (parser fuzzing)
+
+**What was built.**
+- `SalvageCore/Tests/SalvageCoreTests/FuzzTests.swift`: a deterministic, seedable mutation fuzzer. It is opt-in (`SALVAGE_FUZZ=1`, `SALVAGE_FUZZ_ITERATIONS` per format, `SALVAGE_FUZZ_SEED`; the other knobs are listed in the file header).
+  - Seeds: the existing synthetic builders (`fatImage`, `exfatImage` plus a deleted-entry variant, `EXTImage`/`ext2Image`/`deletedImage` for ext2 and ext4 extents and 64-bit descriptors, `HFSImage` basic/journaled/stale-slack), a compact port of the private NTFS builder, and MBR (exFAT + ext2 + an unlisted NTFS lost partition) and GPT (exFAT + HFS+) layouts. Real `hdiutil` images are added where available: FAT32, exFAT, HFS+, HFS+J, APFS, MBR/exFAT and GPT/HFS+J. They are created in a temp dir and attached `-nobrowse` at a private mount point only while populated (files written, one deleted), then detached and deleted. APFS has no synthetic seed, because the APFS builder is private to `APFSVolumeTests`; a checksummed NXSB stub stands in when hdiutil is unavailable.
+  - Mutations: bit flips; 1/2/4/8-byte boundary values (LE, or mostly BE for HFS+); length-field targeting at per-format header offsets (boot sectors, superblocks, MFT records and attributes, inodes, B-tree headers and node descriptors, NXSB, MBR/GPT entries); arithmetic ±1..16; random runs; truncation; block duplication; zero/0xFF fills; and splicing 32 B–4 KiB from any seed (any format) into the image. Offsets favour blocks that hold structure in the seed. In 80% of iterations a fix-up step re-seals checksums the seed had valid, so mutations get past them: APFS Fletcher-64, exFAT boot region and entry sets, and the GPT header and entry array.
+  - Each iteration runs a full `ScanSession` (discovery, parsers, sweep, carving) over the result through the in-memory `ImageReader`.
+  - `fuzzParsers` (driver) re-invokes the test binary (`swiftpm-testing-helper … --filter FuzzTests/fuzzWorker`) once per batch, in parallel. The worker writes each iteration number to a status file before scanning it. A signal death or an unfinished exit is a crash, located by iteration, and `SWIFT_BACKTRACE` supplies a signature: the trap message plus the first SalvageCore frame. A child whose iteration outlives `HANG_BASE + HANG_PER_MIB × largest seed MiB` (30 s + 2 s/MiB) is SIGKILLed and reported as a hang. The batch then resumes at the next iteration. Each finding gets `crashes/<kind>-<format>-<iteration>/` with `input.img` and a `README.txt` holding the mutation list and two commands: one replays the input (`SALVAGE_FUZZ_REPRO=… --filter FuzzTests/fuzzReproduce`), the other regenerates it from the seed. Crashes are also greedily minimised against their base seed into `minimised.img` and a patch list (in Swift literal form, for regression tests). `summary.json` holds the totals. `SALVAGE_FUZZ_ALLOW` lets a known, owned-elsewhere signature be reported without failing the run.
+  - `mutatorIsDeterministicAndSeedsScan` (always on) checks that the mutator is a pure function of (seed, format, iteration) and that every synthetic seed under 4 MiB scans to completion.
+  - Harness self-test: `SALVAGE_FUZZ_INJECT_CRASH` / `SALVAGE_FUZZ_INJECT_HANG=<format>:<iteration>` trap or spin in the worker. With these, the injected crash (exfat:37, `signal 5`) and hang (ntfs:120, killed after 5 s) were both reported at the right iteration and the run continued.
+- `scripts/fuzz-parsers.sh`: builds in release with `-Xswiftc -enable-testing`. Debug traps the same way but scans the 32 MiB FAT32 seeds about 150× slower (≈6 s vs ≈35 ms). The default is 20,000 iterations per format with a random seed. `--smoke` gives 500 iterations at fixed seed `0x5a17a6e`, `--debug` switches the build, and `--repro <file>` replays an input. Exits 1 on any non-allowed finding.
+- `.github/workflows/ci.yml`: one new step, `./scripts/fuzz-parsers.sh --smoke`, after the DiskIO tests. Cost: the release test build took about 11 minutes here (the fuzz run itself takes about 25 s locally), so expect the step to add 10–20 minutes on the hosted runner.
+
+**Runs (all release, 8 parallel workers, on a shared machine).**
+
+| Seed | Iterations per format | Formats | Crashes | Hangs | Wall time |
+|---|---|---|---|---|---|
+| `0x20261101` | 20,000 | 9 | 0 | 0 | ~13 min of workers (driver hung, see below) |
+| `0x20261102` | 20,000 | 9 | 0 | 0 | 231 s |
+| `0x20261103` | 200,000 | 9 | 0 | 0 | 1,796 s |
+| `0x5a17a6e` (smoke) | 500 | 9 | 0 | 0 | 10 s |
+
+The formats are fat32, exfat, ntfs, ext2, ext4, hfsplus, apfs, mbr and gpt. The first run's driver never wrote a summary: `Process.waitUntilExit()` blocked forever on a cooperative thread after its children exited. Every worker had written `done` and no crash log was left, but that run is counted only as corroboration. The driver now observes exit through `terminationHandler`.
+
+Scan depth check, 200 inputs per format: about half complete with files found and half end in a parser error (`malformed`, `unsupported`, cluster/extent damage). MBR and GPT complete almost always, because one damaged partition only skips that volume. FAT32 completes about 80% of the time, finding 0–10 files.
+
+**Findings.** None. No trap or hang appeared in `Parsers/**`, carving or `ScanSession` in 2.2 million total iterations, so no parser fix or regression test was needed, and there are no carving or `ScanSession` crashes to report. The parsers' existing checked arithmetic (`checkedAdd`/`checkedMultiply`/`signed`, bounded `Data.number`) and work budgets held.
+
+**Limits.** Coverage is mutation-based from a small seed set. It does not exercise APFS FileVault unlocking (no credentials are passed), resumed scans (`resumingFrom`), or recovery reads after the scan (`FileContentReader`). Real-image seeds differ between runs (UUIDs, timestamps), so a finding from a real seed is reproduced from its saved `input.img`, not from the seed number alone. HFS+ journal and NTFS update-sequence checksums are not re-sealed.
