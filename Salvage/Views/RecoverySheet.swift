@@ -164,10 +164,13 @@ struct RecoverySheet: View {
 
 /// The destination = source block (FR-15). The only place the `blocking` color appears.
 struct DestinationBlockBanner: View {
+    /// Recovery's message by default; imaging a drive passes its own (spec-tech-image-drive).
+    var message = RecoveryCoordinator.blockedMessage
+
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Image(systemName: "xmark.octagon.fill").accessibilityHidden(true)
-            Text(RecoveryCoordinator.blockedMessage).fixedSize(horizontal: false, vertical: true)
+            Text(message).fixedSize(horizontal: false, vertical: true)
         }
         .font(.body.weight(.medium))
         .foregroundStyle(BlockingColors.text)
@@ -175,7 +178,7 @@ struct DestinationBlockBanner: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(BlockingColors.surface, in: RoundedRectangle(cornerRadius: 8))
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Destination blocked. \(RecoveryCoordinator.blockedMessage)")
+        .accessibilityLabel("Destination blocked. \(message)")
         .accessibilityIdentifier("destination-blocked-banner")
     }
 }

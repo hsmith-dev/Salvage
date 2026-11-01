@@ -54,6 +54,17 @@ destination you choose (`Salvage/ViewModels/RecoveryCoordinator.swift`):
   (`SalvageDiskIO/Sources/SalvageDiskIO/DestinationSafety.swift`). The check runs when you choose
   the folder and again just before writing.
 
+**A drive image**, only when you choose **Image This Drive…**, and only to the file you name in
+the save panel (`Salvage/ViewModels/DriveImaging.swift`,
+`SalvageDiskIO/Sources/SalvageDiskIO/ImageOutputFile.swift`):
+
+- The `.img` file holds every byte of the drive, with zeros where sectors couldn't be read. It is
+  created new; an existing file is replaced only when you confirm that in the save panel.
+- Next to it, `<name>.img.badblocks.json` lists the unreadable byte ranges, how much was copied
+  and the image's SHA-256. It holds no file contents.
+- A destination on the drive being imaged is blocked, and so is one whose drive can't be
+  determined, one without enough free space, and a FAT volume for a drive over 4 GB.
+
 **A saved scan position**, so an interrupted scan can resume
 (`Salvage/ViewModels/ScanCheckpointStore.swift`):
 

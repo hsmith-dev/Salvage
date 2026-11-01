@@ -49,6 +49,8 @@ struct DeviceListView: View {
     /// "Recover all files…" in their context menu.
     var finishedScanDevice: BlockDevice?
     var onRecoverPartition: (DevicePartition) -> Void = { _ in }
+    /// spec-tech-image-drive: "Image This Drive…" in a drive row's context menu.
+    var onImageDrive: (BlockDevice) -> Void = { _ in }
     var onSelect: (BlockDevice) -> Void = { _ in }
 
     var body: some View {
@@ -144,6 +146,11 @@ struct DeviceListView: View {
             .accessibilityLabel(device.displayName)
             .accessibilityValue(accessibilityValue(for: device))
             .accessibilityIdentifier("device-row-\(device.id)")
+            .contextMenu {
+                Button("Image This Drive…") { onImageDrive(device) }
+                    .disabled(!DriveImagingCenter.canImage(device) || (isScanning && activeDeviceID == device.id))
+                    .accessibilityIdentifier("image-drive-menu-\(device.id)")
+            }
     }
 
     /// The glyph alone never conveys the FileVault state (EXPERIENCE.md): "Locked" is spoken too.
