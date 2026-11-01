@@ -7,14 +7,14 @@ sources:
   - _bmad-output/planning-artifacts/architecture/architecture-DataRecoveryTool-2026-10-30/ARCHITECTURE.md
   - _bmad-output/planning-artifacts/epics.md
 created: 2026-10-31
-updated: 2026-10-31
+updated: 2026-11-01
 ---
 
 # Salvage — Experience Spine
 
 ## Foundation
 
-Native macOS desktop app (SwiftUI), single window, standard sidebar + content split view — no custom chrome, no multi-window workflow in v1. No third-party UI system; inherits Apple Human Interface Guidelines throughout. `DESIGN.md` is the visual identity reference; this spine is the behavior. Light/dark follows the system setting automatically (no in-app theme toggle — there's nothing to configure, per the "calm, not configurable-for-its-own-sake" posture). The sidebar holds device selection only — no persistent scan-history list in v1 (no FR or story calls for one; each session starts from the Device Picker).
+Native macOS desktop app (SwiftUI), single window, standard sidebar + content split view — no custom chrome, no multi-window workflow in v1. No third-party UI system; inherits Apple Human Interface Guidelines throughout. `DESIGN.md` is the visual identity reference; this spine is the behavior. Light/dark follows the system setting automatically (no in-app theme toggle — there's nothing to configure, per the "calm, not configurable-for-its-own-sake" posture). The sidebar holds device selection only — no persistent scan-history list in v1 (no FR or story calls for one; each session starts from the Device Picker). It is sectioned like Disk Utility's: "Internal", "External" and "Disk Images", each device a row with its partitions beneath, and a "Hidden" group at the bottom for what Salvage doesn't scan (see Device row).
 
 ## Information Architecture
 
@@ -42,7 +42,7 @@ Microcopy only. Brand posture lives in `DESIGN.md.Brand & Style`.
 |---|---|
 | "This file could not be fully reconstructed." | "Oops! Something went wrong." |
 | "Scanning… 1,204 files found so far." | "Working our magic! ✨" |
-| "Your boot drive can't be scanned while macOS is running from it." | Silently excluding it with no explanation |
+| "Startup disk — Salvage can't scan the disk your Mac is running from" (sidebar); "Your boot drive can't be scanned while macOS is running from it." (refused scan) | Silently excluding it with no explanation |
 | "Wrong password." / "Couldn't unlock this volume — try again or use your recovery key." | A single generic "Unlock failed" for both cases |
 | "Built from the techniques pioneered by TestDisk and PhotoRec." | Implying the recovery methods are novel or proprietary |
 | Short, complete, factual sentences | Exclamation points, percentage claims, urgency language |
@@ -53,7 +53,8 @@ Behavioral. Visual specs live in `DESIGN.md.Components`.
 
 | Component | Use | Behavioral rules |
 |---|---|---|
-| Device row | Device Picker | Click selects and immediately begins the scan — no separate "confirm" step, matching macOS's direct-manipulation convention. Boot volume (if present) is shown, grayed, with its one-line reason, never omitted. |
+| Device row | Device Picker | Click selects and immediately begins the scan — no separate "confirm" step, matching macOS's direct-manipulation convention. Only whole devices are scan targets; partition/volume rows beneath them are information. |
+| Hidden group | Device Picker | Collapsed by default; its open/closed state is remembered per user. Holds the startup disk ("Startup disk — Salvage can't scan the disk your Mac is running from") and disk images macOS attached for itself — attached by the system rather than the user, or mounted nobrowse (simulator runtimes, system assets), which Disk Utility doesn't list either ("System disk image, used by macOS"). Rows are information only: listed with their reason, never omitted, never selectable, no context actions (scanning would unmount a system image). |
 | Type-bucket tile | Scan Results Dashboard | Click opens File Browser scoped to that category. Count/size update live if a scan is still running in the background. |
 | Lost Partitions card | Scan Results Dashboard | Visually and positionally distinct from the type-bucket grid — never merges into it (FR-9). Click opens File Browser scoped to that partition's reconstructed contents. |
 | Confidence label | File Browser rows, Preview pane | Text only, distinguished by size/weight/tone together per `DESIGN.md` — never by color alone. Never recalculated or re-derived in the UI layer — reflects exactly what `SalvageCore`'s scoring function returned (Architecture AD-7). |
@@ -71,7 +72,8 @@ Behavioral. Visual specs live in `DESIGN.md.Components`.
 | State | Surface | Treatment |
 |---|---|---|
 | No devices attached | Device Picker | "No storage devices found. Connect a drive to get started." — no illustration, no animation. |
-| Boot volume present | Device Picker | Grayed row, one-line reason (see Voice and Tone). |
+| Boot volume present | Device Picker | Listed under the collapsed "Hidden" group with its one-line reason, not selectable (see Voice and Tone). |
+| Only hidden devices attached | Device Picker | "Connect a drive or open a disk image to get started." above the Hidden group. |
 | Scan paused | Scan Progress | Progress freezes visually; "Paused" state text replaces the live percentage; Resume becomes the primary action. |
 | Unsupported filesystem | Scan Progress / Results | "This filesystem isn't supported yet." — factual, not apologetic, no retry-loop UI. |
 | FileVault locked (known up front) | Device Picker | Lock icon on the device row, paired with "Locked" in the row's accessible label (the glyph alone never conveys the state); selecting it opens the unlock sheet before any scan begins. |

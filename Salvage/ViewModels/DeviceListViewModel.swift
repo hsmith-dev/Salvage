@@ -59,7 +59,8 @@ public enum HiddenDeviceReason: Equatable, Sendable {
     /// The disk the Mac is running from (Architecture AD-4): never a scan target.
     case startupDisk
     /// A disk image macOS attached for itself (simulator runtimes, system assets), which Disk
-    /// Utility doesn't list either. Still a valid scan target.
+    /// Utility doesn't list either. Not offered for scanning: a scan unmounts its source, which
+    /// would pull a simulator runtime out from under Xcode.
     case systemDiskImage
 
     /// The one-line reason shown under the row and spoken by VoiceOver.
@@ -70,8 +71,9 @@ public enum HiddenDeviceReason: Equatable, Sendable {
         }
     }
 
-    /// Whether a row with this reason can be selected (and so scanned).
-    public var isScannable: Bool { self == .systemDiskImage }
+    /// Whether a row with this reason can be selected (and so scanned). Neither can: "Hidden" is
+    /// information only.
+    public var isScannable: Bool { false }
 }
 
 /// One row of the "Hidden" group.
@@ -210,7 +212,9 @@ public final class DeviceListViewModel {
     /// whatever `device.isBootVolume` the caller happened to pass in -- that field is just
     /// caller-supplied data, not something this method can trust as the real safety boundary.
     public func selectDevice(_ device: BlockDevice) {
-        guard let canonical = devices.first(where: { $0.id == device.id }), !canonical.isBootVolume else { return }
+        // System disk images are listed under "Hidden" for information only, never scanned.
+        guard let canonical = devices.first(where: { $0.id == device.id }), !canonical.isBootVolume,
+              !canonical.isSystemImage else { return }
         selectedDeviceID = canonical.id
     }
 
@@ -223,7 +227,7 @@ public final class DeviceListViewModel {
     private func apply(_ currentDevices: [BlockDevice]) {
         devices = currentDevices
         hasReceivedDevices = true
-        if let selectedDeviceID, !currentDevices.contains(where: { $0.id == selectedDeviceID && !$0.isBootVolume }) {
+        if let selectedDeviceID, !currentDevices.contains(where: { $0.id == selectedDeviceID && !$0.isBootVolume && !$0.isSystemImage }) {
             self.selectedDeviceID = nil
         }
     }

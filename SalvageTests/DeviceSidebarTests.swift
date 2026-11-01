@@ -113,7 +113,7 @@ struct DeviceSidebarSectionTests {
         #expect(sidebar.internalDrives.map(\.id) == ["disk1"])
         #expect(sidebar.hidden.map(\.reason) == [.startupDisk])
         #expect(!HiddenDeviceReason.startupDisk.isScannable)
-        #expect(HiddenDeviceReason.systemDiskImage.isScannable)
+        #expect(!HiddenDeviceReason.systemDiskImage.isScannable)
     }
 
     @Test("Images Salvage attached itself are left out entirely")
@@ -140,7 +140,7 @@ struct DeviceSidebarSectionTests {
         #expect(HiddenDevice(device: bare, reason: .systemDiskImage).title == "x.dmg")
     }
 
-    @Test("The view model selects a hidden system image but never the startup disk")
+    @Test("The view model never selects the startup disk or a system disk image; it does select a drive")
     @MainActor func selection() async throws {
         let model = DeviceListViewModel(watcher: StaticDeviceWatcher(devices: SidebarFixture.devices))
         model.startWatching()
@@ -148,7 +148,9 @@ struct DeviceSidebarSectionTests {
         model.selectDevice(SidebarFixture.bootSSD)
         #expect(model.selectedDeviceID == nil)
         model.selectDevice(SidebarFixture.systemImages[0])
-        #expect(model.selectedDeviceID == "disk40")
+        #expect(model.selectedDeviceID == nil)
+        model.selectDevice(SidebarFixture.usbStick)
+        #expect(model.selectedDeviceID == "disk18")
     }
 }
 

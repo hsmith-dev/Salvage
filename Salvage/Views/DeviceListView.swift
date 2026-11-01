@@ -276,23 +276,21 @@ extension DeviceListView {
         }
     }
 
-    /// The collapsed "Hidden" group: the startup disk (never selectable) and macOS's own disk
-    /// images (selectable, as any image), each with its reason. Its open state is remembered.
+    /// The collapsed "Hidden" group: the startup disk and macOS's own disk images, each with its
+    /// reason. Information only: no row is selectable (scanning a system image would unmount
+    /// it) and none offers actions. Its open state is remembered.
     fileprivate func hiddenSection(_ hidden: [HiddenDevice]) -> some View {
         Section {
             DisclosureGroup(isExpanded: $hiddenExpanded) {
                 ForEach(hidden) { item in
-                    let selectable = item.reason.isScannable && !isScanning
-                    HiddenDeviceRow(item: item, inUse: isScanning && activeDeviceID == item.id)
+                    HiddenDeviceRow(item: item)
                         .listRowSeparator(.hidden)
-                        .tag(item.id)
-                        .disabled(!selectable)
-                        .selectionDisabled(!selectable)
+                        .disabled(!item.reason.isScannable)
+                        .selectionDisabled(!item.reason.isScannable)
                         .accessibilityElement(children: .ignore)
                         .accessibilityLabel(item.title)
                         .accessibilityValue("\(item.reason.text). \(sizeText(for: item.device))")
                         .accessibilityIdentifier("device-row-\(item.id)")
-                        .contextMenu { if item.reason.isScannable { imageDriveButton(item.device) } }
                 }
             } label: {
                 HStack(spacing: 6) {
@@ -306,7 +304,7 @@ extension DeviceListView {
                 }
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel("Hidden, \(hidden.count) \(hidden.count == 1 ? "device" : "devices")")
-                .accessibilityHint("Devices Salvage can't scan, and disk images macOS uses for itself")
+                .accessibilityHint("Devices Salvage doesn't scan: your startup disk and disk images macOS uses for itself")
             }
             .selectionDisabled()
             .accessibilityIdentifier("hidden-group")
@@ -314,17 +312,17 @@ extension DeviceListView {
     }
 }
 
-/// The device row's first line, as Disk Utility titles a device: "MK3252GSX — 320.07 GB". One
-/// run of text, so a long name wraps onto a second line instead of hiding the capacity.
+/// The device row's first line: the device's name alone, truncated in the middle when long
+/// (the capacity leads the subtitle, so it never wraps or truncates away).
 private struct DeviceTitle: View {
     let name: String
-    let size: String
 
     var body: some View {
-        (Text(name).font(.headline).foregroundStyle(.inkPrimary)
-            + Text(capacitySuffix(size)).font(.headline.weight(.regular)).foregroundStyle(.inkSecondary))
-            .lineLimit(2)
-            .fixedSize(horizontal: false, vertical: true)
+        Text(name)
+            .font(.headline)
+            .foregroundStyle(.inkPrimary)
+            .lineLimit(1)
+            .truncationMode(.middle)
     }
 }
 
@@ -341,8 +339,9 @@ private struct DiskImageRow: View {
                 .foregroundStyle(.secondary)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
-                DeviceTitle(name: image.name, size: deviceSizeFormatter.string(fromByteCount: image.sizeBytes))
-                Text(inUse ? "In use by another scan" : "Image file · opened in Salvage")
+                DeviceTitle(name: image.name)
+                Text(inUse ? "In use by another scan"
+                     : subtitle([deviceSizeFormatter.string(fromByteCount: image.sizeBytes), "Image file", "opened in Salvage"]))
                     .font(.subheadline)
                     .foregroundStyle(.inkSecondary)
             }
@@ -356,8 +355,8 @@ private struct DiskImageRow: View {
 }
 
 /// One device row -- `DESIGN.md`'s `device-row` component (surface-raised background,
-/// `rounded/sm` corners, `spacing/3` padding): the drive's icon, "Model — capacity", and what it
-/// holds. It is the scan target; its partitions are the plain rows indented beneath it. Purely
+/// `rounded/sm` corners, `spacing/3` padding): the drive's icon, its name, then its capacity
+/// and what it holds ("320.07 GB · Whole drive · 2 partitions"). It is the scan target; its partitions are the plain rows indented beneath it. Purely
 /// visual: `DeviceListView` applies the row's accessibility label/value itself.
 private struct DeviceRow: View {
     let device: BlockDevice
@@ -373,7 +372,7 @@ private struct DeviceRow: View {
                 .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 2) {
-                DeviceTitle(name: device.displayName, size: sizeText(for: device))
+                DeviceTitle(name: device.displayName)
                 Text(inUse ? "In use by another scan" : (isLocked ? "\(contents) · Locked" : contents))
                     .font(.subheadline)
                     .foregroundStyle(.inkSecondary)
@@ -402,12 +401,13 @@ private struct DeviceRow: View {
         .help(device.diskImagePath ?? "")
     }
 
-    /// "Whole drive · 2 partitions": says this row is the device, and what is beneath it.
+    /// "320.07 GB · Whole drive · 2 partitions": the capacity, that this row is the device, and
+    /// what is beneath it.
     private var contents: String {
-        let kind = device.isDiskImage ? "Disk image" : "Whole drive"
+        var parts = [sizeText(for: device), device.isDiskImage ? "Disk image" : "Whole drive"]
         let count = device.partitions.count
-        guard count > 0 else { return kind }
-        return "\(kind) · \(count) \(count == 1 ? "partition" : "partitions")"
+        if count > 0 { parts.append("\(count) \(count == 1 ? "partition" : "partitions")") }
+        return subtitle(parts)
     }
 }
 
@@ -415,7 +415,6 @@ private struct DeviceRow: View {
 /// these are listed so nothing is silently omitted, not to be browsed.
 private struct HiddenDeviceRow: View {
     let item: HiddenDevice
-    var inUse = false
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
@@ -424,12 +423,12 @@ private struct HiddenDeviceRow: View {
                 .foregroundStyle(.tertiary)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
-                (Text(item.title).foregroundStyle(.inkSecondary)
-                    + Text(capacitySuffix(sizeText(for: item.device))).foregroundStyle(.inkTertiary))
+                Text(item.title)
                     .font(.subheadline)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text(inUse ? "In use by another scan" : item.reason.text)
+                    .foregroundStyle(.inkSecondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text("\(sizeText(for: item.device)) · \(item.reason.text)")
                     .font(.caption)
                     .foregroundStyle(.inkTertiary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -441,10 +440,10 @@ private struct HiddenDeviceRow: View {
     }
 }
 
-/// " — 320.07 GB", with non-breaking spaces after the dash and inside the size, so a name too
-/// long for one line wraps before the dash and the capacity stays whole.
-private func capacitySuffix(_ size: String) -> String {
-    " —\u{00A0}" + size.replacingOccurrences(of: " ", with: "\u{00A0}")
+/// "320.07 GB · Whole drive · 2 partitions", with non-breaking spaces inside each part, so a
+/// narrow sidebar wraps the line only between parts.
+private func subtitle(_ parts: [String]) -> String {
+    parts.map { $0.replacingOccurrences(of: " ", with: "\u{00A0}") }.joined(separator: " · ")
 }
 
 private func deviceSymbol(_ device: BlockDevice) -> String {

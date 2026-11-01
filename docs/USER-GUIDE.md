@@ -80,23 +80,23 @@ Disk images you attach yourself are opened directly, without a password.
 
 The left column is laid out like Disk Utility's sidebar, in sections:
 
-- **Internal** and **External**: one row per physical drive, with its model and capacity (for
-  example "MK3252GSX — 320.07 GB") and a drive icon. The drive's partitions are indented beneath
+- **Internal** and **External**: one row per physical drive, with a drive icon, its model name, and
+  under it the capacity and what it holds (for example "320.07 GB · Whole drive · 2 partitions"). The drive's partitions are indented beneath
   it, each with its name ("Untitled" if it has none), format and size. An APFS drive shows its
   APFS container, with the container's volumes indented once more; click the small arrow beside a
   container to show or hide its volumes.
 - **Disk Images**: disk images you attached yourself (in Finder or Disk Utility), shown like
   drives, and image files you opened in Salvage (see
   [Scan a disk-image file](#scan-a-disk-image-file)).
-- **Hidden**, at the bottom and collapsed: what Salvage can't scan, or what you almost certainly
-  don't want to, each with its reason. Click it to open it; Salvage remembers whether it's open.
+- **Hidden**, at the bottom and collapsed: what Salvage doesn't scan, each with its capacity and
+  reason. Click it to open it; Salvage remembers whether it's open.
   - Your startup disk: "Startup disk — Salvage can't scan the disk your Mac is running from". It
     can't be selected. If your Mac has another internal drive that isn't the startup disk, it's
     listed under Internal and can be scanned.
   - Disk images macOS attached for its own use, such as Xcode simulator runtimes and downloaded
     system components. Disk Utility doesn't list them either. Salvage counts an image as one of
-    these when the system, not you, attached it, or when it's mounted hidden. You can still
-    select one to scan it.
+    these when the system, not you, attached it, or when it's mounted hidden. They're listed for
+    information only and can't be selected: scanning one would unmount it from under macOS.
 
 - **Only whole drives can be selected.** The bold row with the drive icon is the drive; clicking
   it starts a scan of the whole drive. Partition and volume rows are there for information.
