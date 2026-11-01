@@ -8,6 +8,7 @@ struct ScanProgressView: View {
         let volumeLabels = model.sourceVolumeLabels
         VStack(alignment: .leading, spacing: 16) {
             Text(title).font(.title2)
+                .accessibilityIdentifier("scan-title")
             if let device = model.device { Text(device.displayName).foregroundStyle(.secondary) }
             if model.state == .resumable {
                 resumeOffer
@@ -18,6 +19,7 @@ struct ScanProgressView: View {
                     .accessibilityLabel("Source bytes scanned")
                 Text("\(Int(Double(model.bytesScanned) / Double(model.totalBytes) * 100))% of supported volume bytes read")
                     .font(.subheadline).foregroundStyle(.secondary)
+                    .accessibilityIdentifier("scan-progress-percent")
             }
             TimelineView(.periodic(from: .now, by: 1)) { context in
                 HStack(spacing: 24) {

@@ -152,3 +152,26 @@ merge, update these places:
 **Not verified by this item:** whether a GitHub release exists. No local tags exist, so the
 README and the guide say to build from source if none is listed. No code or tests were run for
 this docs-only change.
+
+## Implementation Notes — C
+
+**What was built**
+- `Salvage/Testing/UITestFixtures.swift` (whole file inside `#if DEBUG`): `UITestFixture`, enabled by `-SalvageUITestFixture <standard|slowScan|destinationOnSource|fileVault>`. It provides a fake `DeviceWatching` (a grayed boot drive `disk990`, the fixture drive `disk991` and, for `fileVault`, a locked drive `disk992`). It also provides a scan runner that drives the real `ScanSession` over an in-memory `BlockReader` holding a synthetic exFAT image built the same way as `exfatImage()` in `ScanSessionTests.swift`: 4 KiB clusters, bitmap, contiguous files in `/DCIM`, `/Documents` and the root, two pictures encoded with ImageIO and three documents. The image is 8 MiB, or 64 MiB with a 400 ms delay per 1 MiB sweep read for `slowScan` (about 26 s, so pausing is reliable even on a loaded machine). The rest of the fixture covers recovery and unlock: a recovery destination preset from `-SalvageUITestDestination <dir>`, a destination verdict (`.safe`, or `.sameDevice` for `destinationOnSource`) carrying the real `statfs` mount source so the engine's opened-folder check still runs, and a fake FileVault check. `-SalvageUITestExpected <dir>` writes the fixture files' exact bytes for the byte-identical comparison. In fixture mode no checkpoints are saved and nothing touches Application Support.
+- `ContentView.swift`: a `#if DEBUG` branch in `init` swaps in the fixture runner and unlock check. It also adds `CompositionRoot` (`deviceWatcher()`, `recoveryCoordinator(files:source:)`, `presetDestination`). These return the live adapters, and only their `#if DEBUG` lines consult the fixture. `SalvageApp.swift` needed no change.
+- `SalvageUITests/SalvageUITests.swift`: the 7 tests (1)–(7). Tests write only to a per-test folder under the runner's temporary directory, which is deleted in `tearDown`. They never press Check for Updates.
+- `project.yml`: a new `SalvageUITests` (`bundle.ui-testing`) target, added to the `Salvage` scheme's test targets so `-only-testing:SalvageUITests` works. The xcodeproj was regenerated with xcodegen 2.46.0.
+- CI (`.github/workflows/ci.yml`): `build-for-testing` (unsigned) always runs. The UI-test run is gated on the repository variable `SALVAGE_RUN_UI_TESTS == '1'`, because XCUITest needs a GUI session plus automation permission, which hosted runners don't reliably provide. That step ad-hoc signs (`CODE_SIGN_IDENTITY="-"`).
+
+**Deviation (needs a human ack).** Section C allows only one-line `.accessibilityIdentifier` additions in other view files. However, the device watcher and the recovery destination are created *inside* `DeviceListView` and `RecoverySheet`, not in `ContentView`, so a fake can't be injected without touching them. Three one-line seam calls were added, and in Release builds they resolve to exactly the previous live behavior:
+- `DeviceListView.swift`: `DeviceListViewModel(watcher: CompositionRoot.deviceWatcher())`
+- `RecoverySheet.swift`: `CompositionRoot.recoveryCoordinator(files:source:)` in `init`
+- `RecoverySheet.swift`: the first line of `chooseDestination()` uses `CompositionRoot.presetDestination`, which is always nil in Release, instead of `NSOpenPanel`.
+Every other edit in view files is a one-line `.accessibilityIdentifier`: `device-row-<bsd>`, `scan-title`, `scan-progress-percent`, `results-status`, `bucket-<category>`, `file-table`, `recover-button`, `file-preview`, `preview-image`, `recovery-confirm-button`, `destination-blocked-banner` and `recovery-summary-headline`.
+
+**Limits of the fakes**
+- `VolumeCredential` exposes no way to read its secret outside SalvageCore. The fixture's unlock check therefore accepts a password by kind and byte length (`fixture-vault-pass`, 18 bytes) and rejects others such as `wrong`. It tests the sheet's flow, not decryption.
+- Test (5) checks the UI's handling of a `.sameDevice` verdict. The real `DestinationSafety` resolution of fake BSD names can't be exercised; its own unit tests cover that.
+- Test (3) checks that the image renders by sampling the preview pane's pixels for the fixture picture's saturated colours, because SwiftUI's decorative `Image` isn't exposed to accessibility.
+- SwiftUI repeats a merged row's identifier (`device-row-disk991-device-row-disk991`), so the tests also match the identifier as a prefix.
+
+**Release check.** A Release build was made with the Verification command. `strings` and `nm` on `Salvage.app/Contents/MacOS/Salvage` and on the Release `UITestFixtures.o`/`ContentView.o` show 0 occurrences of `UITestFixture`, `SalvageUITestFixture`, `SalvageUITestDestination`, `SalvageUITestExpected`, `ExFATFixtureImage`, `FixtureReader`, `FixtureDeviceWatcher`, `fixture-vault-pass` and `Salvage Fixture Drive`. The Debug `Salvage.debug.dylib` does contain `SalvageUITestFixture` (positive control).

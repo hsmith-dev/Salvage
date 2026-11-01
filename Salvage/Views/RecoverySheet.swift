@@ -14,9 +14,9 @@ struct RecoverySheet: View {
     init(files: [RecoveredFile], source: SourceSession, rootName: String? = nil,
          reconstructedFiles: [RecoveredFile] = [], onDone: @escaping () -> Void) {
         self.onDone = onDone
-        _coordinator = State(initialValue: RecoveryCoordinator(files: files, source: source, rootName: rootName,
-                                                               reconstructedFiles: reconstructedFiles,
-                                                               sourceLabel: rootName))
+        _coordinator = State(initialValue: CompositionRoot.recoveryCoordinator(files: files, source: source, rootName: rootName,
+                                                                              reconstructedFiles: reconstructedFiles,
+                                                                              sourceLabel: rootName))
     }
 
     var body: some View {
@@ -97,6 +97,7 @@ struct RecoverySheet: View {
                 Button(isRetry ? "Try Again" : (coordinator.spaceShortfall != nil ? "Recover Anyway" : "Recover")) { coordinator.start() }
                     .keyboardShortcut(.defaultAction)
                     .disabled(!coordinator.canRecover)
+                    .accessibilityIdentifier("recovery-confirm-button")
             }
         }
     }
@@ -107,6 +108,7 @@ struct RecoverySheet: View {
     }
 
     private func chooseDestination() {
+        if let url = CompositionRoot.presetDestination { Task { await coordinator.chooseDestination(url) }; return }
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
@@ -155,6 +157,7 @@ struct DestinationBlockBanner: View {
         .background(BlockingColors.surface, in: RoundedRectangle(cornerRadius: 8))
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Destination blocked. \(RecoveryCoordinator.blockedMessage)")
+        .accessibilityIdentifier("destination-blocked-banner")
     }
 }
 
@@ -188,6 +191,7 @@ struct RecoverySummaryView: View {
                 .font(.title2.weight(.semibold))
                 .accessibilityAddTraits(.isHeader)
             Text(Self.headline(summary, sourceName: sourceName)).fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("recovery-summary-headline")
             Text(summary.root.path).font(.callout).foregroundStyle(.secondary)
                 .lineLimit(2).truncationMode(.middle).textSelection(.enabled)
 

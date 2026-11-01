@@ -6,13 +6,23 @@ import SwiftUI
 struct ContentView: View {
     @State private var scan: ScanViewModel
     init() {
+        let rescan: UnlockViewModel.Rescan
+        #if DEBUG
+        // UI tests only (`-SalvageUITestFixture`): in-memory fakes, no checkpoints saved.
+        if let fixture = UITestFixture.active {
+            let scan = ScanViewModel(runner: fixture.runScan, checkpointStore: nil)
+            _scan = State(initialValue: scan)
+            rescan = { device, credentials in Task { @MainActor in scan.start(device, credentials: credentials) } }
+            _unlock = State(initialValue: UnlockViewModel(verify: fixture.verifyUnlock, rescan: rescan))
+            return
+        }
+        #endif
         let scan = ScanViewModel(runner: Self.runScan, checkpointStore: .applicationSupport())
         _scan = State(initialValue: scan)
+        rescan = { device, credentials in Task { @MainActor in scan.start(device, credentials: credentials) } }
         _unlock = State(initialValue: UnlockViewModel(
             verify: { device, credential in await Self.verifyUnlock(device, credential, source: await scan.source) },
-            rescan: { device, credentials in
-                Task { @MainActor in scan.start(device, credentials: credentials) }
-            }))
+            rescan: rescan))
     }
     nonisolated private static func runScan(run: ScanRun, events: AsyncStream<ScanEvent>.Continuation) async throws {
         let reader = try await RawBlockReader.prepare(device: run.device)
@@ -97,6 +107,41 @@ struct ContentView: View {
         Binding(get: { unlock.request }, set: { value in
             if value == nil, let device = unlock.resolve() { startAfterPendingUnlock(device) }
         })
+    }
+}
+
+/// The live adapters views reach for outside `ContentView` (the Device Picker's watcher and the
+/// recovery flow's destination check and folder). Release builds always get the live ones; only a
+/// DEBUG build launched with `-SalvageUITestFixture` gets the UI-test fakes (`UITestFixture`).
+enum CompositionRoot {
+    @MainActor static func deviceWatcher() -> any DeviceWatching {
+        #if DEBUG
+        if let fixture = UITestFixture.active { return fixture.deviceWatcher }
+        #endif
+        return DeviceWatcher()
+    }
+
+    @MainActor static func recoveryCoordinator(files: [RecoveredFile], source: SourceSession, rootName: String? = nil,
+                                               reconstructedFiles: [RecoveredFile] = [],
+                                               sourceLabel: String? = nil) -> RecoveryCoordinator {
+        #if DEBUG
+        if let fixture = UITestFixture.active {
+            return RecoveryCoordinator(files: files, content: source.content, deviceName: source.device.displayName,
+                                       rootName: rootName, reconstructedFiles: reconstructedFiles, sourceLabel: sourceLabel,
+                                       destinationCheck: fixture.destinationCheck)
+        }
+        #endif
+        return RecoveryCoordinator(files: files, source: source, rootName: rootName,
+                                   reconstructedFiles: reconstructedFiles, sourceLabel: sourceLabel)
+    }
+
+    /// A destination chosen in advance, replacing the folder picker; always nil in Release.
+    static var presetDestination: URL? {
+        #if DEBUG
+        return UITestFixture.active?.destination
+        #else
+        return nil
+        #endif
     }
 }
 

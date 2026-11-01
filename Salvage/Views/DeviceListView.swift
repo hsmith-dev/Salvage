@@ -36,7 +36,7 @@ private func sizeText(for device: BlockDevice) -> String {
 /// into sections. Clicking an eligible row validates selection and starts a scan through the composition root. See `DESIGN.md`'s `device-row` component and `EXPERIENCE.md`'s
 /// Device row / State Patterns for the full behavioral spec this view implements.
 struct DeviceListView: View {
-    @State private var viewModel = DeviceListViewModel()
+    @State private var viewModel = DeviceListViewModel(watcher: CompositionRoot.deviceWatcher())
     /// Tree nodes the user expanded or collapsed away from their default
     /// (`DeviceTreeNode.startsExpanded`).
     @State private var toggledNodeIDs: Set<String> = []
@@ -133,6 +133,7 @@ struct DeviceListView: View {
             // inconsistent -- not confirmed either way, no VoiceOver testing was done.
             .accessibilityLabel(device.displayName)
             .accessibilityValue(accessibilityValue(for: device))
+            .accessibilityIdentifier("device-row-\(device.id)")
     }
 
     /// The glyph alone never conveys the FileVault state (EXPERIENCE.md): "Locked" is spoken too.

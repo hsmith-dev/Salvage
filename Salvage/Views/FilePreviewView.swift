@@ -33,6 +33,7 @@ struct FilePreviewView<Details: View>: View {
                     .strokeBorder(Color(nsColor: .separatorColor)))
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel("Preview of \(file.name)")
+                .accessibilityIdentifier("file-preview")
             VStack(alignment: .leading, spacing: 4) {
                 PreviewMetadataHeader(file: file)
                 details
@@ -61,6 +62,7 @@ struct FilePreviewView<Details: View>: View {
                     .aspectRatio(contentMode: .fit)
                     .padding(16)
                     .accessibilityLabel("Image preview")
+                    .accessibilityIdentifier("preview-image")
             case .pdf(let pdf):
                 PDFPreview(document: pdf.document)
                     .accessibilityLabel("PDF preview")

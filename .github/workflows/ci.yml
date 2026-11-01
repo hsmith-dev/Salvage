@@ -143,3 +143,37 @@ jobs:
             -only-testing:SalvageTests \
             CODE_SIGNING_ALLOWED=NO \
             test
+
+      # spec-tech-batch-5 §C: end-to-end UI tests against the DEBUG-only in-memory fixture
+      # (Salvage/Testing/UITestFixtures.swift): no real device is listed or read, and recovery
+      # writes only to a temporary folder. XCUITest needs a logged-in GUI session and the
+      # runner's Accessibility/automation permission, which hosted runners don't reliably grant,
+      # so this step runs only when the repository variable SALVAGE_RUN_UI_TESTS is '1' (e.g. on a
+      # self-hosted runner with a GUI session). The runner is ad-hoc signed ("Sign to Run
+      # Locally"); no team or certificate is involved.
+      - name: Run UI tests (opt-in, needs a GUI session)
+        if: ${{ vars.SALVAGE_RUN_UI_TESTS == '1' }}
+        run: |
+          xcodebuild \
+            -project Salvage.xcodeproj \
+            -scheme Salvage \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            -only-testing:SalvageUITests \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            test
+
+      # Always build the UI-test bundle, so it can't rot where the step above is skipped.
+      - name: Build UI tests
+        run: |
+          xcodebuild \
+            -project Salvage.xcodeproj \
+            -scheme Salvage \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build-for-testing
