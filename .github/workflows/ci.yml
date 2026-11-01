@@ -59,6 +59,11 @@ jobs:
       - name: Test the release helper signing-team checker itself
         run: ./scripts/test-check-helper-signing-team.sh
 
+      # scripts/release-local.sh (the owner's local signed release) against fake Apple tools: no
+      # certificate, Team ID, notary profile or network needed.
+      - name: Test the local release script itself
+        run: ./scripts/test-release-local.sh
+
       # The committed Salvage.xcodeproj must be exactly what xcodegen generates from project.yml.
       # xcodegen is pinned to an exact release, verified by SHA-256 before it runs; the version
       # must equal PINNED_XCODEGEN_VERSION in scripts/check-xcodeproj-sync.sh (which refuses any
