@@ -4,7 +4,7 @@ import PackageDescription
 // SalvageCLI -- the `salvage` command-line tool (spec-tech-batch-6 §C).
 //
 // A driving adapter beside the app: it uses SalvageCore (scan, content reads) and SalvageDiskIO
-// (device tree, RawBlockReader with its boot-disk refusal and helper fallback, destination
+// (device tree, RawBlockReader with its boot-disk refusal and helper/authopen fallback, destination
 // safety) by path, and never imports DiskArbitration itself (AD-1/AD-9). Local dependencies
 // only: scripts/check-no-network.sh refuses any remote package and scans these sources for
 // network APIs.

@@ -576,6 +576,14 @@ private func devNullIdentity() -> RawDeviceIdentity {
     return RawDeviceIdentity(registryID: 77, sizeBytes: 65536, blockSize: 512, deviceNumber: node.st_rdev)
 }
 
+extension ElevatedOpeners {
+    /// An enabled helper; the password path fails loudly if it is ever reached.
+    static func enabledHelper(_ helper: any PrivilegedOpening) -> ElevatedOpeners {
+        ElevatedOpeners(helper: helper, helperStatus: { .enabled },
+                        password: HelperFake(.fail(.io("the password path must not be reached"))), willAskForPassword: {})
+    }
+}
+
 // Serialized: the O_NONBLOCK marker on HelperFake's /dev/null descriptors is only unique if no
 // sibling test in this suite holds another one while a closed number gets reused.
 @Suite("Raw open falls back to the helper", .serialized)
@@ -585,7 +593,7 @@ struct RawOpenFallbackTests {
         var paths: [String] = []
         let fd = try await openRawDevice("disk42", expected: expected, directOpen: { path in
             paths.append(path); return .opened(open("/dev/null", O_RDONLY | O_CLOEXEC))
-        }, helper: helper)
+        }, elevated: .enabledHelper(helper))
         defer { close(fd) }
         #expect(paths == ["/dev/rdisk42"])
         #expect(await helper.requests.isEmpty)
@@ -594,7 +602,7 @@ struct RawOpenFallbackTests {
     @Test(arguments: [EACCES, EPERM])
     func permissionErrorAsksTheHelper(_ code: Int32) async throws {
         let helper = HelperFake(.devNull), expected = devNullIdentity()
-        let fd = try await openRawDevice("disk42", expected: expected, directOpen: { _ in .failed(errno: code) }, helper: helper)
+        let fd = try await openRawDevice("disk42", expected: expected, directOpen: { _ in .failed(errno: code) }, elevated: .enabledHelper(helper))
         defer { close(fd) }
         #expect(!(await helper.wasClosed(fd)))
         #expect(await helper.requests == [PrivilegedOpenRequest(bsdName: "disk42", registryID: 77, deviceNumber: expected.deviceNumber)])
@@ -605,22 +613,22 @@ struct RawOpenFallbackTests {
     func otherErrorsNeverReachTheHelper(_ code: Int32) async {
         let helper = HelperFake(.devNull)
         await #expect(throws: ScanError.io(String(cString: strerror(code)))) {
-            _ = try await openRawDevice("disk42", expected: devNullIdentity(), directOpen: { _ in .failed(errno: code) }, helper: helper)
+            _ = try await openRawDevice("disk42", expected: devNullIdentity(), directOpen: { _ in .failed(errno: code) }, elevated: .enabledHelper(helper))
         }
         #expect(await helper.requests.isEmpty)
     }
 
-    @Test func helperErrorsPropagate() async {
-        let helper = HelperFake(.fail(PrivilegedHelperApproval.approvalRequiredError))
-        await #expect(throws: PrivilegedHelperApproval.approvalRequiredError) {
-            _ = try await openRawDevice("disk42", expected: devNullIdentity(), directOpen: { _ in .failed(errno: EACCES) }, helper: helper)
+    @Test func helperRefusalsPropagate() async {
+        let helper = HelperFake(.fail(.unsafeTarget(RawBlockReader.bootDriveReason)))
+        await #expect(throws: ScanError.unsafeTarget(RawBlockReader.bootDriveReason)) {
+            _ = try await openRawDevice("disk42", expected: devNullIdentity(), directOpen: { _ in .failed(errno: EACCES) }, elevated: .enabledHelper(helper))
         }
     }
 
     @Test func helperDescriptorForTheWrongNodeIsClosedAndRefused() async throws {
         let helper = HelperFake(.pipe)
         await #expect(throws: ScanError.deviceChanged) {
-            _ = try await openRawDevice("disk42", expected: devNullIdentity(), directOpen: { _ in .failed(errno: EACCES) }, helper: helper)
+            _ = try await openRawDevice("disk42", expected: devNullIdentity(), directOpen: { _ in .failed(errno: EACCES) }, elevated: .enabledHelper(helper))
         }
         let fd = try #require(await helper.handedOut.first)
         #expect(await helper.wasClosed(fd))
@@ -631,7 +639,7 @@ struct RawOpenFallbackTests {
         let identity = devNullIdentity()
         let wrong = RawDeviceIdentity(registryID: 77, sizeBytes: 65536, blockSize: 512, deviceNumber: identity.deviceNumber &+ 1)
         await #expect(throws: ScanError.deviceChanged) {
-            _ = try await openRawDevice("disk42", expected: wrong, directOpen: { _ in .failed(errno: EACCES) }, helper: helper)
+            _ = try await openRawDevice("disk42", expected: wrong, directOpen: { _ in .failed(errno: EACCES) }, elevated: .enabledHelper(helper))
         }
         let fd = try #require(await helper.handedOut.first)
         #expect(await helper.wasClosed(fd))
@@ -641,7 +649,7 @@ struct RawOpenFallbackTests {
         let helper = HelperFake(.devNull)
         var called = false
         await #expect(throws: ScanError.unsafeTarget(RawBlockReader.notWholeDriveReason)) {
-            _ = try await openRawDevice("disk4s1", expected: devNullIdentity(), directOpen: { _ in called = true; return .failed(errno: EACCES) }, helper: helper)
+            _ = try await openRawDevice("disk4s1", expected: devNullIdentity(), directOpen: { _ in called = true; return .failed(errno: EACCES) }, elevated: .enabledHelper(helper))
         }
         #expect(!called)
         #expect(await helper.requests.isEmpty)
@@ -773,12 +781,13 @@ struct PrivilegedOpenClientTests {
 struct HelperApprovalGuidanceTests {
     @Test func guidanceSaysWhereToApproveInPlainLanguage() {
         let text = PrivilegedHelperApproval.guidance
-        for phrase in ["System Settings", "General", "Login Items", "Allow in the Background", "Salvage", "retry the scan", "never changes"] {
+        for phrase in ["System Settings", "General", "Login Items", "Allow in the Background", "Salvage", "without asking for your password", "never changes"] {
             #expect(text.contains(phrase), "missing: \(phrase)")
         }
     }
 
-    @Test(arguments: [PrivilegedHelperApproval.guidance, PrivilegedHelperApproval.missingGuidance, PrivilegedHelperApproval.unavailableGuidance])
+    @Test(arguments: [PrivilegedHelperApproval.guidance, PrivilegedHelperApproval.missingGuidance, PrivilegedHelperApproval.unavailableGuidance,
+                      PrivilegedHelperApproval.skipPasswordGuidance, ScanError.administratorPasswordNeeded.description])
     func guidanceHasNoJargon(_ text: String) {
         for jargon in ["XPC", "daemon", "launchd", "SMAppService", "helper", "EACCES", "EPERM", "errno", "root", "rdisk", "privileged", "Mach"] {
             #expect(!text.localizedCaseInsensitiveContains(jargon), "jargon: \(jargon)")
