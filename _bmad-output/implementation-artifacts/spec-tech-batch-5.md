@@ -95,6 +95,76 @@ Five independent work items, one agent each. Each section lists the files that a
 - **Outside the owned files**: `SalvageTests/ScanViewModelTests.swift` `staleCheckpointsAreDiscarded` hard-codes checkpoint JSON with `"version":2`. The version bump broke it, so its fixture now uses 3, and its old-version case uses 2 instead of 1. No other batch-5 section owns that file.
 - **Tests**: `ScanPauseTests` adds tests for these cases: a header before the checkpoint is carved, with progress unchanged; a straddling file is carved whole once (this test fails with the overrun set to 0); a file after the resume point is not reported twice; pause during the backfill; a cancelled backfill raises the notice, and its checkpoint resumes. The existing resume tests now expect the backfill reads, and the mismatched-checkpoint cases now include v2 checkpoints and malformed backfill checkpoints. `ScanNoticeTests` checks that a resumed scan that finishes has no notice.
 
+## Implementation Notes — D
+
+**What was built.**
+- `SalvageCore/Tests/SalvageCoreTests/PerformanceTests.swift` holds one suite, gated on `SALVAGE_BENCHMARK=1`, so the default `swift test` run reports it as skipped. It builds a 2 GiB image with `hdiutil` in a temp dir: exFAT on GPT (4 KiB clusters, `-fsargs "-c 8"`), or FAT32 on MBR. The image gets 50,000 files across 1,000 nested folders (`Folder N/Album M/…`). Sizes run from 1 KiB to 4 MiB (about 1.5 GB in total). Names mix 8.3 and long names. 10% of the files are deleted. The image is attached with `-nobrowse` at a private mount point, then detached. The test then:
+  - scans the detached image *file* (pread, no device node) through `ScanSession`;
+  - recovers every metadata-found file to a temp folder;
+  - re-reads all of them through `FileContentReader` alone (the source-side throughput);
+  - checks 200 sampled files byte for byte.
+
+  It reports wall time, CPU time, the device reads issued, throughput, peak physical footprint (sampled every 20 ms) and peak RSS. Knobs: `SALVAGE_BENCHMARK_FS/FILES/SIZE_MIB/DIR/SCAN_REPEATS/SKIP_RECOVERY/REPORT`.
+- `scripts/benchmark-scan.sh [all|scan|results]` runs one Release `swift test` process per image, so peak RSS is per scan. It also builds the app's own `ResultsViewModel.swift`, unmodified, into a throwaway Release executable against SalvageCore. That executable times row building, the aggregates, and 26 filter/sort queries over 100k rows. Each query also runs through a verbatim copy of the pre-batch-5 `apply`. The script fails unless both versions return the same rows in the same order. Images are deleted on exit unless `SALVAGE_BENCHMARK_DIR` is given. No sudo is used.
+- A large NTFS/EXT image was **not feasible**. `hdiutil` cannot format either. This host has no `mke2fs`/`mkntfs`. The in-test builders (`EXTImage`, `NTFSImage`) are fixed at 1–2 groups and a few hundred blocks. So `EXTVolume.swift` and `NTFSRecord.swift` were neither profiled at scale nor changed.
+
+**Host caveat.** Apple M5 Max (18 cores). Up to five other agents were building and testing on the same machine (load average 15 → 230 during the runs). Wall times varied up to 5× between identical runs. The figures below are best-of-6 warm-cache Release scans, with before and after interleaved in the same session (before = `HEAD` versions of the four optimizable Core files). CPU time and device-read counts are the stable comparisons. The read counts are deterministic.
+
+**Scan, 2 GiB image, 50k files (91,050 live entries including macOS `._` AppleDouble files, 10,000 deleted, 0 carved; identical before/after):**
+
+| | exFAT before | exFAT after | FAT32 before | FAT32 after |
+|---|---|---|---|---|
+| wall (best of 6, quietest round) | 0.873 s | 0.728 s (−17%) | 1.063 s | 0.681 s (−36%) |
+| throughput | 2,343 MiB/s | 2,810 MiB/s | 1,926 MiB/s | 3,006 MiB/s |
+| CPU (user+sys) | 1.053 s | 0.896 s (−15%) | 1.282 s | 0.827 s (−35%) |
+| device reads | 31,159 | 7,156 (−77%) | 38,234 | 5,842 (−85%) |
+| bytes read from device (2 GiB image) | 2.69 GB | 2.16 GB | 4.28 GB | 2.16 GB |
+| peak footprint during scan | 121.8 MiB | 112.6 MiB | 118.1 MiB | 112.3 MiB |
+| process peak RSS | 229 MiB | 225 MiB | 230 MiB | 219 MiB |
+
+On FAT32, half of all bytes read were the same 64 KiB FAT pages read again. A first, cold-cache scan right after the image was built took 2.0 s (exFAT) and 2.8 s (FAT32), before the change.
+
+**Recovery (101,050 files, 1.54 GB):** 139–208 MiB/s in the quietest round (7.1–10.6 s), 32–71 MiB/s under peak load, with no consistent before/after difference; the recovery path was not changed. Profiling (`sample`) puts almost all of it in destination `open`/`write`/`close`, and in rename/fstat in the harness's first version. The source side alone (`FileContentReader` with no destination) runs at 3.7–10 GB/s on a warm cache, so `FileContentReader.swift` has no hotspot to fix and was left unchanged.
+
+**Results browser, 100k rows (Release; `before_ms` is the verbatim pre-batch-5 `apply` in the same process; quieter run):**
+
+| query | before | after |
+|---|---|---|
+| default (name asc, system files hidden) | 681 ms | 412 ms |
+| name desc | 614 ms | 576 ms (375 ms with system files) |
+| path asc | 247 ms | 78 ms |
+| size asc / desc | 103 / 95 ms | 18 / 18 ms |
+| modified asc / desc | 139 / 230 ms | 20 / 36 ms |
+| search "photo 12" (ASCII) | 137 ms | 13 ms |
+| search, no match | 118 ms | 13 ms |
+| search "café" / "写真" (non-ASCII, Foundation path) | 119 / 203 ms | ~same |
+| category Pictures, name sort | 107 ms | 80 ms |
+| build 100k rows / both aggregates | 99 ms / 35 ms | unchanged |
+
+The second run, under load average 230, showed the same ratios at 3–10× the absolute times: for example, default sort 4,227 → 2,276 ms and "no match" 677 → 12 ms. All 26 queries returned identical results in both runs.
+
+**Hotspots found and fixed (no behaviour change):**
+1. `FATVolume.fatEntry`, and the exFAT `allocatedInBitmap`, kept a single cached page. Chain lookups alternate between a directory's chain and its files' chains, so the same 64 KiB FAT page was read again thousands of times, each read going through the `MeasuredReader` actor. They now use `PageCache`: an LRU of 64 pages (at most 4 MiB of FAT and 256 KiB of bitmap per volume). The source is read-only, so a cached page holds exactly the bytes a re-read would return. A failed read is still not cached, so the read-error tests see the same failures.
+2. `FATVolume.validName` took 17% of FAT32 scan samples and 10% of exFAT: Foundation's `String.contains("/")` / `contains("\0")` → `range(of:options:range:locale:)`, called for every entry. For an ASCII name it is now a UTF-8 byte test. Any non-ASCII name still goes through the original Foundation calls, which match whole characters: `"a/\u{301}b".contains("/")` is false. A randomized check over 300k ASCII strings showed the two agree.
+3. FAT `lfnName` decoded each UTF-16 unit through the generic `Data.number`. It now reads the bytes directly; the slots were already checked to be 32 bytes. exFAT `decodeExfatSet` computed its checksum by enumerating a concatenated copy of the entry set. It now walks the entries. `rawRecord` values are built in one allocation (`joined`) instead of `reduce(Data(), +)`. The bytes are identical.
+4. `ResultsViewModel.apply` copied whole `Row` values (each holding a full `RecoveredFile`) through the filter, the sort and the reconstructed-section split, and read `name`/`path` through them in every comparison. It now filters and sorts row indices against per-query key arrays and bridges names to `NSString` once per query. The comparisons, their order (so ties land the same way) and the cancellation checks are unchanged. Search uses a byte substring test when the search text and key are ASCII and the needle does not start with LF or end with CR. That test matches Foundation's character-wise result; it was checked over random ASCII strings including CR/LF. Everything else goes through `String.contains` as before.
+
+**Hotspots reported, not changed (owned by other items or outside D's files):**
+- **ScanSession per-file emit** (`closure #6 in ScanSession.run`): 13% of FAT32 and 18% of exFAT scan samples. Every found file costs an `await claimed.add(runs)` hop to the `ClaimedRuns` actor plus `AsyncStream.send`. Batching claims, or keeping them in the session's own task, would remove one actor hop per file.
+- **MeasuredReader**: every parser read hops to this actor, scans `extents.contains(where:)` and calls `now()`. After fix 1 this matters far less, because reads dropped by 77–85%. A per-volume read-through, or skipping the clock check on small reads, would cut it further.
+- **SignatureCarver.consume/scan**: 15–18% of scan samples on these mostly-claimed images. That share would grow on images with more unclaimed space. `claimedRange(containing:)` showed up separately.
+- **`Data.number`** (VolumeDiscovery.swift) uses a generic `reduce` closure per field. It is used by every parser; a fixed-width load would help all of them.
+- **FAT/exFAT timestamps**: `FATVolume.timestamp` builds a `Calendar` and calls `date(from:)` for every file, about 3% of samples. A cached calendar per zone would help, but was left alone to keep the date semantics untouched.
+- **Results name sort**: after fix 4, `localizedStandardCompare` itself (CFString/ICU collation) is about 60% of the default sort. Precomputed collation keys would change comparison semantics, so it was not attempted.
+- **Recovery**: destination file creation dominates (see above). That is RecoveryCoordinator and the filesystem, not the source read path.
+
+**Verification (D branch):**
+- `swift test --package-path SalvageCore`: 385 tests in 30 suites. All passed, with the benchmark suite skipped. In one full run under load average ~230, `HFSPlusRealImageTests.deletedFilesAreRecoveredFromTheJournalUnlessTheirBlocksWereReused` failed: an hdiutil journal-timing test that touches no D file. Its suite then failed once and passed once with D's changes, and passed on unmodified sources. It is load-dependent, not a regression.
+- `swift test --package-path SalvageDiskIO`: 174 tests in 24 suites, all passed.
+- The three check scripts pass.
+- `xcodebuild … -only-testing:SalvageTests test` (Debug): 149 tests in 13 suites, TEST SUCCEEDED.
+- The Release build succeeded.
+
 ## Verification (each agent runs what applies)
 
 - `swift test --package-path SalvageCore`
