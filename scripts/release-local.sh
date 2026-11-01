@@ -152,7 +152,7 @@ build_log="$work_root/xcodebuild-$version.log"
 build_cmd=("$XCODEBUILD" -project "$root/Salvage.xcodeproj" -scheme Salvage -configuration Release
     -destination 'platform=macOS' -derivedDataPath "$derived_data"
     DEVELOPMENT_TEAM="$team" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="Developer ID Application"
-    ENABLE_HARDENED_RUNTIME=YES OTHER_CODE_SIGN_FLAGS="--timestamp" clean build)
+    ENABLE_HARDENED_RUNTIME=YES CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO OTHER_CODE_SIGN_FLAGS="--timestamp" clean build)
 package_cmd=("$root/scripts/package-release.sh" --release --identity "$identity" --notary-profile "$profile"
     "$app" "$version" "$outdir")
 
@@ -203,6 +203,11 @@ for target in "$app" "$helper"; do
         || fail "$(basename "$target") is not signed with a Developer ID Application certificate"
     printf '%s\n' "$info" | grep -q 'flags=.*runtime' || fail "$(basename "$target") lacks the hardened runtime"
     printf '%s\n' "$info" | grep -q '^Timestamp=' || fail "$(basename "$target") lacks a secure timestamp"
+    # Notarization rejects the debugging entitlement Xcode injects unless told not to.
+    entitlements="$("$CODESIGN" --display --entitlements - --xml "$target" 2>/dev/null || true)"
+    if printf '%s' "$entitlements" | grep -q 'com.apple.security.get-task-allow'; then
+        fail "$(basename "$target") has the com.apple.security.get-task-allow entitlement, which notarization rejects"
+    fi
 done
 helper_id="$("$CODESIGN" --display --verbose=4 "$helper" 2>&1 | sed -n 's/^Identifier=//p')"
 [ "$helper_id" = "$helper_identifier" ] || fail "SalvageHelper is signed as '$helper_id', expected $helper_identifier"
