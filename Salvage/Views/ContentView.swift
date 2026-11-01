@@ -43,6 +43,7 @@ struct ContentView: View {
         return result
     }
     @State private var showsTrust = false
+    @State private var partitionRequest: PartitionRecoveryRequest?
     /// Story 2.4/2.5: the FileVault unlock sheet, offered before scanning a device the picker knows
     /// is locked, and after a scan that met encrypted volumes. A correct credential re-scans the
     /// device with the volume decrypted. Withheld while `FileVaultUnlockFeature.canReadUnlockedVolumes`
@@ -50,7 +51,9 @@ struct ContentView: View {
     @State private var unlock: UnlockViewModel
     var body: some View {
         NavigationSplitView {
-            DeviceListView(isScanning: scan.isActive, activeDeviceID: scan.device?.id) { device in
+            DeviceListView(isScanning: scan.isActive, activeDeviceID: scan.device?.id,
+                           finishedScanDevice: scan.deviceWithFinishedResults,
+                           onRecoverPartition: { partitionRequest = PartitionRecoveryRequest(partition: $0) }) { device in
                 if !unlock.offerBeforeScan(device) { startAfterPendingUnlock(device) }
             }
             .navigationSplitViewColumnWidth(min: 220, ideal: 280)
@@ -60,7 +63,7 @@ struct ContentView: View {
                     Text("Select a device to start scanning.").foregroundStyle(.secondary)
                 } else if ResultsViewModel.showsResults(state: scan.state, isActive: scan.isActive, fileCount: scan.files.count) {
                     // A fresh results surface per finished scan.
-                    ResultsView(scan: scan).id(scan.endedAt)
+                    ResultsView(scan: scan, partitionRequest: $partitionRequest).id(scan.endedAt)
                 } else { ScanProgressView(model: scan) }
             }
             .safeAreaInset(edge: .bottom) {

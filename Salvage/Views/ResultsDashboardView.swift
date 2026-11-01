@@ -4,8 +4,12 @@ import SwiftUI
 /// The results surface shown once a scan has ended: the dashboard, and the File Browser it opens.
 struct ResultsView: View {
     let scan: ScanViewModel
+    /// "Recover all files…" picked on a partition in the sidebar; consumed (set back to nil) here.
+    var partitionRequest: Binding<PartitionRecoveryRequest?> = .constant(nil)
     @State private var model: ResultsViewModel?
     @State private var browsing = false
+    @State private var partitionCache = PartitionSectionCache()
+    @State private var partitionPlan: PartitionRecoveryPlan?
 
     var body: some View {
         Group {
@@ -13,7 +17,10 @@ struct ResultsView: View {
                 if browsing {
                     FileBrowserView(model: model, source: scan.source, onBack: { browsing = false })
                 } else {
-                    ResultsDashboardView(model: model, scan: scan, onOpen: { category in
+                    ResultsDashboardView(model: model, scan: scan, partitionCache: partitionCache, onRecoverPartition: { summary in
+                        partitionPlan = model.recoverAllPlan(for: summary, devicePartitions: scan.device?.partitions ?? [],
+                                                             cache: partitionCache)
+                    }, onOpen: { category in
                         model.category = category
                         model.volumeFilter = nil
                         model.focusedID = nil
@@ -30,6 +37,22 @@ struct ResultsView: View {
             }
         }
         .task { if model == nil { model = await ResultsViewModel.build(files: scan.files, lostPartitions: scan.lostPartitions) } }
+        .onChange(of: partitionRequest.wrappedValue) { _, _ in takePartitionRequest() }
+        .onChange(of: model == nil) { _, _ in takePartitionRequest() }
+        .sheet(item: $partitionPlan) { plan in
+            if let source = scan.source {
+                RecoverySheet(files: plan.files, source: source, rootName: plan.name,
+                              reconstructedFiles: plan.reconstructed, onDone: { partitionPlan = nil })
+            }
+        }
+    }
+
+    /// Opens Recover all files… for a partition picked in the sidebar, once results are ready.
+    private func takePartitionRequest() {
+        guard let request = partitionRequest.wrappedValue, let model, scan.source != nil else { return }
+        partitionRequest.wrappedValue = nil
+        partitionPlan = model.recoverAllPlan(for: request.partition, devicePartitions: scan.device?.partitions ?? [],
+                                             cache: partitionCache)
     }
 }
 
@@ -37,6 +60,10 @@ struct ResultsView: View {
 struct ResultsDashboardView: View {
     @Bindable var model: ResultsViewModel
     let scan: ScanViewModel
+    /// The Partitions section's grouping cache, owned by `ResultsView`.
+    var partitionCache = PartitionSectionCache()
+    /// Recover all files… on one partition row.
+    var onRecoverPartition: (PartitionSummary) -> Void = { _ in }
     /// Opens the File Browser, filtered to a category or (nil) showing everything.
     let onOpen: (FileCategory?) -> Void
     /// Opens the File Browser scoped to one lost partition's files (FR-9/FR-10).
@@ -78,6 +105,10 @@ struct ResultsDashboardView: View {
                             .font(.subheadline).foregroundStyle(.secondary)
                         Button("Browse all files") { onOpen(nil) }
                     }
+                }
+                let partitionRows = model.partitionSummaries(devicePartitions: scan.device?.partitions ?? [], cache: partitionCache)
+                if !partitionRows.isEmpty {
+                    PartitionsSection(summaries: partitionRows, canRecover: scan.source != nil, onRecoverAll: onRecoverPartition)
                 }
                 // Its own section, after the type grid and never inside it (FR-9).
                 if !model.lostPartitions.isEmpty {

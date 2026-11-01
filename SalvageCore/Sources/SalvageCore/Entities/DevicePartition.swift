@@ -27,13 +27,20 @@ public struct DevicePartition: Identifiable, Equatable, Sendable {
     /// What sits inside this node: an APFS container's volumes. Empty for an ordinary partition.
     public let children: [DevicePartition]
 
+    /// Where the partition starts on its drive, in bytes from the drive's first byte (the IOMedia
+    /// `Base`). Lets scan results, which record each volume's start offset, be matched to this
+    /// partition by equality. `nil` when unknown, and for a volume inside an APFS container (its
+    /// files are found at the container's offset).
+    public let offsetBytes: Int64?
+
     public init(bsdName: String, displayName: String, sizeBytes: Int64?, formatName: String,
-                children: [DevicePartition] = []) {
+                children: [DevicePartition] = [], offsetBytes: Int64? = nil) {
         self.bsdName = bsdName
         self.displayName = displayName
         self.sizeBytes = sizeBytes
         self.formatName = formatName
         self.children = children
+        self.offsetBytes = offsetBytes
     }
 
     public var id: String { bsdName }

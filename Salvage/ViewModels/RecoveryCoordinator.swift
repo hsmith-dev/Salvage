@@ -511,26 +511,54 @@ final class RecoveryCoordinator {
 
     static let blockedMessage = "This folder is on the drive you're recovering from. Choose a folder on a different drive."
 
-    let files: [RecoveredFile]
-    let totalBytes: Int64
+    /// The files this run copies: the selection, plus the optional reconstructed files when
+    /// `includeReconstructed` is on.
+    var files: [RecoveredFile] { includeReconstructed ? baseFiles + reconstructedFiles : baseFiles }
+    var totalBytes: Int64 { includeReconstructed ? baseBytes + reconstructedBytes : baseBytes }
+    /// Reconstructed files offered behind "Include reconstructed files (N)" (Recover all files…);
+    /// empty for an ordinary recovery. They can be partial and have generated names, so they are
+    /// left out unless the user ticks the box.
+    let reconstructedFiles: [RecoveredFile]
+    /// Off by default; changed with `setIncludeReconstructed(_:)`, only before a run starts.
+    private(set) var includeReconstructed = false
+    /// What the files are recovered from, e.g. "Photos (exFAT)", for the summary sentence; nil
+    /// for an ordinary selection.
+    let sourceLabel: String?
+    /// Free bytes on the chosen destination's volume, read when the folder was chosen; nil when
+    /// unknown (no warning is then shown).
+    private(set) var destinationFreeBytes: Int64?
     private(set) var phase: Phase = .ready
     private(set) var destination: URL?
     private(set) var destinationStatus: DestinationStatus = .none
     private(set) var progress = RecoveryProgress(filesFinished: 0, bytesDone: 0, currentName: nil)
 
+    private let baseFiles: [RecoveredFile]
+    private let baseBytes: Int64
+    private let reconstructedBytes: Int64
     private let engine: RecoveryEngine
     private let deviceName: String
+    private let rootName: String?
+    private let freeSpace: @Sendable (URL) -> Int64?
     private let now: @Sendable () -> Date
     private let destinationCheck: @Sendable (URL) -> DestinationAssessment
     private var task: Task<Void, Never>?
     private var checkGeneration = 0
 
+    /// `rootName` (e.g. a partition's name) names the recovery folder "<rootName> (recovered
+    /// <date>)" instead of "Salvage Recovery <device> <date>".
     init(files: [RecoveredFile], content: FileContentReader, deviceName: String,
+         rootName: String? = nil, reconstructedFiles: [RecoveredFile] = [], sourceLabel: String? = nil,
          now: @escaping @Sendable () -> Date = { Date() },
          sync: (@Sendable (Int32) -> Int32?)? = nil,
+         freeSpace: @escaping @Sendable (URL) -> Int64? = { RecoveryCoordinator.availableCapacity(at: $0) },
          destinationCheck: @escaping @Sendable (URL) -> DestinationAssessment) {
-        self.files = files
-        self.totalBytes = files.reduce(0) { $0 + max(0, $1.sizeBytes) }
+        self.baseFiles = files
+        self.baseBytes = files.reduce(0) { $0 + max(0, $1.sizeBytes) }
+        self.reconstructedFiles = reconstructedFiles
+        self.reconstructedBytes = reconstructedFiles.reduce(0) { $0 + max(0, $1.sizeBytes) }
+        self.rootName = rootName
+        self.sourceLabel = sourceLabel
+        self.freeSpace = freeSpace
         var engine = RecoveryEngine(content: content)
         if let sync { engine.sync = sync }
         self.engine = engine
@@ -539,10 +567,45 @@ final class RecoveryCoordinator {
         self.destinationCheck = destinationCheck
     }
 
-    convenience init(files: [RecoveredFile], source: SourceSession) {
+    convenience init(files: [RecoveredFile], source: SourceSession, rootName: String? = nil,
+                     reconstructedFiles: [RecoveredFile] = [], sourceLabel: String? = nil) {
         let device = source.device
-        self.init(files: files, content: source.content, deviceName: device.displayName,
+        self.init(files: files, content: source.content, deviceName: device.displayName, rootName: rootName,
+                  reconstructedFiles: reconstructedFiles, sourceLabel: sourceLabel,
                   destinationCheck: { DestinationSafety.live.assess(destination: $0, source: device) })
+    }
+
+    /// Ticks or unticks "Include reconstructed files (N)". Ignored once a run has started, or
+    /// when there are none to include.
+    func setIncludeReconstructed(_ on: Bool) {
+        guard isConfirming, !reconstructedFiles.isEmpty else { return }
+        includeReconstructed = on
+    }
+
+    /// How many bytes the selection exceeds the destination's free space by, or nil when it fits
+    /// or the free space is unknown. Recovery may still go ahead: files that don't fit are
+    /// reported as failed, one by one, as before.
+    var spaceShortfall: Int64? {
+        guard let free = destinationFreeBytes, destination != nil, destinationStatus == .safe, totalBytes > free else { return nil }
+        return totalBytes - free
+    }
+
+    /// The plain warning shown when the selection may not fit.
+    var spaceWarning: String? {
+        guard spaceShortfall != nil, let free = destinationFreeBytes else { return nil }
+        return Self.spaceWarning(needed: totalBytes, available: free)
+    }
+
+    nonisolated static func spaceWarning(needed: Int64, available: Int64) -> String {
+        let need = ByteCountFormatter.string(fromByteCount: needed, countStyle: .file)
+        let have = ByteCountFormatter.string(fromByteCount: max(0, available), countStyle: .file)
+        return "These files need \(need), but the destination has only \(have) free. Recovery will stop copying files once it is full. You can continue anyway, or cancel and choose another folder."
+    }
+
+    /// The destination volume's free space for important use, or nil when it can't be read.
+    nonisolated static func availableCapacity(at url: URL) -> Int64? {
+        let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        return values?.volumeAvailableCapacityForImportantUsage
     }
 
     /// Whether the confirmation is showing: before a run, or after one failed to start (the user
@@ -565,17 +628,20 @@ final class RecoveryCoordinator {
         let generation = checkGeneration
         destination = url
         destinationStatus = .checking
-        let check = destinationCheck
-        let verdict = await Task.detached { check(url).verdict }.value
+        destinationFreeBytes = nil
+        let check = destinationCheck, space = freeSpace
+        let (verdict, free) = await Task.detached { (check(url).verdict, space(url)) }.value
         guard generation == checkGeneration else { return }
         destinationStatus = verdict.isSafe ? .safe : .blocked
+        destinationFreeBytes = free
     }
 
     func start() {
         guard canRecover, let destination else { return }
         phase = .running
         let files = self.files, engine = self.engine, check = self.destinationCheck
-        let rootName = Self.rootFolderName(device: deviceName, date: now())
+        let rootName = self.rootName.map { Self.rootFolderName(partition: $0, date: now()) }
+            ?? Self.rootFolderName(device: deviceName, date: now())
         task = Task { [weak self] in
             // Re-check right before writing: the volume under the chosen path may have changed.
             let assessment = await Task.detached { check(destination) }.value
@@ -619,5 +685,14 @@ final class RecoveryCoordinator {
         formatter.dateFormat = "yyyy-MM-dd HH.mm.ss"
         let label = device.trimmingCharacters(in: .whitespacesAndNewlines)
         return "Salvage Recovery \(label.isEmpty ? "Drive" : label) \(formatter.string(from: date))"
+    }
+
+    /// "Photos (exFAT) (recovered 2026-10-31 14.02.11)": the folder for Recover all files….
+    nonisolated static func rootFolderName(partition: String, date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd HH.mm.ss"
+        let label = partition.trimmingCharacters(in: .whitespacesAndNewlines)
+        return "\(label.isEmpty ? "Partition" : label) (recovered \(formatter.string(from: date)))"
     }
 }

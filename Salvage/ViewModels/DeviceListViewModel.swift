@@ -151,6 +151,27 @@ public final class DeviceListViewModel {
         }
     }
 
+    // MARK: Recover all files (spec-tech-recover-whole-partition)
+
+    /// The drive whose scan has finished with results open, set by the composition root from
+    /// `ScanViewModel.deviceWithFinishedResults`. Its partition rows offer "Recover all files…".
+    public var finishedScanDevice: BlockDevice?
+
+    /// The partition "Recover all files…" acts on for a sidebar row, or nil when the row offers no
+    /// such action: only partitions of the drive whose scan has finished (matched by BSD name and
+    /// attachment identity, so a drive re-attached under the same name doesn't qualify). A volume
+    /// inside an APFS container resolves to its container, where its files were found.
+    public func recoverAllTarget(for partition: DevicePartition) -> DevicePartition? {
+        guard let finished = finishedScanDevice,
+              let drive = devices.first(where: { $0.id == finished.id }),
+              drive.mediaIdentity == finished.mediaIdentity else { return nil }
+        for top in drive.partitions {
+            if top.id == partition.id { return top }
+            if top.children.contains(where: { $0.id == partition.id }) { return top }
+        }
+        return nil
+    }
+
     /// VoiceOver label for a partition row: "Partition Photos, exFAT, 63.8 gigabytes, on SanDisk
     /// Ultra USB"; a volume inside an APFS container says so ("Volume Data, APFS, in APFS
     /// container, on ...") and has no size of its own.

@@ -8,9 +8,15 @@ struct RecoverySheet: View {
     let onDone: () -> Void
     @State private var coordinator: RecoveryCoordinator
 
-    init(files: [RecoveredFile], source: SourceSession, onDone: @escaping () -> Void) {
+    /// `rootName` names the recovery folder after a partition ("Photos (exFAT) (recovered …)");
+    /// `reconstructedFiles` are offered behind an "Include reconstructed files" checkbox, off by
+    /// default. Both are for Recover all files…; an ordinary selection passes neither.
+    init(files: [RecoveredFile], source: SourceSession, rootName: String? = nil,
+         reconstructedFiles: [RecoveredFile] = [], onDone: @escaping () -> Void) {
         self.onDone = onDone
-        _coordinator = State(initialValue: RecoveryCoordinator(files: files, source: source))
+        _coordinator = State(initialValue: RecoveryCoordinator(files: files, source: source, rootName: rootName,
+                                                               reconstructedFiles: reconstructedFiles,
+                                                               sourceLabel: rootName))
     }
 
     var body: some View {
@@ -18,7 +24,7 @@ struct RecoverySheet: View {
             switch coordinator.phase {
             case .ready, .failedToStart: confirmation
             case .running: running
-            case .finished(let summary): RecoverySummaryView(summary: summary, onDone: onDone)
+            case .finished(let summary): RecoverySummaryView(summary: summary, sourceName: coordinator.sourceLabel, onDone: onDone)
             }
         }
         .padding(24)
@@ -29,9 +35,26 @@ struct RecoverySheet: View {
 
     private var confirmation: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Recover \(fileCount(coordinator.files.count))")
+            Text(coordinator.sourceLabel.map { "Recover all files from \($0)" } ?? "Recover \(fileCount(coordinator.files.count))")
                 .font(.title2.weight(.semibold))
                 .accessibilityAddTraits(.isHeader)
+            if coordinator.sourceLabel != nil {
+                Text(coordinator.files.isEmpty ? "No recoverable files were found in this partition."
+                                               : "\(fileCount(coordinator.files.count)), keeping their folders. Deleted files go in the same folders, with their own names.")
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !coordinator.reconstructedFiles.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    Toggle("Include reconstructed files (\(coordinator.reconstructedFiles.count.formatted()))",
+                           isOn: Binding(get: { coordinator.includeReconstructed },
+                                         set: { coordinator.setIncludeReconstructed($0) }))
+                        .toggleStyle(.checkbox)
+                        .disabled(!coordinator.isConfirming)
+                    Text("Rebuilt from raw bytes: they have generated names and some may be incomplete.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
             Text("\(byteString(coordinator.totalBytes)) will be copied into a new folder inside the destination you choose. Nothing is written to the drive you're recovering from.")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -50,6 +73,14 @@ struct RecoverySheet: View {
             .accessibilityLabel("Destination")
 
             if coordinator.destinationStatus == .blocked { DestinationBlockBanner() }
+            if let warning = coordinator.spaceWarning {
+                // A warning, not a block: the user may continue or cancel.
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle").accessibilityHidden(true)
+                    Text(warning).fixedSize(horizontal: false, vertical: true)
+                }
+                .accessibilityElement(children: .combine)
+            }
             if case .failedToStart(let reason) = coordinator.phase {
                 // Not a block: the user can choose another folder (which clears this) or retry.
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -63,7 +94,7 @@ struct RecoverySheet: View {
             HStack {
                 Spacer()
                 Button("Cancel", role: .cancel, action: onDone).keyboardShortcut(.cancelAction)
-                Button(isRetry ? "Try Again" : "Recover") { coordinator.start() }
+                Button(isRetry ? "Try Again" : (coordinator.spaceShortfall != nil ? "Recover Anyway" : "Recover")) { coordinator.start() }
                     .keyboardShortcut(.defaultAction)
                     .disabled(!coordinator.canRecover)
             }
@@ -147,6 +178,8 @@ private enum BlockingColors {
 
 struct RecoverySummaryView: View {
     let summary: RecoverySummary
+    /// What the files came from ("Photos (exFAT)") for Recover all files…; nil otherwise.
+    var sourceName: String? = nil
     let onDone: () -> Void
 
     var body: some View {
@@ -154,7 +187,7 @@ struct RecoverySummaryView: View {
             Text(summary.cancelled ? "Recovery cancelled" : "Recovery finished")
                 .font(.title2.weight(.semibold))
                 .accessibilityAddTraits(.isHeader)
-            Text(headline).fixedSize(horizontal: false, vertical: true)
+            Text(Self.headline(summary, sourceName: sourceName)).fixedSize(horizontal: false, vertical: true)
             Text(summary.root.path).font(.callout).foregroundStyle(.secondary)
                 .lineLimit(2).truncationMode(.middle).textSelection(.enabled)
 
@@ -186,8 +219,10 @@ struct RecoverySummaryView: View {
         }
     }
 
-    private var headline: String {
-        var text = "Recovered \(summary.written.count) of \(fileCount(summary.selectedCount)) (\(byteString(summary.bytesWritten)) written)."
+    /// "Recovered 3 of 5 files from Photos (exFAT) (1.2 MB written)." and what didn't make it.
+    static func headline(_ summary: RecoverySummary, sourceName: String? = nil) -> String {
+        let from = sourceName.map { " from \($0)" } ?? ""
+        var text = "Recovered \(summary.written.count) of \(fileCount(summary.selectedCount))\(from) (\(byteString(summary.bytesWritten)) written)."
         if !summary.failed.isEmpty { text += " \(fileCount(summary.failed.count)) couldn't be recovered." }
         if summary.notAttempted > 0 {
             text += " \(fileCount(summary.notAttempted)) \(summary.notAttempted == 1 ? "wasn't" : "weren't") recovered because you cancelled."

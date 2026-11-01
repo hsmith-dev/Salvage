@@ -1,4 +1,5 @@
 import DiskArbitration
+import IOKit
 import Foundation
 import SalvageCore
 
@@ -26,6 +27,19 @@ struct RawDiskDescription {
     /// synthesizes on top of another disk's partition (an APFS container: `["disk0s2", "disk0"]`);
     /// empty for a physical drive or a disk image; `nil` when the walk failed.
     var ancestorMedia: [String]?
+    /// Where a partition starts on its whole disk, in bytes: the IOMedia `Base` property (the
+    /// DiskArbitration description carries no offset). `nil` when it couldn't be read.
+    var baseOffset: Int64?
+}
+
+/// The IOMedia `Base` property of `media` (a partition's byte offset on its whole disk), or nil
+/// when it is missing or not a non-negative number. A metadata read only.
+func ioMediaBaseOffset(_ media: io_registry_entry_t) -> Int64? {
+    guard media != 0,
+          let value = IORegistryEntryCreateCFProperty(media, "Base" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue(),
+          let number = value as? NSNumber else { return nil }
+    let offset = number.int64Value
+    return offset >= 0 ? offset : nil
 }
 
 /// DiskArbitration description keys. The literal values are what DiskArbitration uses, so tests
@@ -90,6 +104,7 @@ private struct DecodedSlice {
     let mediaContent: String?
     let volumeName: String?
     let volumeKind: String?
+    let baseOffset: Int64?
     var format: String { plainFormatName(volumeKind: volumeKind, mediaContent: mediaContent) }
 
     init?(_ raw: RawDiskDescription) {
@@ -102,6 +117,7 @@ private struct DecodedSlice {
         mediaContent = Self.text(description[DiskKey.mediaContent])
         volumeName = Self.text(description[DiskKey.volumeName])
         volumeKind = Self.text(description[DiskKey.volumeKind])
+        baseOffset = raw.baseOffset.flatMap { $0 >= 0 ? $0 : nil }
     }
 
     private static func text(_ value: Any?) -> String? {
@@ -179,6 +195,8 @@ func buildDeviceTree(_ disks: [RawDiskDescription], bootDisks: Set<String>) -> [
             guard let volume = DecodedSlice(raw) else { return nil }
             let name = volume.volumeName ?? volume.mediaName ?? "\(volume.format) volume"
             // An APFS volume's media size is its container's; its space is shared, so no size.
+            // Nor an offset: its `Base` is relative to the synthesized container disk, and its
+            // files are found at the store partition's offset.
             let isAPFS = volume.format == "APFS"
             result.append(DevicePartition(bsdName: volume.bsdName, displayName: name,
                                           sizeBytes: isAPFS ? nil : volume.sizeBytes, formatName: volume.format))
@@ -202,12 +220,14 @@ func buildDeviceTree(_ disks: [RawDiskDescription], bootDisks: Set<String>) -> [
                 // The store partition is the container's node, as in Disk Utility: drive, then
                 // "APFS container", then its volumes.
                 result.append(DevicePartition(bsdName: slice.bsdName, displayName: containerLabel(slice.mediaContent),
-                                              sizeBytes: slice.sizeBytes, formatName: "APFS", children: children))
+                                              sizeBytes: slice.sizeBytes, formatName: "APFS", children: children,
+                                              offsetBytes: slice.baseOffset))
             } else {
                 let format = slice.format
                 let name = slice.volumeName ?? (format == "Unknown" ? "Unnamed partition" : format)
                 result.append(DevicePartition(bsdName: slice.bsdName, displayName: name,
-                                              sizeBytes: slice.sizeBytes, formatName: format, children: children))
+                                              sizeBytes: slice.sizeBytes, formatName: format, children: children,
+                                              offsetBytes: slice.baseOffset))
             }
         }
         return result
@@ -261,7 +281,8 @@ func debugDescription(ofDeviceTree devices: [BlockDevice]) -> String {
     func walk(_ partitions: [DevicePartition], depth: Int) {
         for partition in partitions {
             let size = partition.sizeBytes.map { " \($0)" } ?? ""
-            lines.append(String(repeating: "   ", count: depth) + "└ \(partition.bsdName)\(size) \(partition.formatName) \"\(partition.displayName)\"")
+            let offset = partition.offsetBytes.map { " @\($0)" } ?? ""
+            lines.append(String(repeating: "   ", count: depth) + "└ \(partition.bsdName)\(size)\(offset) \(partition.formatName) \"\(partition.displayName)\"")
             walk(partition.children, depth: depth + 1)
         }
     }

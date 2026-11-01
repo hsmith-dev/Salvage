@@ -580,3 +580,130 @@ private final class Counter: @unchecked Sendable {
     private var value = 0
     func next() -> Int { lock.withLock { value += 1; return value } }
 }
+
+// MARK: - Recover all files from a partition (spec-tech-recover-whole-partition)
+
+private func deleted(_ path: String, content: FileContent, size: Int64) -> RecoveredFile {
+    RecoveredFile(name: (path as NSString).lastPathComponent, path: path, sizeBytes: size, isDeleted: true,
+                  sourceMetadata: metadata, content: content)
+}
+
+@MainActor @Suite("Recover all files from a partition: coordinator")
+struct PartitionRecoveryCoordinatorTests {
+    private let epoch = Date(timeIntervalSince1970: 0)
+
+    @Test func rootFolderIsNamedAfterThePartition() async throws {
+        let dir = try TempDir()
+        let files = [file("/DCIM/a.jpg", size: 1, content: .resident(Data("a".utf8)))]
+        let coordinator = RecoveryCoordinator(files: files, content: FileContentReader(reader: MemoryReader(bytes: Data())),
+                                              deviceName: "SanDisk Ultra", rootName: "Photos (exFAT)", sourceLabel: "Photos (exFAT)",
+                                              now: { Date(timeIntervalSince1970: 0) }, destinationCheck: checked(.safe))
+        await coordinator.chooseDestination(dir.url)
+        coordinator.start()
+        await coordinator.waitUntilFinished()
+        let result = try #require(summary(coordinator))
+        let expected = RecoveryCoordinator.rootFolderName(partition: "Photos (exFAT)", date: epoch)
+        #expect(expected.hasPrefix("Photos (exFAT) (recovered ") && expected.hasSuffix(")"))
+        #expect(!expected.contains(":"))
+        #expect(result.root.lastPathComponent == expected)
+        #expect(try Data(contentsOf: result.root.appendingPathComponent("DCIM/a.jpg")) == Data("a".utf8))
+        #expect(RecoverySummaryView.headline(result, sourceName: coordinator.sourceLabel)
+            == "Recovered 1 of 1 file from Photos (exFAT) (\(ByteCountFormatter.string(fromByteCount: 1, countStyle: .file)) written).")
+        // Existing callers are unchanged.
+        #expect(RecoveryCoordinator.rootFolderName(device: "SanDisk Ultra", date: epoch).hasPrefix("Salvage Recovery SanDisk Ultra "))
+        #expect(RecoveryCoordinator.rootFolderName(partition: "  ", date: epoch).hasPrefix("Partition (recovered "))
+    }
+
+    @Test func deletedFilesShareTheFoldersWithCollisionHandlingAndNoOverwrite() async throws {
+        let dir = try TempDir()
+        let files = [file("/Docs/report.txt", size: 4, content: .resident(Data("live".utf8))),
+                     deleted("/Docs/report.txt", content: .resident(Data("gone".utf8)), size: 4),
+                     deleted("/Docs/old/draft.txt", content: .resident(Data("old".utf8)), size: 3)]
+        let coordinator = RecoveryCoordinator(files: files, content: FileContentReader(reader: MemoryReader(bytes: Data())),
+                                              deviceName: "Drive", rootName: "Photos (exFAT)", destinationCheck: checked(.safe))
+        await coordinator.chooseDestination(dir.url)
+        coordinator.start()
+        await coordinator.waitUntilFinished()
+        let root = try #require(summary(coordinator)).root
+        #expect(try Data(contentsOf: root.appendingPathComponent("Docs/report.txt")) == Data("live".utf8))
+        #expect(try Data(contentsOf: root.appendingPathComponent("Docs/report (2).txt")) == Data("gone".utf8))
+        #expect(try Data(contentsOf: root.appendingPathComponent("Docs/old/draft.txt")) == Data("old".utf8))
+    }
+
+    @Test func reconstructedFilesAreOptInAndFrozenOnceRunning() async throws {
+        let dir = try TempDir()
+        let base = [file("/a.txt", size: 1, content: .resident(Data("a".utf8)))]
+        let rebuilt = [file("/Reconstructed/Pictures/jpeg-1.jpg", size: 2, content: .resident(Data("jj".utf8)))]
+        let coordinator = RecoveryCoordinator(files: base, content: FileContentReader(reader: MemoryReader(bytes: Data())),
+                                              deviceName: "Drive", rootName: "P", reconstructedFiles: rebuilt,
+                                              destinationCheck: checked(.safe))
+        #expect(coordinator.files == base && coordinator.totalBytes == 1)
+        coordinator.setIncludeReconstructed(true)
+        #expect(coordinator.files == base + rebuilt && coordinator.totalBytes == 3)
+        await coordinator.chooseDestination(dir.url)
+        coordinator.start()
+        coordinator.setIncludeReconstructed(false)  // ignored while running
+        await coordinator.waitUntilFinished()
+        let result = try #require(summary(coordinator))
+        #expect(result.written.count == 2 && result.selectedCount == 2)
+
+        // Without reconstructed files there is nothing to toggle.
+        let plain = RecoveryCoordinator(files: base, content: FileContentReader(reader: MemoryReader(bytes: Data())),
+                                        deviceName: "Drive", destinationCheck: checked(.safe))
+        plain.setIncludeReconstructed(true)
+        #expect(!plain.includeReconstructed && plain.files == base)
+    }
+
+    @Test func freeSpaceShortfallWarnsButStillLetsTheUserContinue() async throws {
+        let dir = try TempDir()
+        let files = [file("/a.bin", size: 600, content: .runs([DataRun(deviceOffset: 0, length: 600)])),
+                     file("/b.bin", size: 600, content: .runs([DataRun(deviceOffset: 0, length: 600)]))]
+        let reader = MemoryReader(bytes: deviceBytes(1024))
+        let short = RecoveryCoordinator(files: files, content: FileContentReader(reader: reader), deviceName: "Drive",
+                                        rootName: "Photos (exFAT)", freeSpace: { _ in 1000 }, destinationCheck: checked(.safe))
+        #expect(short.spaceWarning == nil)  // nothing chosen yet
+        await short.chooseDestination(dir.url)
+        #expect(short.destinationFreeBytes == 1000)
+        #expect(short.spaceShortfall == 200)
+        #expect(short.spaceWarning == RecoveryCoordinator.spaceWarning(needed: 1200, available: 1000))
+        #expect(short.spaceWarning?.contains("continue anyway") == true)
+        #expect(short.canRecover)  // a warning, not a block
+        short.start()
+        await short.waitUntilFinished()
+        #expect(try #require(summary(short)).written.count == 2)
+
+        let roomy = RecoveryCoordinator(files: files, content: FileContentReader(reader: reader), deviceName: "Drive",
+                                        freeSpace: { _ in 1200 }, destinationCheck: checked(.safe))
+        await roomy.chooseDestination(dir.url)
+        #expect(roomy.spaceShortfall == nil && roomy.spaceWarning == nil)
+
+        let unknown = RecoveryCoordinator(files: files, content: FileContentReader(reader: reader), deviceName: "Drive",
+                                          freeSpace: { _ in nil }, destinationCheck: checked(.safe))
+        await unknown.chooseDestination(dir.url)
+        #expect(unknown.spaceWarning == nil)
+
+        // The live reading returns a real number for a real folder.
+        #expect((RecoveryCoordinator.availableCapacity(at: dir.url) ?? -1) >= 0)
+    }
+
+    @Test func destinationOnTheSourceDriveBlocksRecoverAllAndWritesNothing() async throws {
+        for verdict in [DestinationVerdict.sameDevice, .undetermined] {
+            let dir = try TempDir()
+            let coordinator = RecoveryCoordinator(
+                files: [file("/a.txt", size: 1, content: .resident(Data("a".utf8)))],
+                content: FileContentReader(reader: MemoryReader(bytes: Data())), deviceName: "Drive",
+                rootName: "Photos (exFAT)",
+                reconstructedFiles: [file("/Reconstructed/x.jpg", size: 1, content: .resident(Data("x".utf8)))],
+                sourceLabel: "Photos (exFAT)", freeSpace: { _ in 0 }, destinationCheck: checked(verdict))
+            coordinator.setIncludeReconstructed(true)
+            await coordinator.chooseDestination(dir.url)
+            #expect(coordinator.destinationStatus == .blocked)
+            #expect(!coordinator.canRecover)
+            #expect(coordinator.spaceWarning == nil)  // the block is what's shown
+            coordinator.start()
+            await coordinator.waitUntilFinished()
+            #expect(coordinator.phase == .ready)
+            #expect(dir.allFiles().isEmpty)
+        }
+    }
+}
