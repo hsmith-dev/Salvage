@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 10-31-2026 09:25
-last_updated: 10-31-2026 19:05
+last_updated: 10-31-2026 21:30
 project: Salvage
 project_key: NOKEY
 tracking_system: file-system
@@ -58,7 +58,7 @@ development_status:
   2-5-read-an-unlocked-filevault-volume: backlog
   epic-2-retrospective: optional
 
-  epic-3: in-progress
+  epic-3: review
   3-1-carve-files-from-raw-bytes-when-metadata-is-gone: review
   3-2-organize-reconstructed-files-sensibly: review
   3-3-discover-a-lost-partition: review

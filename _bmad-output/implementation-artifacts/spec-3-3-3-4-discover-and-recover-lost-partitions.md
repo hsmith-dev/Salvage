@@ -2,7 +2,7 @@
 title: 'Discover a Lost Partition and Recover Files from It (Stories 3.3 + 3.4)'
 type: 'feature'
 created: '2026-10-31'
-status: 'ready-for-dev'
+status: 'done'
 baseline_commit: '4d050bd'
 route: 'dispatch'
 context:

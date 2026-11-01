@@ -2,7 +2,7 @@
 title: 'Scan and Recover Deleted Files from an HFS+ Drive'
 type: 'feature'
 created: '2026-10-31'
-status: 'ready-for-dev'
+status: 'done'
 baseline_commit: '4d050bd'
 route: 'dispatch'
 context:

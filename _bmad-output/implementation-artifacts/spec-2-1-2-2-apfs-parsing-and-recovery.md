@@ -2,7 +2,7 @@
 title: 'APFS Parsing Spike and Recovery (Stories 2.1 + 2.2)'
 type: 'feature'
 created: '2026-10-31'
-status: 'ready-for-dev'
+status: 'done'
 baseline_commit: '4d050bd'
 route: 'dispatch'
 context:
