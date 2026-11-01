@@ -28,6 +28,14 @@ final class JPEGHuffmanTable: @unchecked Sendable {
     private let fastLookup: UnsafeMutablePointer<UInt16>
     private let codeLimits: UnsafeMutablePointer<Int32>
     private let fastValues: UnsafeMutablePointer<UInt8>
+    /// The same three pointers, for the decode loop to use without touching the class (no
+    /// retain/release per symbol). Valid while the table is alive.
+    var pointers: Pointers { Pointers(lookup: fastLookup, limits: codeLimits, values: fastValues) }
+    struct Pointers {
+        let lookup: UnsafeMutablePointer<UInt16>
+        let limits: UnsafeMutablePointer<Int32>
+        let values: UnsafeMutablePointer<UInt8>
+    }
 
     init?(counts: [UInt8], values: [UInt8]) {
         guard counts.count == 16 else { return nil }
@@ -70,24 +78,30 @@ final class JPEGHuffmanTable: @unchecked Sendable {
     /// `length << 8 | symbol` of the code at the top of `bits` (`count` valid bits), 0 when more
     /// bits are needed, -1 when no code matches.
     @inline(__always)
-    func decode(_ bits: UInt64, _ count: Int) -> Int {
-        let lookupBits = Self.lookupBits
+    func decode(_ bits: UInt64, _ count: Int) -> Int { Self.decode(pointers, bits, count) }
+
+    @inline(__always)
+    static func decode(_ table: Pointers, _ bits: UInt64, _ count: Int) -> Int {
+        var code: Int32 = 0, first = 1
         if count >= lookupBits {
-            let entry = fastLookup[Int(truncatingIfNeeded: (bits >> UInt64(count - lookupBits)) & UInt64((1 << lookupBits) - 1))]
+            let prefix = Int(truncatingIfNeeded: (bits >> UInt64(count - lookupBits)) & UInt64((1 << lookupBits) - 1))
+            let entry = table.lookup[prefix]
             if entry != 0 { return Int(entry) }
+            // No code of `lookupBits` bits or fewer is a prefix of these bits (the lookup would
+            // hold it), so the canonical search below can't stop at those lengths: start past them.
+            code = Int32(prefix); first = lookupBits + 1
         }
-        var code: Int32 = 0
-        for length in 1...16 {
+        for length in first...16 {
             guard length <= count else { return 0 }
             code = code << 1 | Int32(truncatingIfNeeded: (bits >> UInt64(count - length)) & 1)
-            if code <= codeLimits[2 * length] { return length << 8 | Int(fastValues[Int(code + codeLimits[2 * length + 1])]) }
+            if code <= table.limits[2 * length] { return length << 8 | Int(table.values[Int(code + table.limits[2 * length + 1])]) }
         }
         return -1
     }
 }
 
 /// What one scan looks like to the entropy decoder: its tables, MCU structure and size.
-final class JPEGScanLayout: Sendable {
+final class JPEGScanLayout: @unchecked Sendable {
     let blocksPerMCU: Int
     let totalMCUs: Int
     let restartInterval: Int
@@ -99,12 +113,32 @@ final class JPEGScanLayout: Sendable {
     let dcLimit: [Int32]
     let maxDCCategory: Int
     let maxACCategory: Int
+    /// What decoding block `i` of an MCU needs, flattened for the decode loop: no array bounds
+    /// checks and no retain/release of the tables (which `dcTables`/`acTables` keep alive).
+    /// Immutable after `init`, which is why the class is `@unchecked Sendable`.
+    struct Block {
+        let component: Int
+        let dc: JPEGHuffmanTable.Pointers
+        let ac: JPEGHuffmanTable.Pointers
+        let dcLimit: Int32
+    }
+    let blocks: UnsafeMutablePointer<Block>
     init(blockComponent: [Int], totalMCUs: Int, restartInterval: Int, dcTables: [JPEGHuffmanTable],
          acTables: [JPEGHuffmanTable], dcLimit: [Int32], precision: Int) {
         self.blockComponent = blockComponent; self.blocksPerMCU = blockComponent.count
         self.totalMCUs = totalMCUs; self.restartInterval = restartInterval
         self.dcTables = dcTables; self.acTables = acTables; self.dcLimit = dcLimit
         maxDCCategory = precision + 3; maxACCategory = precision + 2
+        blocks = .allocate(capacity: max(1, blockComponent.count))
+        for (index, component) in blockComponent.enumerated() {
+            (blocks + index).initialize(to: Block(component: component, dc: dcTables[component].pointers,
+                                                  ac: acTables[component].pointers, dcLimit: dcLimit[component]))
+        }
+    }
+
+    deinit {
+        blocks.deinitialize(count: blockComponent.count)
+        blocks.deallocate()
     }
 
 }
@@ -320,6 +354,20 @@ struct JPEGScanDecoder: Sendable {
         guard isLive, end > position else { return 0 }
         let begin = position
         guard position >= bufferStart, end - bufferStart <= Int64(buffer.count) else { fail(); return 0 }
+        // Optimistic pass over the plain entropy data before the next marker: it decodes the same
+        // whenever its symbols are drained (the reference loop also drains fully at a marker and
+        // at the end of a feed), so it is read with a fuller bit buffer and fewer drains. If the
+        // outcome could depend on when bits are drained (a failure, the end of a restart interval
+        // or of the frame), the state is put back and the reference loop below replays the range.
+        if status == .decoding, !pendingFF {
+            let snapshot = self
+            if let reached = feedPlainData(buffer, from: Int(position - bufferStart), to: Int(end - bufferStart)) {
+                position = bufferStart + Int64(reached)
+                if position == end { return position - begin }
+            } else {
+                self = snapshot
+            }
+        }
         var index = Int(position - bufferStart)
         let stop = Int(end - bufferStart)
         while index < stop {
@@ -346,6 +394,69 @@ struct JPEGScanDecoder: Sendable {
         return position - begin
     }
 
+    /// Feeds the plain entropy-coded data at the start of `buffer[from..<to]`: bytes other than
+    /// 0xFF, and stuffed `FF 00` pairs, up to the first other 0xFF (a marker, fill bytes, or a 0xFF
+    /// whose next byte isn't in the range), which is left for the reference loop. Bits are drained once at
+    /// least 56 have arrived (a drain leaves at most 30, one symbol and its extra bits, so the
+    /// 64-bit buffer never overflows), then once at the stopping point.
+    ///
+    /// Returns the buffer index it stopped at, with every symbol whose bits arrived decoded: the
+    /// state the reference loop is in at that index once it has drained (as it does at a marker
+    /// and at the end of a feed). Returns nil, with the state partly advanced, when the result
+    /// could depend on when the reference loop drains, and the caller restores the state:
+    /// - a drain failed;
+    /// - a drain ended a restart interval or the frame and a data byte follows (the reference loop
+    ///   fails on it, at a position that depends on when it drained);
+    /// - fill bytes lead to a stuffed 0xFF instead of a marker (`drainsAt`), so the reference loop
+    ///   would not have drained where this pass stops.
+    /// A drain may end an interval or the frame without failing when only a marker or the end of
+    /// the range follows: then fewer than 8 bits are left, so the last byte taken carried the end
+    /// of the last MCU, and the reference loop reaches the same state at the same byte however it
+    /// drained before.
+    /// Whether the reference loop drains at `index` before taking another data bit: the range
+    /// ends there (a feed drains at its end), or a marker starts there (0xFF, any fill bytes, then
+    /// a byte other than 0x00 or 0xFF, or the end of the range). `FF FF ... 00` is a stuffed 0xFF
+    /// data byte after fill bytes, where it doesn't.
+    private static func drainsAt(_ buffer: UnsafeRawBufferPointer, _ index: Int, _ stop: Int) -> Bool {
+        var next = index
+        while next < stop, buffer[next] == 0xFF { next += 1 }
+        return next == stop || buffer[next] != 0x00
+    }
+
+    private mutating func feedPlainData(_ buffer: UnsafeRawBufferPointer, from: Int, to stop: Int) -> Int? {
+        var index = from
+        while index < stop {
+            let byte = buffer[index]
+            if byte == 0xFF {
+                if index + 1 < stop, buffer[index + 1] == 0x00 {
+                    index += 2
+                } else if Self.drainsAt(buffer, index, stop) {
+                    break
+                } else {
+                    return nil
+                }
+            } else {
+                index += 1
+            }
+            bits = bits << 8 | UInt64(byte)
+            bitCount += 8
+            if bitCount >= 56 {
+                drain()
+                if status != .decoding {
+                    // Ending an interval or the frame is the final drain's case when nothing but a
+                    // marker (or the end of the range) follows; any other byte is a failure whose
+                    // position depends on when the reference loop drains.
+                    guard status != .invalid, index == stop || (buffer[index] == 0xFF && Self.drainsAt(buffer, index, stop)) else {
+                        return nil
+                    }
+                    return index
+                }
+            }
+        }
+        drain()
+        return status == .invalid ? nil : index
+    }
+
     private mutating func fail() {
         if status != .invalid { unusedAtFailure = bitCount }
         status = .invalid
@@ -360,8 +471,6 @@ struct JPEGScanDecoder: Sendable {
         if bitCount >= 40 { drain() }
     }
 
-    @inline(__always)
-    private func peekSymbol(_ table: JPEGHuffmanTable) -> Int { table.decode(bits, bitCount) }
 
     @inline(__always)
     private mutating func take(_ count: Int) -> Int32 {
@@ -371,14 +480,16 @@ struct JPEGScanDecoder: Sendable {
 
     /// Decodes every symbol whose bits have arrived.
     private mutating func drain() {
+        let blocks = layout.blocks, maxDC = layout.maxDCCategory, maxAC = layout.maxACCategory
         while status == .decoding {
-            let component = layout.blockComponent[block]
+            let current = blocks[block]
+            let component = current.component
             if coefficient == 0 {
-                let symbol = peekSymbol(layout.dcTables[component])
+                let symbol = JPEGHuffmanTable.decode(current.dc, bits, bitCount)
                 if symbol == 0 { return }
                 guard symbol > 0 else { return fail() }
                 let length = symbol >> 8, size = symbol & 0xFF
-                guard size <= layout.maxDCCategory else { return fail() }
+                guard size <= maxDC else { return fail() }
                 guard bitCount >= length + size else { return }
                 bitCount -= length
                 var difference: Int32 = 0
@@ -387,16 +498,16 @@ struct JPEGScanDecoder: Sendable {
                     if difference < Int32(1) << (size - 1) { difference -= (Int32(1) << size) - 1 }
                 }
                 let value = predictors[component] &+ difference
-                guard abs(value) <= layout.dcLimit[component] else { return fail() }
+                guard abs(value) <= current.dcLimit else { return fail() }
                 predictors[component] = value
                 coefficient = 1
             } else {
                 // The AC coefficients of one block, with the state in locals.
-                let table = layout.acTables[component], maxSize = layout.maxACCategory, bits = self.bits
+                let table = current.ac, maxSize = maxAC, bits = self.bits
                 var count = bitCount, k = coefficient
                 var blockEnded = false, failed = false
                 while true {
-                    let symbol = table.decode(bits, count)
+                    let symbol = JPEGHuffmanTable.decode(table, bits, count)
                     guard symbol > 0 else { failed = symbol < 0; break }
                     let length = symbol >> 8, run = (symbol >> 4) & 0xF, size = symbol & 0xF
                     if size == 0 {

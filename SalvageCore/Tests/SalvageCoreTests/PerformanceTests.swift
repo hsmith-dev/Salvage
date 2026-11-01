@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import ImageIO
 import Testing
 @testable import SalvageCore
 
@@ -9,15 +10,24 @@ import Testing
 //
 // Knobs (environment):
 //   SALVAGE_BENCHMARK=1                 enable the suite
-//   SALVAGE_BENCHMARK_FS=exfat|fat32    which image the `scan` test builds (default exfat)
+//   SALVAGE_BENCHMARK_FS=exfat|fat32|carve
+//                                       which image the `scan` test builds (default exfat).
+//                                       `carve` is a raw image with no filesystem: real ImageIO
+//                                       JPEGs and PNGs, truncated JPEGs, noise and zeros, so the
+//                                       whole device goes through the carver and the JPEG decoder
 //   SALVAGE_BENCHMARK_FILES=50000       files written into nested folders
-//   SALVAGE_BENCHMARK_SIZE_MIB=2048     image size
+//   SALVAGE_BENCHMARK_SIZE_MIB=2048     image size (exfat, fat32)
+//   SALVAGE_BENCHMARK_CARVE_MIB=1024    image size (carve)
 //   SALVAGE_BENCHMARK_DIR=<dir>         keep the built image there and reuse it on the next run
 //                                       (the caller deletes it); default: a fresh temp dir,
 //                                       removed when the test ends
 //   SALVAGE_BENCHMARK_REPORT=<file>     append a one-line JSON result there
 //   SALVAGE_BENCHMARK_SCAN_REPEATS=1    scan the image this many times, report the fastest
 //   SALVAGE_BENCHMARK_SKIP_RECOVERY=1   scans only (for profiling the scan)
+//
+// Every scan also reports `results_digest`: an FNV-1a hash over every event and notice except
+// progress, in emission order, with each file's fields (minus its random UUID) and raw bytes.
+// Equal digests before and after a change mean byte-identical scan results.
 //
 // Images are created, attached (no browse, own mount point) and detached by hdiutil only; the
 // scan reads the detached image *file* through `ImageFileReader`, never a device node.
@@ -26,7 +36,10 @@ enum Benchmark {
     static let enabled = ProcessInfo.processInfo.environment["SALVAGE_BENCHMARK"] == "1"
     static func env(_ key: String) -> String? { ProcessInfo.processInfo.environment[key] }
     static var fileCount: Int { env("SALVAGE_BENCHMARK_FILES").flatMap(Int.init) ?? 50_000 }
-    static var sizeMiB: Int { env("SALVAGE_BENCHMARK_SIZE_MIB").flatMap(Int.init) ?? 2048 }
+    static var sizeMiB: Int {
+        filesystem == "carve" ? env("SALVAGE_BENCHMARK_CARVE_MIB").flatMap(Int.init) ?? 1024
+                              : env("SALVAGE_BENCHMARK_SIZE_MIB").flatMap(Int.init) ?? 2048
+    }
     static var filesystem: String { env("SALVAGE_BENCHMARK_FS") ?? "exfat" }
 
     /// Peak resident set size of this process so far (macOS reports ru_maxrss in bytes).
@@ -168,6 +181,7 @@ enum BenchmarkImage {
 
     /// Builds (or reuses) `<directory>/<fs>-<files>-<size>.dmg` and returns its path.
     static func build(filesystem: String, corpus: BenchmarkCorpus, sizeMiB: Int, in directory: URL) throws -> (path: String, seconds: Double) {
+        if filesystem == "carve" { return try CarveImage.build(sizeMiB: sizeMiB, in: directory) }
         let image = directory.appendingPathComponent("\(filesystem)-\(corpus.count)-\(sizeMiB).dmg")
         if FileManager.default.fileExists(atPath: image.path) { return (image.path, 0) }
         let started = ContinuousClock.now
@@ -213,11 +227,101 @@ enum BenchmarkImage {
     static func seconds(_ d: Duration) -> Double { Benchmark.seconds(d) }
 }
 
+/// A raw image with no partition table or filesystem, so discovery returns one raw extent and
+/// every byte goes through the carver: a deterministic sequence of real ImageIO JPEGs (baseline,
+/// decoded by the entropy validator), PNGs, JPEGs cut off half-way and followed by noise (the
+/// decoder fails there), random noise and zero runs. Items start on 512-byte sector boundaries,
+/// where the carver looks for headers.
+enum CarveImage {
+    static func build(sizeMiB: Int, in directory: URL) throws -> (path: String, seconds: Double) {
+        let image = directory.appendingPathComponent("carve-v1-\(sizeMiB).img")
+        if FileManager.default.fileExists(atPath: image.path) { return (image.path, 0) }
+        let started = ContinuousClock.now
+        let partial = directory.appendingPathComponent("building-\(UUID().uuidString).img")
+        let total = Int64(sizeMiB) * 1_048_576
+        guard FileManager.default.createFile(atPath: partial.path, contents: nil) else { throw ScanError.io("create image failed") }
+        let handle = try FileHandle(forWritingTo: partial)
+        do {
+            let dimensions = [(640, 480), (1024, 768), (1600, 1200), (2048, 1536), (800, 600), (3000, 2000), (1280, 960), (400, 300)]
+            var jpegs: [Data] = [], pngs: [Data] = []
+            for (index, (width, height)) in dimensions.enumerated() {
+                jpegs.append(try encode(width: width, height: height, type: "public.jpeg", quality: 0.7 + 0.03 * Double(index)))
+                if index % 2 == 0 { pngs.append(try encode(width: width / 2, height: height / 2, type: "public.png", quality: 1)) }
+            }
+            let pool = BenchmarkCorpus.pool
+            var state: UInt64 = 0x5eed_c0de_1234_5678
+            func next() -> UInt64 { state ^= state << 13; state ^= state >> 7; state ^= state << 17; return state }
+            var written: Int64 = 0
+            func write(_ data: Data) throws {
+                let room = Int(min(Int64(data.count), total - written))
+                guard room > 0 else { return }
+                try handle.write(contentsOf: data.prefix(room)); written += Int64(room)
+            }
+            while written < total {
+                let pick = Int(next() % 100)
+                switch pick {
+                case 0..<40: try write(jpegs[Int(next() % UInt64(jpegs.count))])
+                case 40..<50: try write(pngs[Int(next() % UInt64(pngs.count))])
+                case 50..<60:
+                    let jpeg = jpegs[Int(next() % UInt64(jpegs.count))]
+                    try write(jpeg.prefix(jpeg.count / 2 + Int(next() % UInt64(jpeg.count / 4))))
+                    let length = 4096 + Int(next() % (256 * 1024)), start = Int(next() % UInt64(pool.count - length))
+                    try write(Data(pool[start..<(start + length)]))
+                case 60..<85:
+                    let length = 4096 + Int(next() % (1024 * 1024)), start = Int(next() % UInt64(pool.count - length))
+                    try write(Data(pool[start..<(start + length)]))
+                default: try write(Data(count: 4096 + Int(next() % (512 * 1024))))
+                }
+                // Pad to the next sector with zeros (headers are only looked for there).
+                let pad = Int((512 - written % 512) % 512)
+                if pad > 0 { try write(Data(count: pad)) }
+            }
+            try handle.close()
+        } catch {
+            try? handle.close(); try? FileManager.default.removeItem(at: partial)
+            throw error
+        }
+        try FileManager.default.moveItem(at: partial, to: image)
+        return (image.path, BenchmarkImage.seconds(ContinuousClock.now - started))
+    }
+
+    /// A noisy gradient encoded by ImageIO (baseline JPEG, or PNG).
+    static func encode(width: Int, height: Int, type: String, quality: Double) throws -> Data {
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        var state: UInt64 = UInt64(width * 31 + height)
+        for y in 0..<height {
+            for x in 0..<width {
+                state = state &* 6364136223846793005 &+ 1442695040888963407
+                let noise = Int(state >> 58), base = (y * width + x) * 4
+                pixels[base] = UInt8((x * 255 / width + noise) & 0xFF)
+                pixels[base + 1] = UInt8((y * 255 / height + noise) & 0xFF)
+                pixels[base + 2] = UInt8(((x + y) * 2 + noise * 3) & 0xFF)
+                pixels[base + 3] = 255
+            }
+        }
+        guard let provider = CGDataProvider(data: Data(pixels) as CFData),
+              let image = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
+                                  space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                                  provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent) else {
+            throw ScanError.io("CGImage failed")
+        }
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(output as CFMutableData, type as CFString, 1, nil) else {
+            throw ScanError.io("CGImageDestination failed")
+        }
+        CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { throw ScanError.io("encode failed") }
+        return output as Data
+    }
+}
+
 actor BenchmarkCollector {
     var files: [RecoveredFile] = []
     var scanned: Int64 = 0, total: Int64 = 0
     var error: ScanError?
     var completed = false
+    var digest = ResultsDigest()
+    var noticeDigest = ResultsDigest()
     func handle(_ event: ScanEvent) {
         switch event {
         case .found(let file): files.append(file)
@@ -226,7 +330,50 @@ actor BenchmarkCollector {
         case .completed: completed = true
         default: break
         }
+        digest.add(event)
     }
+    func handle(_ notice: ScanNotice) { noticeDigest.add(String(reflecting: notice)) }
+}
+
+/// FNV-1a over a canonical rendering of scan results. Progress events are left out (their count
+/// and values depend on timing); everything else is hashed in order, including every byte a file
+/// carries (`rawRecord`, resident data) and the bit pattern of each `Double` and `Date`.
+struct ResultsDigest {
+    private(set) var value: UInt64 = 0xcbf2_9ce4_8422_2325
+    private(set) var events = 0
+    mutating func add(bytes: some Sequence<UInt8>) {
+        for byte in bytes { value = (value ^ UInt64(byte)) &* 0x0000_0100_0000_01b3 }
+    }
+    mutating func add(_ text: String) { add(bytes: text.utf8); add(bytes: [0]); events += 1 }
+    mutating func add(_ event: ScanEvent) {
+        switch event {
+        case .progress: return
+        case .found(let file): add(Self.canonical(file)); add(bytes: file.sourceMetadata.rawRecord)
+            if case .resident(let data) = file.content { add(bytes: data) }
+        case .lostPartitionFound(let candidate): add("lost|\(candidate.offset)|\(candidate.sizeBytes)|\(candidate.formatName)")
+        case .unlockRequired(let device): add("unlock|\(String(reflecting: device))")
+        case .error(let error): add("error|\(String(reflecting: error))")
+        case .completed: add("completed")
+        }
+    }
+    static func canonical(_ file: RecoveredFile) -> String {
+        let source = file.sourceMetadata
+        let runs: String = switch file.content {
+        case .unmapped: "unmapped"
+        case .resident(let data): "resident \(data.count)"
+        case .runs(let runs): "runs " + runs.map(run).joined(separator: ",")
+        case .encryptedRuns(let runs, let key): "encrypted \(key) " + runs.map(run).joined(separator: ",")
+        }
+        return ["found", file.name, file.path, "\(file.sizeBytes)", file.modified.map { "\($0.timeIntervalSince1970.bitPattern)" } ?? "-",
+                "\(file.isDeleted)", source.filesystem.rawValue, "\(source.volumeOffset)", "\(source.recordOffset)",
+                "\(source.allocationStart)", "\(source.contiguous)", "\(source.rawRecord.count)", source.volumeName ?? "-",
+                source.volumeID ?? "-", runs, "\(file.recoveryMethod)", "\(file.isPartial)", "\(file.overwriteConfidence.bitPattern)"]
+            .joined(separator: "|")
+    }
+    static func run(_ run: DataRun) -> String {
+        "\(run.deviceOffset.map(String.init) ?? "hole"):\(run.length):\(run.firstDataUnit.map(String.init) ?? "-")"
+    }
+    var hex: String { String(format: "%016llx", value) }
 }
 
 /// Samples the physical footprint while `body` runs and returns its peak.
@@ -273,32 +420,39 @@ struct PerformanceTests {
         let footprintBefore = Benchmark.footprint()
         let clock = ContinuousClock()
         var scanSeconds = Double.infinity, scanPeak: Int64 = 0, allScans: [String] = []
-        var scanCPU = Double.infinity, scanReads = 0, scanReadBytes: Int64 = 0
+        var scanCPU = Double.infinity, scanReads = 0, scanReadBytes: Int64 = 0, allCPU: [String] = []
+        var digests = Set<String>()
         _ = reader.takeCounts()
         for _ in 0..<repeats {
             collector = BenchmarkCollector()
             let started = clock.now, cpuStarted = Benchmark.cpuSeconds()
             let (_, peak) = await peakFootprint { [collector] in
                 let (stream, continuation) = AsyncStream<ScanEvent>.makeStream(bufferingPolicy: .bufferingOldest(4096))
+                let (noticeStream, noticeContinuation) = AsyncStream<ScanNotice>.makeStream()
                 let session = ScanSession(reader: reader)
-                let producer = Task { await session.run(events: continuation) }
+                let producer = Task { await session.run(events: continuation, notices: noticeContinuation) }
                 for await event in stream { await collector.handle(event) }
                 await producer.value
+                for await notice in noticeStream { await collector.handle(notice) }
             }
             let elapsed = Benchmark.seconds(clock.now - started)
-            scanCPU = min(scanCPU, Benchmark.cpuSeconds() - cpuStarted)
+            let cpu = Benchmark.cpuSeconds() - cpuStarted
+            scanCPU = min(scanCPU, cpu); allCPU.append(String(format: "%.3f", cpu))
             (scanReads, scanReadBytes) = reader.takeCounts()
+            digests.insert("\(await collector.digest.hex)/\(await collector.noticeDigest.hex)")
             allScans.append(String(format: "%.3f", elapsed))
             scanSeconds = min(scanSeconds, elapsed); scanPeak = max(scanPeak, peak)
         }
         let files = await collector.files
         #expect(await collector.error == nil)
         #expect(await collector.completed)
+        #expect(digests.count == 1, "repeated scans of one image gave different results")
         let metadata = files.filter { $0.recoveryMethod == .metadata }
         let live = metadata.filter { !$0.isDeleted }, deleted = metadata.filter(\.isDeleted)
         let carved = files.count - metadata.count
-        let expectedLive = (0..<corpus.count).filter { !corpus.isDeleted($0) }.count
+        let expectedLive = filesystem == "carve" ? 0 : (0..<corpus.count).filter { !corpus.isDeleted($0) }.count
         #expect(live.filter { !$0.name.hasPrefix(".") }.count >= expectedLive)
+        let carvedPartial = files.filter { $0.recoveryMethod == .carved && $0.isPartial }.count
         let scanned = await collector.scanned
 
         // Recover every mapped metadata file (live and deleted) to a temp folder.
@@ -339,7 +493,7 @@ struct PerformanceTests {
         // Byte-for-byte check of a sample of live files against the corpus.
         let byPath = Dictionary(live.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
         var checked = 0
-        for index in stride(from: 0, to: corpus.count, by: max(1, corpus.count / 200)) where !corpus.isDeleted(index) {
+        for index in stride(from: 0, to: filesystem == "carve" ? 0 : corpus.count, by: max(1, corpus.count / 200)) where !corpus.isDeleted(index) {
             guard let file = byPath["/" + corpus.relativePath(index)] else {
                 Issue.record("missing \(corpus.relativePath(index))"); continue
             }
@@ -351,6 +505,8 @@ struct PerformanceTests {
             "fs": filesystem, "files_written": corpus.count, "image_mib": Benchmark.sizeMiB,
             "image_build_s": String(format: "%.1f", buildSeconds),
             "scan_s": String(format: "%.3f", scanSeconds), "scan_cpu_s": String(format: "%.3f", scanCPU),
+            "scan_cpu_runs_s": allCPU.joined(separator: " "), "results_digest": digests.sorted().joined(separator: " "),
+            "result_events": await collector.digest.events, "found_carved_partial": carvedPartial,
             "scan_device_reads": scanReads, "scan_device_read_bytes": scanReadBytes, "scan_runs_s": allScans.joined(separator: " "), "scanned_bytes": scanned,
             "scan_mib_per_s": String(format: "%.1f", Double(scanned) / 1_048_576 / scanSeconds),
             "found_live": live.count, "found_deleted": deleted.count, "found_carved": carved,

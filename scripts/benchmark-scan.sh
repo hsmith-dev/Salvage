@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Salvage performance benchmark (batch 5, item D). Release builds only.
 #
-#   ./scripts/benchmark-scan.sh            # exFAT + FAT32 scans/recovery, then results browser
+#   ./scripts/benchmark-scan.sh            # exFAT + FAT32 + carve scans/recovery, then results browser
 #   ./scripts/benchmark-scan.sh scan       # only the image scans
 #   ./scripts/benchmark-scan.sh results    # only the results-browser filter/sort benchmark
 #
@@ -13,12 +13,18 @@
 # SALVAGE_BENCHMARK_DIR is set (then the caller owns them; they are reused on the next run).
 # No sudo, no device nodes are opened.
 #
+# The `carve` image (batch 6, item B) is a raw file with no filesystem, written directly (no
+# hdiutil): real ImageIO JPEGs and PNGs, truncated JPEGs, noise and zeros, so every byte goes
+# through the signature carver and every JPEG through the entropy decoder. Each scan reports a
+# `results_digest` over everything it found; compare it before and after a change.
+#
 # Results browser: builds ResultsViewModel.swift (the app's file, unmodified) into a throwaway
 # release executable against SalvageCore and times row building, dashboard aggregates, and
 # filter/sort over 100k rows. Each query is also run through a verbatim copy of the pre-batch-5
 # `apply` ("before_ms"), and the script fails unless both return the same rows in the same order.
 #
-# Environment: SALVAGE_BENCHMARK_FILES (50000), SALVAGE_BENCHMARK_SIZE_MIB (2048),
+# Environment: SALVAGE_BENCHMARK_IMAGES ("exfat fat32 carve"), SALVAGE_BENCHMARK_FILES (50000),
+# SALVAGE_BENCHMARK_SIZE_MIB (2048), SALVAGE_BENCHMARK_CARVE_MIB (1024), SALVAGE_BENCHMARK_SCAN_REPEATS,
 # SALVAGE_BENCHMARK_ROWS (100000), SALVAGE_BENCHMARK_DIR, SALVAGE_BENCHMARK_REPORT (JSON lines),
 # SALVAGE_BENCHMARK_WORK.
 set -euo pipefail
@@ -40,7 +46,7 @@ export SALVAGE_BENCHMARK_REPORT="$report"
 run_scans() {
     local images="${SALVAGE_BENCHMARK_DIR:-$work/images}"
     mkdir -p "$images"
-    for fs in exfat fat32; do
+    for fs in ${SALVAGE_BENCHMARK_IMAGES:-exfat fat32 carve}; do
         echo "== $fs: build image (if needed), scan, recover =="
         SALVAGE_BENCHMARK=1 SALVAGE_BENCHMARK_FS="$fs" SALVAGE_BENCHMARK_DIR="$images" \
             swift test -c release --package-path "$root/SalvageCore" --filter PerformanceTests 2>&1 \

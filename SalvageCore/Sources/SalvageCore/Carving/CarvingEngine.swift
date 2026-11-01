@@ -155,6 +155,8 @@ actor SignatureCarver: Carver {
     let limits: Limits
     /// Bytes past a candidate position every rule in the library can be evaluated with.
     let reach: Int
+    /// Which signatures can possibly match at a position, from single bytes (see `HeaderDispatch`).
+    let dispatch: HeaderDispatch
 
     private var claimed: [Range<Int64>] = []
     /// Bytes from `windowStart` to the end of the previous chunk that still need examining.
@@ -191,6 +193,7 @@ actor SignatureCarver: Carver {
             reach = max(reach, signature.headerReach, signature.footerReach, signature.segments?.reach ?? 0)
         }
         self.reach = reach
+        self.dispatch = HeaderDispatch(library.signatures)
     }
 
     // MARK: Carver
@@ -271,13 +274,29 @@ actor SignatureCarver: Carver {
         window.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
             let context = Window(buffer: buffer, start: windowStart, end: windowEnd, final: final)
             var position = nextHeaderSearch
+            // Positions below `unclaimedUntil` are known to lie outside every claimed range, so
+            // the binary search runs once per gap instead of once per sector.
+            var unclaimedUntil = Int64.min
             while position < windowEnd, final || position + Int64(reach) <= windowEnd {
-                if let range = claimedRange(containing: position) {
-                    position = alignUp(range.upperBound)
-                    continue
+                if position >= unclaimedUntil {
+                    if let range = claimedRange(containing: position) {
+                        position = alignUp(range.upperBound)
+                        continue
+                    }
+                    unclaimedUntil = nextClaimStart(after: position)
                 }
-                let matched = signatures.filter { context.headerMatches($0, at: position) && context.validates($0, at: position) }
-                if !matched.isEmpty { openCarves(matched, at: position, context, &ended) }
+                // Only signatures whose first header byte(s) fit are tested, in library order, so
+                // `matched` is exactly what filtering every signature would give.
+                if dispatch.mayMatch(context, at: position) {
+                    var matched: [FileSignature] = []
+                    dispatch.forEachCandidate(context, at: position) { index in
+                        let signature = signatures[index]
+                        if context.headerMatches(signature, at: position) && context.validates(signature, at: position) {
+                            matched.append(signature)
+                        }
+                    }
+                    if !matched.isEmpty { openCarves(matched, at: position, context, &ended) }
+                }
                 position += Int64(limits.sectorSize)
             }
             nextHeaderSearch = position
@@ -657,6 +676,75 @@ actor SignatureCarver: Carver {
         guard remainder != 0 else { return offset }
         let (aligned, overflow) = offset.addingReportingOverflow(sector - remainder)
         return overflow ? Int64.max : aligned
+    }
+}
+
+/// A first-byte dispatch table over a signature library. For each distinct `headerOffset`, a
+/// 256-entry table says which signatures have a header pattern whose first byte (under its mask)
+/// equals that byte. A signature can only match at a position if its entry for the byte at
+/// `position + headerOffset` is set; `Window.headerMatches` still makes the full test. Signatures
+/// with an empty header pattern (which `matches` accepts anywhere in the window) are always
+/// candidates.
+struct HeaderDispatch: Sendable {
+    struct Group: Sendable {
+        let offset: Int64
+        /// `words` bitset words per byte value, byte-major.
+        let table: [UInt64]
+    }
+    let groups: [Group]
+    let words: Int
+    /// Signatures to test at every position.
+    let always: [UInt64]
+
+    init(_ signatures: [FileSignature]) {
+        let words = max(1, (signatures.count + 63) / 64)
+        var always = [UInt64](repeating: 0, count: words)
+        var tables: [Int: [UInt64]] = [:]
+        for (index, signature) in signatures.enumerated() {
+            let word = index / 64, bit = UInt64(1) << UInt64(index % 64)
+            for pattern in signature.headers {
+                guard pattern.count > 0 else { always[word] |= bit; continue }
+                var table = tables[signature.headerOffset] ?? [UInt64](repeating: 0, count: 256 * words)
+                for byte in 0..<256 where UInt8(byte) & pattern.mask[0] == pattern.bytes[0] {
+                    table[byte * words + word] |= bit
+                }
+                tables[signature.headerOffset] = table
+            }
+        }
+        self.words = words
+        self.always = always
+        self.groups = tables.keys.sorted().map { Group(offset: Int64($0), table: tables[$0]!) }
+    }
+
+    /// Candidate bits of word `word` at `position`.
+    @inline(__always)
+    private func bits(_ context: Window, at position: Int64, word: Int) -> UInt64 {
+        var bits = always[word]
+        for group in groups {
+            let at = position + group.offset
+            guard at >= context.start, at < context.end else { continue }
+            bits |= group.table[Int(context.buffer[Int(at - context.start)]) * words + word]
+        }
+        return bits
+    }
+
+    /// False when no signature can match at `position`.
+    @inline(__always)
+    func mayMatch(_ context: Window, at position: Int64) -> Bool {
+        for word in 0..<words where bits(context, at: position, word: word) != 0 { return true }
+        return false
+    }
+
+    /// Calls `body` with each candidate signature index, ascending.
+    func forEachCandidate(_ context: Window, at position: Int64, _ body: (Int) -> Void) {
+        for word in 0..<words {
+            var bits = bits(context, at: position, word: word)
+            while bits != 0 {
+                let bit = bits.trailingZeroBitCount
+                body(word * 64 + bit)
+                bits &= bits - 1
+            }
+        }
     }
 }
 
