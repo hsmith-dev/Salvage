@@ -42,11 +42,16 @@ struct DeviceListView: View {
     @State private var toggledNodeIDs: Set<String> = []
     var isScanning = false
     var activeDeviceID: BlockDevice.ID?
+    /// The drive whose scan has finished with results open; its partition rows offer
+    /// "Recover all files…" in their context menu.
+    var finishedScanDevice: BlockDevice?
+    var onRecoverPartition: (DevicePartition) -> Void = { _ in }
     var onSelect: (BlockDevice) -> Void = { _ in }
 
     var body: some View {
         content
             .task { viewModel.startWatching() }
+            .onChange(of: finishedScanDevice, initial: true) { _, device in viewModel.finishedScanDevice = device }
             .onDisappear { viewModel.stopWatching() }
             .onChange(of: isScanning) { _, active in if !active { viewModel.clearSelection() } }
     }
@@ -99,7 +104,7 @@ struct DeviceListView: View {
                     } else {
                         DisclosureGroup(isExpanded: expansion(of: node, toggled: $toggledNodeIDs)) {
                             ForEach(node.children) { child in
-                                PartitionTreeRows(node: child, toggled: $toggledNodeIDs)
+                                PartitionTreeRows(node: child, toggled: $toggledNodeIDs, recoverAction: recoverAction)
                             }
                         } label: {
                             driveRow(device)
@@ -109,6 +114,12 @@ struct DeviceListView: View {
             }
         }
         .listStyle(.inset)
+    }
+
+    /// The context-menu action for a partition row, or nil when it offers none.
+    private func recoverAction(for partition: DevicePartition) -> (() -> Void)? {
+        guard let target = viewModel.recoverAllTarget(for: partition) else { return nil }
+        return { onRecoverPartition(target) }
     }
 
     private func driveRow(_ device: BlockDevice) -> some View {
@@ -226,6 +237,7 @@ private func expansion(of node: DeviceTreeNode, toggled: Binding<Set<String>>) -
 private struct PartitionTreeRows: View {
     let node: DeviceTreeNode
     @Binding var toggled: Set<String>
+    var recoverAction: (DevicePartition) -> (() -> Void)? = { _ in nil }
 
     var body: some View {
         if node.children.isEmpty {
@@ -233,7 +245,7 @@ private struct PartitionTreeRows: View {
         } else {
             DisclosureGroup(isExpanded: expansion(of: node, toggled: $toggled)) {
                 ForEach(node.children) { child in
-                    PartitionTreeRows(node: child, toggled: $toggled)
+                    PartitionTreeRows(node: child, toggled: $toggled, recoverAction: recoverAction)
                 }
             } label: {
                 row
@@ -246,6 +258,10 @@ private struct PartitionTreeRows: View {
         if case .partition(let partition, let drive, let container) = node.kind {
             PartitionRow(partition: partition)
                 .selectionDisabled()
+                // Still informational; once this drive's scan has finished it can be recovered whole.
+                .contextMenu {
+                    if let action = recoverAction(partition) { Button("Recover all files…", action: action) }
+                }
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(DeviceListViewModel.accessibilityLabel(for: partition, drive: drive,
                                                                            container: container))

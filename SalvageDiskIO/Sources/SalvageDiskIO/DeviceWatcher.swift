@@ -373,9 +373,15 @@ final class DiskWatchRegistration: @unchecked Sendable {
             sliceDepth(name) == 1 && wholeDiskBSDName(fromDevicePath: name).map(wholeNames.contains) == true
         }
         for name in Set(sliceNames).sorted() {
-            let description = DADiskCreateFromBSDName(kCFAllocatorDefault, session, name)
-                .flatMap { DADiskCopyDescription($0) as? [String: Any] }
-            disks.append(RawDiskDescription(bsdName: name, description: description))
+            let disk = DADiskCreateFromBSDName(kCFAllocatorDefault, session, name)
+            let description = disk.flatMap { DADiskCopyDescription($0) as? [String: Any] }
+            var base: Int64?
+            if let disk {
+                let media = DADiskCopyIOMedia(disk)
+                base = ioMediaBaseOffset(media)
+                if media != 0 { IOObjectRelease(media) }
+            }
+            disks.append(RawDiskDescription(bsdName: name, description: description, baseOffset: base))
         }
         return disks
     }

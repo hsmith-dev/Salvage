@@ -1,4 +1,5 @@
 import Foundation
+import IOKit
 import SalvageCore
 import Testing
 @testable import SalvageDiskIO
@@ -211,6 +212,83 @@ struct DeviceTreeTests {
         let annotated = try #require(annotateLocked([device], containers: [container]).only)
         #expect(annotated.encryptedVolumeName == "Vault")
         #expect(annotated.partitions == device.partitions)
+    }
+
+    // MARK: Partition offsets (recover a whole partition)
+
+    @Test("A partition carries its IOMedia Base as its start offset")
+    func partitionOffsetsFromBase() throws {
+        var disks = usbStick
+        disks[1].baseOffset = 20_480
+        disks[2].baseOffset = 209_735_680
+        let stick = try #require(buildDeviceTree(disks, bootDisks: ["disk0"]).only)
+        #expect(stick.partitions.map(\.offsetBytes) == [20_480, 209_735_680])
+        #expect(stick.partitions[1] == DevicePartition(bsdName: "disk6s2", displayName: "Photos", sizeBytes: 63_790_000_000,
+                                                        formatName: "exFAT", offsetBytes: 209_735_680))
+    }
+
+    @Test("An APFS store has the container's offset; its volumes have none")
+    func apfsContainerOffset() throws {
+        var disks = bootDrive
+        disks[1].baseOffset = 524_288_000
+        disks[3].baseOffset = 4096  // relative to the synthesized container disk: never used
+        let container = try #require(buildDeviceTree(disks, bootDisks: ["disk0", "disk3"]).only?.partitions.only)
+        #expect(container.offsetBytes == 524_288_000)
+        #expect(container.children.map(\.offsetBytes) == [nil, nil])
+    }
+
+    @Test("An unknown or negative Base leaves the offset unknown")
+    func unknownOffset() throws {
+        var disks = usbStick
+        disks[1].baseOffset = -1
+        let stick = try #require(buildDeviceTree(disks, bootDisks: ["disk0"]).only)
+        #expect(stick.partitions.map(\.offsetBytes) == [nil, nil])
+    }
+}
+
+/// The live `Base` read on a GPT exFAT disk image this test creates in its own temp directory and
+/// attaches without mounting. Metadata only: no raw reads, no writes to any device.
+@Suite("Partition offset from a real disk image",
+       .enabled(if: FileManager.default.isExecutableFile(atPath: "/usr/bin/hdiutil")
+                && ProcessInfo.processInfo.environment["SALVAGE_SKIP_HDIUTIL"] == nil))
+struct LivePartitionOffsetTests {
+    @Test func ioMediaBaseOfAnAttachedImagesPartition() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("salvage-base-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let image = directory.appendingPathComponent("gpt.dmg").path
+        guard run(["create", "-quiet", "-size", "64m", "-fs", "ExFAT", "-volname", "BASE", "-layout", "GPTSPUD",
+                   "-type", "UDIF", image]).status == 0 else {
+            print("Skipping: hdiutil couldn't create an image here."); return
+        }
+        let attach = run(["attach", "-nobrowse", "-nomount", image])
+        let nodes = attach.output.split(separator: "\n").compactMap { line in
+            line.split(separator: "\t").first.map { $0.trimmingCharacters(in: .whitespaces) }
+        }.filter { $0.hasPrefix("/dev/disk") }
+        guard attach.status == 0, let whole = nodes.min(by: { $0.count < $1.count }) else {
+            print("Skipping: hdiutil couldn't attach an image here."); return
+        }
+        defer { _ = run(["detach", "-force", whole]) }
+        let partition = try #require(nodes.first { $0 != whole })
+        let name = String(partition.dropFirst("/dev/".count))
+        let media = IOServiceGetMatchingService(kIOMainPortDefault, IOBSDNameMatching(kIOMainPortDefault, 0, name))
+        defer { if media != 0 { IOObjectRelease(media) } }
+        // hdiutil's GPTSPUD layout puts the single partition at 1 MiB.
+        #expect(ioMediaBaseOffset(media) == 1_048_576)
+        #expect(ioMediaBaseOffset(0) == nil)
+    }
+
+    private func run(_ arguments: [String]) -> (status: Int32, output: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return (-1, "") }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(decoding: data, as: UTF8.self))
     }
 }
 
