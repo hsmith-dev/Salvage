@@ -403,3 +403,29 @@ The spec's sample High sentence ended "and wasn't overwritten". I didn't use tha
 - The Debug `SalvageTests` run passed (233 tests).
 - `build-for-testing` (ad-hoc signing) and the Release build succeeded.
 - The `SalvageUITests` suite was not run (the lead runs it centrally).
+
+### Review fixes (second commit on p7-archive)
+
+1. **Media identity can't override a stable identity, and counts only within one boot.** `admits` now requires `sameDrive` whenever both sides have a stable identity, even when the media identity is equal (IORegistry IDs restart each boot and can be reused). Without stable identities on both sides, only an equal media identity counts. `Info.json` v2 records `bootSessionUUID` (`kern.bootsessionuuid`). `ScanArchive.read(from:boot:)` drops a saved media identity from another boot. A version 1 package has no session UUID, so its media identity is kept only when `savedAt` is after `kern.boottime`.
+2. **GPT drives also match by volume UUIDs.** `StableIdentity.volumes` (offset plus `DAVolumeUUID`) is now recorded for every drive and must be equal in `sameDrive`, so a volume erased in place to the same format (same GUID, same extents) is a different drive. `ExtentFingerprint`'s doc comment now says what the fingerprint does and doesn't catch. A live test patches the exFAT serial (and boot checksum) on a copy of the image file. It confirms the GUID and offset are the same, the volume UUID differs, and the drive is refused without being opened.
+3. **MFT records that straddle `$MFT` runs.** `NTFSResidentData.revalidate` now locates record N through `$MFT`'s own run list, read from its record 0. It requires the whole record to lie in one run starting at the saved record offset. A straddling record (its saved runs assumed contiguity) is refused: "Rescan to recover this file." Test: 512-byte clusters, 1 KiB records, `$MFT` in runs (16, 33) and (120, 31). Record 16's file is refused on reconnect and record 17's reads.
+4. **Confidence unchanged by save and reopen.** `RecoveredFile.liesInsideOwnNTFSRecord` (in `RecoveryConfidence.swift`) counts an NTFS metadata file whose runs all lie within 64 KiB (the largest MFT record) past its own record's start as one fragment. A non-resident file's data can't start inside its own record. This is a structural inference, because `RecoveredFile` carries no explicit marker.
+5. **Resident records live with the scan.** `ScanViewModel.ReopenedScan.residentRecords` is set by `openArchive` and written by `makeArchive`. The 16-entry `ReopenedArchives` side table is gone.
+6. **User-facing text and sidebar.**
+   - `RecoveryEngine.CopyFailure.needsRescan` and `PreviewUnavailableReason.needsRescan` show "Rescan to recover this file." for the guard's error.
+   - `ScanViewModel.reconnect` now sets `device` to the reconnected candidate, so the sidebar's "Recover all files…" row, the dashboard's partitions and a later save all use the drive as attached now (new BSD name, media identity and partition names).
+
+Edits outside the earlier file list, as asked by review:
+- `ScanViewModel.swift` (ReopenedScan field, `makeArchive`, `reconnect`);
+- `RecoveryConfidence.swift`;
+- `RecoveryCoordinator.swift`;
+- `PreviewLoader.swift`.
+
+- `SalvageCLI/Sources/SalvageCLIKit/RecoveryEngine.swift` re-copied (docs/CLI.md, Maintenance), since the engine gained `needsRescan`. The engine holds the "Rescan to recover this file." text itself, so the CLI copy stays self-contained. `ScanArchive.rescanToRecover` refers to it.
+
+Verification of the fixes:
+- `swift test`: SalvageCore 429, SalvageDiskIO 183 and SalvageCLI 28 tests passed.
+- `check-core-boundary`, `check-no-network` and `check-xcodeproj-sync` passed.
+- The Debug `SalvageTests` run passed (236 tests).
+- `build-for-testing` and the Release build succeeded.
+- `SalvageUITests` was not run.

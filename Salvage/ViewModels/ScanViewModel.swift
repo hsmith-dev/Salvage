@@ -294,6 +294,9 @@ final class ScanViewModel {
         let token = UUID()
         let fingerprint: [ScanCheckpoint.Extent]?
         let hasEncryptedFiles: Bool
+        /// NTFS resident files kept as runs inside their MFT records (`ScanArchive.residentRecords`),
+        /// checked against their records before they're read, and kept when the scan is saved again.
+        var residentRecords: [UUID: Int] = [:]
         var status: Status
     }
 
@@ -317,7 +320,8 @@ final class ScanViewModel {
         }
         return ScanArchive(device: device, files: files, lostPartitions: lostPartitions, notices: notices,
                            checkpoint: latestCheckpoint, outcome: outcome, bytesScanned: bytesScanned,
-                           totalBytes: totalBytes, startedAt: startedAt, endedAt: endedAt, savedAt: savedAt)
+                           totalBytes: totalBytes, startedAt: startedAt, endedAt: endedAt, savedAt: savedAt,
+                           residentRecords: reopened?.residentRecords ?? [:])
     }
 
     /// Shows a saved scan's results with no source session. Preview and recovery stay off until
@@ -339,6 +343,7 @@ final class ScanViewModel {
         case .failed(let error): state = .failed(error)
         }
         reopened = ReopenedScan(fingerprint: archive.fingerprint, hasEncryptedFiles: archive.hasEncryptedFiles,
+                                residentRecords: archive.residentRecords,
                                 status: archive.fingerprint == nil ? .unverifiable : .waiting)
     }
 
@@ -367,6 +372,9 @@ final class ScanViewModel {
             return fresh == nil ? .unavailable : .changed
         }
         source = session
+        // The drive as attached now (after a replug, its new BSD name, media identity and
+        // partition names), so the sidebar's "Recover all files…" and a later save refer to it.
+        self.device = candidate
         self.reopened?.status = .connected
         return .connected
     }

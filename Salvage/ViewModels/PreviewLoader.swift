@@ -16,6 +16,8 @@ enum PreviewUnavailableReason: Error, Sendable, Equatable {
     case deviceUnreadable
     /// The file has no bytes.
     case empty
+    /// A reopened scan's small NTFS file whose record no longer holds it (spec-tech-batch-7 §B).
+    case needsRescan
 
     var message: String {
         switch self {
@@ -24,6 +26,7 @@ enum PreviewUnavailableReason: Error, Sendable, Equatable {
         case .tooLarge: "This file is too large to preview."
         case .deviceUnreadable: "The device couldn't be read."
         case .empty: "This file is empty."
+        case .needsRescan: ScanArchive.rescanToRecover
         }
     }
 }
@@ -155,6 +158,9 @@ struct PreviewLoader: Sendable {
                 switch error {
                 case .unmapped, .runsShorterThanFile, .runOutsideDevice, .locked, .decryptionFailed: throw Unavailable(reason: .unmapped)
                 }
+            } catch let error as ScanError where error == .io(ScanArchive.rescanToRecover) {
+                if Task.isCancelled { throw CancellationError() }
+                throw Unavailable(reason: .needsRescan)
             } catch {
                 if Task.isCancelled { throw CancellationError() }
                 return nil

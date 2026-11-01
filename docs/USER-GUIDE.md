@@ -322,9 +322,9 @@ so you can come back to its results without scanning again.
 
 **Reconnecting.** When the same drive is attached, a **Reconnect** button appears next to that
 message. Salvage recognises the drive even after it was unplugged or the Mac was restarted, by
-what's stored on the drive and in its hardware: its partition table's ID (or, on a drive without
-one, the IDs of its volumes), its size, and its serial number when it has one. Nothing is read
-from a drive that doesn't match.
+what's stored on the drive and in its hardware: its partition table's ID, the IDs of its volumes,
+its size, and its serial number when it has one. A drive whose volume was erased since, even to
+the same format, counts as a different drive. Nothing is read from a drive that doesn't match.
 
 Salvage then opens the drive read-only, as a scan does (its volumes are unmounted), and checks the
 partition layout is the same as when it was scanned before it reads any file from it. If the
@@ -332,13 +332,14 @@ layout is different, the results say the drive "has changed since this scan was 
 Salvage won't read from it. Scan it again instead.
 
 Very small files on NTFS drives are read again from their file records when you preview or
-recover them. If a record no longer holds the same file (its name, date or size changed), that
-file can't be read from the saved scan: rescan to recover it.
+recover them. If a record no longer holds the same file (its name, date or size changed), or the
+record is split across two places on the drive, Preview and Recover say "Rescan to recover this
+file."
 
 Some drives can't be recognised after a replug: a drive with no partition table ID and no
 volume Salvage can identify (for example, one whose volumes are all damaged). Their saved scans
-reconnect only while the drive stays connected; after it's unplugged, scan it again. Scans saved
-by the first version of this feature work the same way.
+reconnect only while the drive stays connected and the Mac isn't restarted; otherwise scan it
+again. Scans saved by the first version of this feature work the same way.
 
 Files on encrypted (FileVault) volumes need the password again after reopening. Scan the drive
 again and unlock the volume to preview or recover them.

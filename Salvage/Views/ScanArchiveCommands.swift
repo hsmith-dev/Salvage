@@ -34,12 +34,9 @@ extension FocusedValues {
 /// `-SalvageUITestArchive <path>` uses that path instead of either panel.
 @MainActor enum ScanArchiveActions {
     static func save(_ scan: ScanViewModel) {
-        guard var archive = scan.makeArchive(), let url = saveURL(suggesting: archive.device.displayName) else { return }
-        // A reopened scan's small NTFS files stay marked as living in their MFT records.
-        if let token = scan.reopened?.token { archive.residentRecords = ReopenedArchives.residentRecords(for: token) }
-        let finished = archive
+        guard let archive = scan.makeArchive(), let url = saveURL(suggesting: archive.device.displayName) else { return }
         Task {
-            do { try await Task.detached(priority: .userInitiated) { try finished.write(to: url) }.value }
+            do { try await Task.detached(priority: .userInitiated) { try archive.write(to: url) }.value }
             catch { alert("Couldn't save the scan.", detail: describe(error)) }
         }
     }
@@ -50,7 +47,6 @@ extension FocusedValues {
             do {
                 let archive = try await Task.detached(priority: .userInitiated) { try ScanArchive.read(from: url) }.value
                 scan.openArchive(archive)
-                if let token = scan.reopened?.token { ReopenedArchives.register(archive.residentRecords, for: token) }
             } catch { alert("Couldn't open this saved scan.", detail: describe(error)) }
         }
     }
@@ -115,24 +111,6 @@ extension FocusedValues {
         guard url.pathExtension.lowercased() == ScanArchive.fileExtension else {
             throw NSError(domain: "Salvage", code: 1, userInfo: [NSLocalizedDescriptionKey: "Choose a saved scan, a file ending in .\(ScanArchive.fileExtension)."])
         }
-    }
-}
-
-/// What a reopened scan remembers beyond its files: which of them are NTFS resident data kept as
-/// runs inside their MFT records (`ScanArchive.residentRecords`), by the reopening's token. The
-/// view model holds only files, so this rides alongside it for the reconnect and a later save.
-@MainActor enum ReopenedArchives {
-    private static var entries: [(token: UUID, records: [UUID: Int])] = []
-    private static let kept = 16
-
-    static func register(_ records: [UUID: Int], for token: UUID) {
-        entries.removeAll { $0.token == token }
-        entries.append((token, records))
-        if entries.count > kept { entries.removeFirst(entries.count - kept) }
-    }
-
-    static func residentRecords(for token: UUID) -> [UUID: Int] {
-        entries.last { $0.token == token }?.records ?? [:]
     }
 }
 
@@ -290,8 +268,7 @@ struct SavedScanBanner: View {
 
     private func reconnect(_ device: BlockDevice) {
         openFailed = false
-        let records = scan.reopened.map { ReopenedArchives.residentRecords(for: $0.token) } ?? [:]
-        let entries = ResidentRecordGuard.entries(files: scan.files, residentRecords: records)
+        let entries = ResidentRecordGuard.entries(files: scan.files, residentRecords: scan.reopened?.residentRecords ?? [:])
         Task {
             openFailed = await scan.reconnect(device, open: { try await ScanArchiveSource.open($0, guarding: entries) }) == .unavailable
         }

@@ -86,9 +86,26 @@ extension RecoveredFile {
         switch content {
         case .unmapped: fragments = 0
         case .resident: fragments = 1
+        // NTFS resident data a saved scan keeps as runs inside its own MFT record (spec-tech-batch-7
+        // §B): split only around the record's fixup bytes, it is one piece of one record, as before saving.
+        case .runs where liesInsideOwnNTFSRecord: fragments = 1
         case .runs(let runs), .encryptedRuns(let runs, _): fragments = runs.lazy.filter { $0.deviceOffset != nil }.count
         }
         return RecoveryEvidence(fragmentCount: fragments, overwriteConfidence: overwriteConfidence)
+    }
+
+    /// True for an NTFS file whose runs all lie within the largest MFT record size past its own
+    /// record's start. A non-resident file's data is in clusters `$MFT` doesn't own, so it can't
+    /// start inside its own record; only resident data a saved scan located there does.
+    var liesInsideOwnNTFSRecord: Bool {
+        guard sourceMetadata.filesystem == .ntfs, recoveryMethod == .metadata, case .runs(let runs) = content,
+              !runs.isEmpty else { return false }
+        let start = sourceMetadata.recordOffset
+        guard start >= 0, start <= Int64.max - 65536 else { return false }
+        return runs.allSatisfy { run in
+            guard let offset = run.deviceOffset, offset >= start, run.length >= 0 else { return false }
+            return run.length <= start + 65536 - offset
+        }
     }
 
     /// The file's recovery confidence, or nil when it can't be recovered at all (unmapped, or a

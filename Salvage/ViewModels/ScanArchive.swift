@@ -34,7 +34,7 @@ struct ScanArchive: Equatable, Sendable {
     /// The one privacy warning, shown in the save panel. Kept here so it is written once.
     static let privacyNotice = "This file lists the names, folders, sizes and dates of the files Salvage found, and where each one is on the drive. It doesn't contain the files themselves."
     /// Why a small NTFS file of a reopened scan can't be read: its record no longer holds it.
-    static let rescanToRecover = "Rescan to recover this file."
+    static let rescanToRecover = RecoveryEngine.CopyFailure.needsRescan.reason
     static var contentType: UTType { UTType(filenameExtension: fileExtension, conformingTo: .package) ?? .package }
 
     enum Outcome: Equatable, Sendable { case completed, cancelled, failed(ScanError) }
@@ -60,25 +60,25 @@ struct ScanArchive: Equatable, Sendable {
 
     /// True when `candidate` may be opened to check its fingerprint. It must not be the startup
     /// drive, must have the saved size, and must be the same drive:
-    /// - the same attachment (an equal media identity), or
-    /// - after an unplug or restart, the same replug-stable identity (`sameDrive`).
-    /// A saved scan without a stable identity (version 1, or a drive that has none) matches only
-    /// by media identity, and a device with neither never matches. The fingerprint check after
-    /// opening is still required either way.
+    /// - when both have a replug-stable identity, it must match (`sameDrive`), whatever the media
+    ///   identity says: IORegistry IDs restart each boot, so another drive can reuse one;
+    /// - otherwise only an equal media identity counts, and only from the same boot (`read` drops
+    ///   a media identity saved in an earlier boot, so such a scan can't match by it).
+    /// A device with neither never matches. The fingerprint check after opening is still required.
     static func admits(_ candidate: BlockDevice, for archived: BlockDevice) -> Bool {
         guard !candidate.isBootVolume, candidate.sizeBytes == archived.sizeBytes else { return false }
-        if let identity = archived.mediaIdentity, candidate.mediaIdentity == identity { return true }
-        guard let saved = archived.stableIdentity, let current = candidate.stableIdentity else { return false }
-        return sameDrive(saved, current)
+        if let saved = archived.stableIdentity, let current = candidate.stableIdentity { return sameDrive(saved, current) }
+        guard let identity = archived.mediaIdentity else { return false }
+        return candidate.mediaIdentity == identity
     }
 
-    /// The same GPT disk GUID (or, for a drive without one, the same volume UUIDs at the same
-    /// offsets), the same size, and the same serial number when both report one.
+    /// The same size, the same serial number when both report one, the same volume UUIDs at the
+    /// same offsets, and the same GPT disk GUID (or, without a GPT, at least one volume UUID).
     static func sameDrive(_ a: BlockDevice.StableIdentity, _ b: BlockDevice.StableIdentity) -> Bool {
-        guard a.sizeBytes > 0, a.sizeBytes == b.sizeBytes else { return false }
+        guard a.sizeBytes > 0, a.sizeBytes == b.sizeBytes, a.volumes == b.volumes else { return false }
         if let x = a.serial, let y = b.serial, x != y { return false }
         if let guid = a.diskGUID { return b.diskGUID?.uppercased() == guid.uppercased() }
-        return b.diskGUID == nil && !a.volumes.isEmpty && a.volumes == b.volumes
+        return b.diskGUID == nil && !a.volumes.isEmpty
     }
 
     /// True when encrypted files are listed: they need the password again after reopening.
@@ -110,9 +110,9 @@ enum ScanArchiveError: Error, Equatable, CustomStringConvertible {
 extension ScanArchive {
     /// Writes the package to `url`, replacing what is there (the save panel has asked). The package
     /// is built beside `url` and moved into place, so a failed save never leaves half a package.
-    func write(to url: URL) throws {
+    func write(to url: URL, boot: BootSession = .current) throws {
         let fileList = FileListCodec.encode(files, residentRecords: residentRecords)
-        let info = Info(archive: self, fileListDigest: Self.digest(fileList))
+        let info = Info(archive: self, fileListDigest: Self.digest(fileList), bootSessionUUID: boot.uuid)
         let encoder = JSONEncoder()
         // Dates keep the default encoding (seconds since 2001, as a double), which round-trips exactly.
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -142,8 +142,10 @@ extension ScanArchive {
         }
     }
 
-    /// Reads a package. The version is checked before anything else is decoded.
-    static func read(from url: URL) throws -> ScanArchive {
+    /// Reads a package. The version is checked before anything else is decoded. A media identity
+    /// saved in an earlier boot (another `kern.bootsessionuuid`, or for version 1, saved before
+    /// this boot began) is dropped: IORegistry IDs restart each boot.
+    static func read(from url: URL, boot: BootSession = .current) throws -> ScanArchive {
         let infoURL = url.appending(path: infoFileName, directoryHint: .notDirectory)
         guard let infoData = try? Data(contentsOf: infoURL) else { throw ScanArchiveError.notAScan }
         let decoder = JSONDecoder()
@@ -156,13 +158,53 @@ extension ScanArchive {
         let list = try FileListCodec.decodeList(fileList)
         guard list.version == header.formatVersion, list.files.count == info.fileCount else { throw ScanArchiveError.damaged }
         // A version 1 package never held a stable identity; it reconnects by media identity only.
-        var archive = try info.archive(files: list.files, stableIdentity: header.formatVersion >= 2)
+        var archive = try info.archive(files: list.files, stableIdentity: header.formatVersion >= 2,
+                                       sameBoot: boot.includes(savedAt: info.savedAt,
+                                                               // Version 1 never wrote one.
+                                                               bootSessionUUID: header.formatVersion >= 2 ? info.bootSessionUUID : nil))
         archive.residentRecords = list.residentRecords
         return archive
     }
 
     static func digest(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+/// Which boot of this Mac a saved media identity belongs to.
+struct BootSession: Sendable, Equatable {
+    /// `kern.bootsessionuuid`: new on every boot.
+    var uuid: String?
+    /// `kern.boottime`.
+    var bootTime: Date?
+
+    static var current: BootSession {
+        BootSession(uuid: sysctlString("kern.bootsessionuuid"), bootTime: sysctlBootTime())
+    }
+
+    /// True when a package saved at `savedAt` with `bootSessionUUID` was saved in this boot. With
+    /// no session UUID on either side (version 1), the save time must be after this boot began.
+    func includes(savedAt: Date, bootSessionUUID saved: String?) -> Bool {
+        if let saved, let uuid { return saved == uuid }
+        if saved != nil { return false }
+        guard let bootTime else { return false }
+        return savedAt >= bootTime
+    }
+
+    private static func sysctlString(_ name: String) -> String? {
+        var size = 0
+        guard sysctlbyname(name, nil, &size, nil, 0) == 0, size > 0, size < 256 else { return nil }
+        var bytes = [CChar](repeating: 0, count: size)
+        guard sysctlbyname(name, &bytes, &size, nil, 0) == 0 else { return nil }
+        let text = String(cString: bytes)
+        return text.isEmpty ? nil : text
+    }
+
+    private static func sysctlBootTime() -> Date? {
+        var time = timeval()
+        var size = MemoryLayout<timeval>.size
+        guard sysctlbyname("kern.boottime", &time, &size, nil, 0) == 0, time.tv_sec > 0 else { return nil }
+        return Date(timeIntervalSince1970: Double(time.tv_sec) + Double(time.tv_usec) / 1_000_000)
     }
 }
 
@@ -259,8 +301,11 @@ private struct Info: Codable {
     let notices: [Notice]
     let fileCount: Int
     let fileListSHA256: String
+    /// Version 2: the boot the media identity belongs to (`kern.bootsessionuuid`).
+    let bootSessionUUID: String?
 
-    init(archive a: ScanArchive, fileListDigest: String) {
+    init(archive a: ScanArchive, fileListDigest: String, bootSessionUUID: String?) {
+        self.bootSessionUUID = bootSessionUUID
         format = Self.formatName
         formatVersion = ScanArchive.formatVersion
         savedAt = a.savedAt
@@ -283,11 +328,11 @@ private struct Info: Codable {
         fileListSHA256 = fileListDigest
     }
 
-    func archive(files: [RecoveredFile], stableIdentity readStable: Bool) throws -> ScanArchive {
+    func archive(files: [RecoveredFile], stableIdentity readStable: Bool, sameBoot: Bool) throws -> ScanArchive {
         var identity: UInt64?
         if let text = device.mediaIdentity {
             guard let value = UInt64(text) else { throw ScanArchiveError.damaged }
-            identity = value
+            identity = sameBoot ? value : nil
         }
         guard device.sizeBytes > 0, bytesScanned >= 0, totalBytes >= 0, checkpoint?.isWellFormed ?? true,
               checkpoint.map({ $0.deviceSizeBytes == device.sizeBytes }) ?? true else { throw ScanArchiveError.damaged }

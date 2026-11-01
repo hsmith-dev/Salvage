@@ -303,6 +303,8 @@ struct RecoveryEngine: Sendable {
         case unmapped
         case damagedMapping
         case sourceRead
+        /// A reopened scan's small NTFS file whose record no longer holds it (spec-tech-batch-7 §B).
+        case needsRescan
         case shortSource
         case outsideRoot
         case destination(Int32)
@@ -313,6 +315,7 @@ struct RecoveryEngine: Sendable {
             case .unmapped: "Salvage couldn't locate this file's contents on the drive."
             case .damagedMapping: "This file's location on the drive is incomplete or damaged."
             case .sourceRead: "Couldn't read this file from the drive."
+            case .needsRescan: "Rescan to recover this file."
             case .shortSource: "The drive returned less data than the file's size."
             case .outsideRoot: "Its folder path points outside the recovery folder, so it was skipped."
             case .destination(let code): RecoveryEngine.describe(errno: code)
@@ -387,6 +390,8 @@ struct RecoveryEngine: Sendable {
             discard(); return .failure(.cancelled)
         } catch let error as FileContentError {
             discard(); return .failure(error == .unmapped ? .unmapped : .damagedMapping)
+        } catch let error as ScanError where error == .io(CopyFailure.needsRescan.reason) {
+            discard(); return .failure(.needsRescan)
         } catch {
             discard(); return .failure(Task.isCancelled ? .cancelled : .sourceRead)
         }

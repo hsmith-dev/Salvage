@@ -3,7 +3,11 @@ import Foundation
 /// The layout fingerprint a scan records (spec-tech-batch-7 §B): the ordered volume extents that
 /// volume discovery finds on a device, exactly as `ScanCheckpoint.extents` holds them. A saved
 /// scan is reconnected to a device only when the device's fingerprint, taken fresh here, equals the
-/// one the scan recorded, so a drive that was re-partitioned or reformatted since is refused.
+/// one the scan recorded, so a drive whose partitions moved, or whose volumes were found at other
+/// offsets or sizes since (re-partitioned, or reformatted to a format with another extent), is
+/// refused. It holds offsets and lengths only: a volume erased in place to the same format keeps
+/// its extent and so its fingerprint. The drive's stable identity (`BlockDevice.StableIdentity`,
+/// whose volume UUIDs change on an erase) is what tells that case apart.
 ///
 /// Discovery reads only partition tables, filesystem headers and the bounded lost-partition probes
 /// (`VolumeDiscovery`); it never sweeps file contents.
@@ -82,10 +86,13 @@ public enum NTFSResidentData {
         return nil
     }
 
-    /// Re-reads `file`'s MFT record from `reader` and checks it still holds this file: the same
-    /// record number, name, date, deleted state and size, a resident unnamed `$DATA` that the
-    /// file's runs (`runs(inRecord:at:)`) map exactly, and bytes at those runs equal to the value
-    /// the existing parser reads. Reads only the volume's boot sector and the one record.
+    /// Re-reads `file`'s MFT record from `reader` and checks it still holds this file: the record
+    /// number maps through `$MFT`'s own runs to one contiguous range starting at the saved record
+    /// offset (a record that straddles two `$MFT` runs can't be described by the saved runs, so it
+    /// is refused: rescan to recover it), and the record has the same number, name, date, deleted
+    /// state and size, a resident unnamed `$DATA` that the file's runs (`runs(inRecord:at:)`) map
+    /// exactly, and bytes at those runs equal to the value the existing parser reads. Reads only
+    /// the volume's boot sector, `$MFT`'s first record and the file's record.
     public static func revalidate(_ file: RecoveredFile, recordBytes: Int, reader: any BlockReader) async -> Bool {
         let meta = file.sourceMetadata
         guard meta.filesystem == .ntfs, case .runs(let runs) = file.content, !runs.isEmpty,
@@ -95,7 +102,9 @@ public enum NTFSResidentData {
         do {
             let boot = try await reader.read(at: meta.volumeOffset, count: 512)
             let geometry = try NTFSGeometry(boot: Data(boot), volumeLength: reader.sizeBytes - meta.volumeOffset)
-            guard geometry.recordBytes == Int64(recordBytes) else { return false }
+            guard geometry.recordBytes == Int64(recordBytes),
+                  try await recordLocation(meta.allocationStart, volumeOffset: meta.volumeOffset, geometry: geometry,
+                                           reader: reader) == meta.recordOffset else { return false }
             let raw = Data(try await reader.read(at: meta.recordOffset, count: recordBytes))
             guard raw.count == recordBytes, String(decoding: raw.prefix(4), as: UTF8.self) == "FILE" else { return false }
             var fixed = raw
@@ -118,5 +127,32 @@ public enum NTFSResidentData {
         } catch {
             return false
         }
+    }
+
+    /// The device offset of MFT record `number`, through `$MFT`'s run list (read from its own
+    /// record 0, as a scan does), when the whole record lies in one run. Nil when it straddles two
+    /// runs, lies past `$MFT`'s initialized size, or `$MFT` can't be read.
+    static func recordLocation(_ number: UInt64, volumeOffset: Int64, geometry g: NTFSGeometry,
+                               reader: any BlockReader) async throws -> Int64? {
+        let mftOffset = try checkedAdd(volumeOffset, checkedMultiply(g.mftCluster, g.clusterBytes))
+        guard mftOffset <= reader.sizeBytes - g.recordBytes else { return nil }
+        var record = Data(try await reader.read(at: mftOffset, count: Int(g.recordBytes)))
+        guard record.count == Int(g.recordBytes), String(decoding: record.prefix(4), as: UTF8.self) == "FILE",
+              applyNTFSFixup(&record) else { return nil }
+        let mft = try NTFSRecord(record, geometry: g)
+        guard mft.inUse, mft.baseReference == 0, let data = mft.data, data.residentValue == nil,
+              number <= UInt64(Int64.max) / UInt64(g.recordBytes) else { return nil }
+        var position = Int64(number) * g.recordBytes
+        guard try checkedAdd(position, g.recordBytes) <= data.initialized else { return nil }
+        for run in data.runs {
+            guard let lcn = run.lcn else { return nil }
+            let runBytes = try checkedMultiply(run.length, g.clusterBytes)
+            if position < runBytes {
+                guard try checkedAdd(position, g.recordBytes) <= runBytes else { return nil }
+                return try checkedAdd(checkedAdd(volumeOffset, checkedMultiply(lcn, g.clusterBytes)), position)
+            }
+            position -= runBytes
+        }
+        return nil
     }
 }

@@ -13,7 +13,8 @@ struct StableDiskIdentityTests {
         let identity = StableDiskIdentity.identity(content: "GUID_partition_scheme", schemeUUID: "6fc74900-00f5-4e35-855d-d8162dbd9a32",
                                                    volumes: [Volume(offsetBytes: 1_048_576, volumeUUID: "X")], sizeBytes: 4096,
                                                    model: "  Portable SSD \n", serial: " S4X9NF0M ")
-        #expect(identity == BlockDevice.StableIdentity(diskGUID: "6FC74900-00F5-4E35-855D-D8162DBD9A32", sizeBytes: 4096,
+        #expect(identity == BlockDevice.StableIdentity(diskGUID: "6FC74900-00F5-4E35-855D-D8162DBD9A32",
+                                                       volumes: [Volume(offsetBytes: 1_048_576, volumeUUID: "X")], sizeBytes: 4096,
                                                        model: "Portable SSD", serial: "S4X9NF0M"))
         // A GPT drive whose GUID wasn't published (or isn't a GUID) has no stable identity.
         #expect(StableDiskIdentity.identity(content: "GUID_partition_scheme", schemeUUID: nil, volumes: [], sizeBytes: 4096,
@@ -50,7 +51,10 @@ struct LiveStableDiskIdentityTests {
         let identity = try #require(try Self.device(first).stableIdentity)
         let mediaIdentity = try Self.device(first).mediaIdentity
         #expect(identity.diskGUID == headerGUID)
-        #expect(identity.volumes.isEmpty && identity.sizeBytes == 8 * 1024 * 1024)
+        #expect(identity.sizeBytes == 8 * 1024 * 1024)
+        // Its exFAT volume's UUID is part of it too, at the partition's offset.
+        #expect(identity.volumes.map(\.offsetBytes) == [1_048_576])
+        #expect(identity.volumes.first?.volumeUUID == Self.diskutilVolumeUUID(first + "s1"))
         #expect(identity.model == "Disk Image")
         folder.detach(first)
 

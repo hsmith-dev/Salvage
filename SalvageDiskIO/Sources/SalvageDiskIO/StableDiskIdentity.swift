@@ -13,9 +13,11 @@ import SalvageCore
 // - GPT: the disk GUID from the partition table header. macOS publishes it as the `UUID` property
 //   of the `IOGUIDPartitionScheme` object beneath the whole disk's IOMedia; the whole disk's own
 //   description has no `DAMediaUUID`.
+// - Every drive: its volumes' filesystem UUIDs (`DAVolumeUUID`, derived from each filesystem's own
+//   serial number or UUID), with their offsets. On a GPT drive they must match as well as the GUID,
+//   since erasing a volume in place keeps the GUID (and, for the same format, the layout).
 // - MBR, or no partition table: macOS publishes no MBR disk signature (not in the description, not
-//   on `IOFDiskPartitionScheme`), so the volumes' filesystem UUIDs (`DAVolumeUUID`, derived from
-//   each filesystem's own serial number or UUID) stand in for it, with their offsets.
+//   on `IOFDiskPartitionScheme`), so the volume UUIDs alone identify the drive.
 // - Size, model, and the serial number when the interface reports one.
 
 enum StableDiskIdentity {
@@ -27,11 +29,12 @@ enum StableDiskIdentity {
                          sizeBytes: Int64, model: String?, serial: String?) -> BlockDevice.StableIdentity? {
         guard sizeBytes > 0 else { return nil }
         let model = clean(model), serial = clean(serial)
+        let sorted = volumes.sorted { $0.offsetBytes < $1.offsetBytes }
         if content == gptScheme {
             guard let guid = clean(schemeUUID).flatMap(UUID.init(uuidString:)) else { return nil }
-            return BlockDevice.StableIdentity(diskGUID: guid.uuidString, sizeBytes: sizeBytes, model: model, serial: serial)
+            return BlockDevice.StableIdentity(diskGUID: guid.uuidString, volumes: sorted, sizeBytes: sizeBytes, model: model,
+                                              serial: serial)
         }
-        let sorted = volumes.sorted { $0.offsetBytes < $1.offsetBytes }
         guard !sorted.isEmpty else { return nil }
         return BlockDevice.StableIdentity(diskGUID: nil, volumes: sorted, sizeBytes: sizeBytes, model: model, serial: serial)
     }

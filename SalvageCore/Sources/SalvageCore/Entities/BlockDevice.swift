@@ -54,9 +54,10 @@ public struct BlockDevice: Identifiable, Equatable, Sendable {
     public struct StableIdentity: Equatable, Sendable, Codable {
         /// The GPT disk GUID (uppercased), when the drive has a GUID partition table.
         public let diskGUID: String?
-        /// For a drive without a GPT (an MBR drive, or one with no partition table), which has no disk
-        /// GUID: each volume's byte offset and the filesystem volume UUID macOS reports for it
-        /// (`DAVolumeUUID`), in offset order. Empty for a GPT drive.
+        /// Each volume's byte offset and the filesystem volume UUID macOS reports for it
+        /// (`DAVolumeUUID`), in offset order, for every drive. A drive without a GPT is identified by
+        /// these alone; on a GPT drive they must match too, so erasing a volume in place (which keeps
+        /// the disk GUID and, for the same format, the layout) is a different drive.
         public let volumes: [Volume]
         public let sizeBytes: Int64
         public let model: String?

@@ -479,6 +479,48 @@ struct ScanArchiveIdentityAndPrivacyTests {
         #expect(!admits(Self.drive(media: 1, nil, boot: true)))
         #expect(!admits(Self.drive(media: 2, Identity(diskGUID: nil, volumes: [.init(offsetBytes: 0, volumeUUID: "A")],
                                                       sizeBytes: Self.size, model: nil, serial: nil))))
+        // IORegistry IDs restart each boot: an equal media identity doesn't override a stable identity that differs.
+        #expect(!admits(Self.drive(media: 1, Identity(diskGUID: "6FC74900-00F5-4E35-855D-D8162DBD9A33", sizeBytes: Self.size,
+                                                      model: "SSD", serial: "S1"))))
+    }
+
+    /// Erasing a GPT drive's volume in place keeps the disk GUID (and, for the same format, the
+    /// layout), but gives the volume a new UUID: another drive.
+    @Test func aGPTDriveMustAlsoKeepItsVolumeUUIDs() {
+        let volume = Identity.Volume(offsetBytes: 1_048_576, volumeUUID: "65FCA101-0112-36D9-82AC-444CA787A199")
+        let saved = Self.drive(media: 1, Identity(diskGUID: Self.guid, volumes: [volume], sizeBytes: Self.size, model: nil, serial: nil))
+        #expect(ScanArchive.admits(Self.drive(media: 2, Identity(diskGUID: Self.guid, volumes: [volume], sizeBytes: Self.size,
+                                                                 model: nil, serial: nil)), for: saved))
+        for volumes in [[Identity.Volume(offsetBytes: 1_048_576, volumeUUID: "0D1E2F30-0112-36D9-82AC-444CA787A199")], [],
+                        [volume, Identity.Volume(offsetBytes: 9_000_000, volumeUUID: "B")]] {
+            #expect(!ScanArchive.admits(Self.drive(media: 1, Identity(diskGUID: Self.guid, volumes: volumes, sizeBytes: Self.size,
+                                                                      model: nil, serial: nil)), for: saved))
+        }
+    }
+
+    @Test func aMediaIdentityCountsOnlyWithinTheBootItWasSavedIn() throws {
+        let device = BlockDevice(bsdName: "disk7", displayName: "Backup Drive", sizeBytes: Int64(ScanArchiveTests.imageSize),
+                                 isInternal: false, isBootVolume: false, mediaIdentity: ScanArchiveTests.identity)
+        let savedAt = Date(timeIntervalSinceReferenceDate: 800_000_000)
+        let archive = ScanArchive(device: device, files: [], lostPartitions: [], notices: [],
+                                  checkpoint: try ScanArchiveTests().checkpoint(for: ScanArchiveTests.image), outcome: .completed,
+                                  bytesScanned: 1, totalBytes: 1, startedAt: nil, endedAt: nil, savedAt: savedAt)
+        let thisBoot = BootSession(uuid: "BOOT-A", bootTime: savedAt.addingTimeInterval(-60))
+        let url = try ScanArchiveTests().temporaryPackage()
+        try archive.write(to: url, boot: thisBoot)
+        #expect(try ScanArchive.read(from: url, boot: thisBoot).device.mediaIdentity == ScanArchiveTests.identity)
+        let restarted = BootSession(uuid: "BOOT-B", bootTime: savedAt.addingTimeInterval(60))
+        let reopened = try ScanArchive.read(from: url, boot: restarted)
+        #expect(reopened.device.mediaIdentity == nil, "After a restart the saved IORegistry ID means nothing")
+        #expect(!ScanArchive.admits(device, for: reopened.device), "so a drive that reuses it isn't admitted")
+        #expect(try ScanArchive.read(from: url, boot: BootSession(uuid: nil, bootTime: nil)).device.mediaIdentity == nil)
+
+        // Version 1 had no session UUID: its save time must fall in this boot.
+        try ScanArchiveTests.replaceFileList(in: url, with: LegacyFileList.encodeVersion1([]), version: 1,
+                                             editDevice: { $0["stableIdentity"] = nil })
+        #expect(try ScanArchive.read(from: url, boot: BootSession(uuid: "BOOT-B", bootTime: savedAt.addingTimeInterval(-1)))
+            .device.mediaIdentity == ScanArchiveTests.identity)
+        #expect(try ScanArchive.read(from: url, boot: restarted).device.mediaIdentity == nil)
     }
 
     @Test func driveWithoutAGPTMatchesByItsVolumeUUIDs() {
@@ -537,6 +579,8 @@ struct ScanArchiveIdentityAndPrivacyTests {
         fresh.openArchive(read)
         #expect(await fresh.reconnect(replugged, open: CountingOpener(data: ScanArchiveTests.image).open) == .connected)
         #expect(fresh.source?.device.bsdName == "disk12")
+        // The scan now refers to the drive as attached, so the sidebar's "Recover all files…" finds it.
+        #expect(fresh.device == replugged && fresh.deviceWithFinishedResults == replugged)
     }
 
     // MARK: No file contents
@@ -600,7 +644,8 @@ struct ScanArchiveIdentityAndPrivacyTests {
         guard case .runs(let runs) = reopenedNotes.content else { Issue.record("resident data should be runs"); return }
         #expect(runs.count == 3, "Before the stride tail, the tail's two saved bytes, after it")
         #expect(read.residentRecords == [notes.id: 1024])
-        #expect(reopenedNotes.recoveryConfidence != nil, "Still recoverable")
+        #expect(reopenedNotes.recoveryConfidence == notes.recoveryConfidence, "Confidence is unchanged by saving and reopening")
+        #expect(reopenedNotes.recoveryEvidence.fragmentCount == 1)
 
         let reopened = ScanViewModel { _, _ in }
         reopened.openArchive(read)
@@ -616,8 +661,8 @@ struct ScanArchiveIdentityAndPrivacyTests {
         #expect(carvedBytes == pdf.dropLast())
 
         // Saving the reopened scan again keeps the resident file located in its record.
-        var again = try #require(reopened.makeArchive())
-        again.residentRecords = read.residentRecords
+        let again = try #require(reopened.makeArchive())
+        #expect(again.residentRecords == read.residentRecords)
         let url2 = try ScanArchiveTests().temporaryPackage()
         try again.write(to: url2)
         #expect(try ScanArchive.read(from: url2).residentRecords == read.residentRecords)
@@ -650,6 +695,10 @@ struct ScanArchiveIdentityAndPrivacyTests {
         }) == .connected, "The layout is unchanged")
         let source = try #require(model.source)
         await #expect(throws: ScanError.io(ScanArchive.rescanToRecover)) { try await Self.contents(of: notes, from: source) }
+        // Preview and recovery say so.
+        #expect(try await PreviewLoader(source: source).load(notes).unavailableReason == .needsRescan)
+        #expect(PreviewUnavailableReason.needsRescan.message == "Rescan to recover this file.")
+        try await Self.expectRecoveryFails(notes, from: source, with: "Rescan to recover this file.")
         // Other files still read.
         let carved = try #require(read.files.first { $0.recoveryMethod == .carved })
         #expect(try await Self.contents(of: carved, from: source) == rewritten.pdf.dropLast())
@@ -665,6 +714,60 @@ struct ScanArchiveIdentityAndPrivacyTests {
         // And unchanged, it reads.
         let intact = ResidentRecordGuard(base: ArchiveMemoryReader(data: original.image), entries: entries)
         #expect(try await Self.contents(of: notes, from: SourceSession(device: device, reader: intact, close: {})) == original.resident)
+    }
+
+    static func expectRecoveryFails(_ file: RecoveredFile, from source: SourceSession, with reason: String) async throws {
+        let destination = FileManager.default.temporaryDirectory.appending(path: "SalvageRescan-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: destination) }
+        let coordinator = RecoveryCoordinator(files: [file], content: source.content, deviceName: "Drive",
+                                              destinationCheck: { url in DestinationAssessment(verdict: .safe, mountSource: mountSourceName(ofPath: url.resolvingSymlinksInPath().path)) })
+        coordinator.setSaveReport(false)
+        await coordinator.chooseDestination(destination)
+        coordinator.start()
+        await coordinator.waitUntilFinished()
+        guard case .finished(let summary) = coordinator.phase else { Issue.record("Recovery didn't finish: \(coordinator.phase)"); return }
+        #expect(summary.failed.map(\.reason) == [reason])
+    }
+
+    /// A 512-byte-cluster volume with 1 KiB records whose `$MFT` is in two runs, so record 16
+    /// starts in the first run and ends in the second. Its resident file can't be described by
+    /// runs from its record offset, so it is refused on reconnect; record 17's file reads.
+    @Test func aRecordThatStraddlesMFTRunsIsRefusedAndOthersRead() async throws {
+        let straddling = Data("straddles \(Self.marker)".utf8), whole = Data("whole record \(Self.marker)".utf8)
+        var ntfs = NTFSFixture()
+        ntfs.mftRuns = [(16, 33), (120, 31)]
+        ntfs.records[16] = NTFSFixture.file("split.txt", data: NTFSFixture.resident(0x80, straddling))
+        ntfs.records[17] = NTFSFixture.file("whole.txt", data: NTFSFixture.resident(0x80, whole))
+        let image = ntfs.build()
+        let reader = ArchiveMemoryReader(data: image)
+        let device = Self.drive(media: 5, nil, size: Int64(image.count))
+        let scanning = ScanViewModel { run, events in
+            await ScanSession(reader: reader).run(events: events, pauseGate: run.pauseGate, checkpoints: run.checkpoints,
+                                                  notices: run.notices, device: run.device)
+        }
+        scanning.start(device)
+        while scanning.isActive { await Task.yield() }
+        let split = try #require(scanning.files.first { $0.name == "split.txt" })
+        let wholeFile = try #require(scanning.files.first { $0.name == "whole.txt" })
+        #expect(split.content == .resident(straddling) && wholeFile.content == .resident(whole), "The scan reads both")
+        #expect(split.sourceMetadata.recordOffset == 48 * 512, "Record 16 starts at the first run's last cluster")
+
+        let url = try ScanArchiveTests().temporaryPackage()
+        try #require(scanning.makeArchive()).write(to: url)
+        let read = try ScanArchive.read(from: url)
+        let model = ScanViewModel { _, _ in }
+        model.openArchive(read)
+        let entries = ResidentRecordGuard.entries(files: model.files, residentRecords: read.residentRecords)
+        #expect(await model.reconnect(device, open: { device in
+            SourceSession(device: device, reader: ResidentRecordGuard.wrapping(ArchiveMemoryReader(data: image), entries: entries),
+                          close: {})
+        }) == .connected)
+        let source = try #require(model.source)
+        let reopenedSplit = try #require(read.files.first { $0.id == split.id })
+        let reopenedWhole = try #require(read.files.first { $0.id == wholeFile.id })
+        await #expect(throws: ScanError.io(ScanArchive.rescanToRecover)) { try await Self.contents(of: reopenedSplit, from: source) }
+        #expect(try await Self.contents(of: reopenedWhole, from: source) == whole)
     }
 
     static func contents(of file: RecoveredFile, from source: SourceSession) async throws -> Data {
@@ -700,7 +803,8 @@ struct ScanArchiveReplugTests {
         let first = try await images.attach(image)
         let original = try await Self.device(first)
         let identity = try #require(original.stableIdentity, "\(layout) image has a stable identity")
-        if layout == "GPTSPUD" { #expect(identity.diskGUID != nil) } else { #expect(identity.diskGUID == nil && !identity.volumes.isEmpty) }
+        #expect((identity.diskGUID != nil) == (layout == "GPTSPUD"))
+        #expect(identity.volumes.count == 1, "Its exFAT volume's UUID is part of the identity")
         let model = ScanViewModel { run, events in
             let reader = try await RawBlockReader.prepare(device: run.device)
             await ScanSession(reader: reader).run(events: events, pauseGate: run.pauseGate, checkpoints: run.checkpoints,
@@ -747,6 +851,24 @@ struct ScanArchiveReplugTests {
         let opener = CountingOpener(data: Data())
         #expect(await refused.reconnect(other, open: opener.open) == .notThisDevice)
         #expect(opener.opened == 0, "A lookalike is never opened")
+
+        // The same drive with its volume erased in place to the same format: the GPT GUID and the
+        // layout stay, the volume's UUID doesn't. (Simulated on a copy of the image file by giving
+        // the exFAT volume a new serial number; no device is written.)
+        if layout == "GPTSPUD" {
+            let erased = images.url.appending(path: "erased.dmg")
+            var bytes = try Data(contentsOf: image)
+            ExFATBoot.setSerial(0x1234_5678, in: &bytes, volumeAt: 1_048_576)
+            try bytes.write(to: erased)
+            let erasedDevice = try await Self.device(try await images.attach(erased))
+            #expect(erasedDevice.stableIdentity?.diskGUID == identity.diskGUID)
+            let erasedVolumes = try #require(erasedDevice.stableIdentity?.volumes)
+            #expect(erasedVolumes.count == 1 && erasedVolumes[0].offsetBytes == identity.volumes[0].offsetBytes,
+                    "macOS still recognizes the volume, at the same offset")
+            #expect(erasedVolumes[0].volumeUUID != identity.volumes[0].volumeUUID)
+            #expect(await refused.reconnect(erasedDevice, open: opener.open) == .notThisDevice)
+            #expect(opener.opened == 0, "An erased drive is never opened")
+        }
         try await waitFor { reopened.source == nil }
     }
 
@@ -821,6 +943,23 @@ private final class ImageFolder {
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+    }
+}
+
+/// Rewrites an exFAT volume's serial number in an image file, with the boot checksum and the
+/// backup boot region updated to match.
+private enum ExFATBoot {
+    static func setSerial(_ serial: UInt32, in image: inout Data, volumeAt base: Int) {
+        for index in 0..<4 { image[base + 100 + index] = UInt8(truncatingIfNeeded: serial >> (index * 8)) }
+        let sector = 1 << Int(image[base + 108])
+        var checksum: UInt32 = 0
+        for index in 0..<(11 * sector) where index != 106 && index != 107 && index != 112 {
+            checksum = (checksum & 1 != 0 ? 0x8000_0000 : 0) &+ (checksum >> 1) &+ UInt32(image[base + index])
+        }
+        for word in stride(from: 0, to: sector, by: 4) {
+            for index in 0..<4 { image[base + 11 * sector + word + index] = UInt8(truncatingIfNeeded: checksum >> (index * 8)) }
+        }
+        image.replaceSubrange(base + 12 * sector..<base + 24 * sector, with: image.subdata(in: base..<base + 12 * sector))
     }
 }
 
@@ -927,6 +1066,8 @@ enum LegacyFileList {
 struct NTFSFixture {
     static let sector = 512, recordSize = 1024, clusterCount = 255
     var records: [Int: Data] = [:]
+    /// `$MFT`'s runs (first cluster, cluster count); 64 clusters hold its 32 records.
+    var mftRuns: [(lcn: Int, length: Int)] = [(16, 64)]
 
     static func put(_ data: inout Data, _ offset: Int, _ value: UInt64, _ width: Int) {
         for index in 0..<width { data[offset + index] = UInt8(truncatingIfNeeded: value >> (index * 8)) }
@@ -946,8 +1087,17 @@ struct NTFSFixture {
     }
 
     static func nonResident(_ type: UInt32, lcn: Int, clusters: Int, size: Int) -> Data {
-        var runs = Data([0x21, UInt8(clusters), UInt8(lcn & 0xff), UInt8(lcn >> 8), 0])
-        if lcn < 0x80 { runs = Data([0x11, UInt8(clusters), UInt8(lcn), 0]) }
+        nonResident(type, runs: [(lcn, clusters)], size: size)
+    }
+
+    /// Runs of under 128 clusters starting below cluster 128, so every field is one byte.
+    static func nonResident(_ type: UInt32, runs list: [(lcn: Int, length: Int)], size: Int) -> Data {
+        var runs = Data(), previous = 0
+        for run in list {
+            runs += Data([0x11, UInt8(run.length), UInt8(bitPattern: Int8(run.lcn - previous))]); previous = run.lcn
+        }
+        runs.append(0)
+        let clusters = list.reduce(0) { $0 + $1.length }
         var a = Data(count: align8(0x40 + runs.count))
         put(&a, 0, UInt64(type), 4); put(&a, 4, UInt64(a.count), 4); put(&a, 8, 1, 1); put(&a, 10, 0x40, 2)
         put(&a, 0x18, UInt64(clusters - 1), 8); put(&a, 0x20, 0x40, 2)
@@ -1005,11 +1155,13 @@ struct NTFSFixture {
         Self.put(&image, 0x28, UInt64(Self.clusterCount), 8); Self.put(&image, 0x30, 16, 8); Self.put(&image, 0x38, 2, 8)
         Self.put(&image, 0x40, 0xf6, 1); Self.put(&image, 0x44, 0xf4, 1); Self.put(&image, 510, 0xaa55, 2)
         var bitmap = Data(count: (Self.clusterCount + 7) / 8)
-        for cluster in 0..<91 { bitmap[cluster / 8] |= UInt8(1) << (cluster % 8) }
+        var used = Set(0..<91)
+        for run in mftRuns { used.formUnion(run.lcn..<run.lcn + run.length) }
+        for cluster in used { bitmap[cluster / 8] |= UInt8(1) << (cluster % 8) }
         var all: [Int: Data] = [:]
         all[0] = Self.record(number: 0, sequence: 1, flags: 1, [
             Self.standardInformation(), Self.fileName("$MFT", parent: 5, sequence: 5, namespace: 3),
-            Self.nonResident(0x80, lcn: 16, clusters: 64, size: 32 * Self.recordSize)])
+            Self.nonResident(0x80, runs: mftRuns, size: 32 * Self.recordSize)])
         all[5] = Self.record(number: 5, sequence: 5, flags: 3, [
             Self.standardInformation(), Self.fileName(".", parent: 5, sequence: 5, namespace: 3),
             Self.resident(0x90, Data(count: 16), name: "$I30")])
@@ -1026,8 +1178,14 @@ struct NTFSFixture {
             all[number] = Self.record(number: number, sequence: 1, flags: 1, parts)
         }
         for (number, bytes) in all {
-            let start = 16 * sector + number * Self.recordSize
-            image.replaceSubrange(start..<start + Self.recordSize, with: bytes)
+            for index in 0..<Self.recordSize {
+                var cluster = (number * Self.recordSize + index) / sector, located: Int?
+                for run in mftRuns {
+                    if cluster < run.length { located = run.lcn + cluster; break }
+                    cluster -= run.length
+                }
+                image[located! * sector + (number * Self.recordSize + index) % sector] = bytes[index]
+            }
         }
         image.replaceSubrange(90 * sector..<90 * sector + bitmap.count, with: bitmap)
         return image
