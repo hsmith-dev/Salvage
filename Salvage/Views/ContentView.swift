@@ -27,7 +27,8 @@ struct ContentView: View {
             rescan: rescan))
     }
     nonisolated private static func runScan(run: ScanRun, events: AsyncStream<ScanEvent>.Continuation) async throws {
-        let reader = try await RawBlockReader.prepare(device: run.device)
+        let reader = try await RawBlockReader.prepare(device: run.device,
+                                                      onAdministratorPasswordPrompt: run.willAskForAdministratorPassword)
         await ScanSession(reader: reader).run(events: events, pauseGate: run.pauseGate,
                                               checkpoints: run.checkpoints,
                                               notices: run.notices,

@@ -74,12 +74,13 @@ xcodebuild -project Salvage.xcodeproj -scheme Salvage -configuration Debug \
 `Salvage.xcodeproj` is generated from `project.yml` with xcodegen and committed. After you add
 files or targets, run `xcodegen generate`.
 
-**USB drives and SD cards need a signed build.** Physical drives' raw device nodes are owned by
-root, so Salvage reads them through a small privileged helper (`SalvageHelper/`). The helper only
-serves an app signed by the same team. An unsigned build can read only disk images you attach
-yourself, such as `hdiutil attach -nomount image.dmg`. To read a real drive from source, set the
-same team for the `Salvage` and `SalvageHelper` targets in Xcode and run a Debug build. The manual
-steps are in
+**USB drives and SD cards work in any build.** Physical drives' raw device nodes are owned by
+root. When Salvage can't open one directly, macOS asks for an administrator password in its own
+dialog (`/usr/libexec/authopen`), which opens the drive read-only and hands it to Salvage. No
+Terminal or `sudo` is needed. A signed release also embeds a small privileged helper
+(`SalvageHelper/`) that the user can approve once to skip the password; it only serves an app
+signed by the same team. To try the helper from source, set the same team for the `Salvage` and
+`SalvageHelper` targets in Xcode and run a Debug build. The manual steps are in
 [spec-1-12, "Manual end-to-end verification"](_bmad-output/implementation-artifacts/spec-1-12-read-physical-drives-via-a-read-only-privileged-helper.md).
 
 Signed, notarized releases come from `.github/workflows/release.yml` when a `v*.*.*` tag is
@@ -91,11 +92,11 @@ with a SHA-256 checksum. If no release is listed there yet, build from source.
 - `SalvageCore/` is the recovery engine: filesystem parsers, carving, lost-partition search,
   FileVault decryption and recovery-confidence scoring. It depends on nothing but Foundation.
 - `SalvageDiskIO/` is the macOS disk adapter: the device list (DiskArbitration), unmounting,
-  raw read-only reads, the boot-disk check, destination safety, and the client for the privileged
-  helper.
+  raw read-only reads, the boot-disk check, destination safety, the administrator-password
+  (`authopen`) fallback, and the client for the privileged helper.
 - `Salvage/` is the SwiftUI app. It is the composition root that connects `SalvageDiskIO` to
   `SalvageCore`.
-- `SalvageHelper/` is the privileged read-only helper. It is a launchd daemon embedded in
+- `SalvageHelper/` is the optional privileged read-only helper. It is a launchd daemon embedded in
   `Salvage.app`, and its one job is to open a validated whole disk read-only and hand the file
   descriptor back.
 - `scripts/` holds the CI policy checks, their self-tests, and `spike-raw-device-access/`, a
@@ -115,6 +116,10 @@ with a SHA-256 checksum. If no release is listed there yet, build from source.
 
 ## Not yet verified
 
+- **The administrator-password dialog on real drives.** The `authopen` path is unit-tested with
+  fakes (descriptor passing over a socketpair, cancel, timeout, extra or writable descriptors), but
+  the real dialog has never been shown under test: nobody has yet scanned a real USB drive through
+  it, or confirmed how authopen behaves on Cancel and when it is terminated while the dialog is up.
 - **The signed privileged helper on real USB drives and SD cards.** The helper and its client are
   unit-tested, and CI checks that the helper is embedded where launchd expects it. Nobody has yet
   run a Developer ID–signed build end to end: approving the helper, scanning a real USB drive,

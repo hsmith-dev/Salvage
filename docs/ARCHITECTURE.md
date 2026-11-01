@@ -27,13 +27,14 @@ graph TD
     App["Salvage (app)<br/>SwiftUI, recovery writes, update check"] --> Core["SalvageCore<br/>parsers, carving, confidence, ports"]
     App --> DiskIO["SalvageDiskIO<br/>DiskArbitration, raw reads, safety checks"]
     DiskIO --> Core
-    DiskIO -. XPC .-> Helper["SalvageHelper<br/>root daemon: open read-only, return fd"]
+    DiskIO -. XPC, if enabled .-> Helper["SalvageHelper<br/>root daemon: open read-only, return fd"]
+    DiskIO -. SCM_RIGHTS .-> Authopen["/usr/libexec/authopen<br/>macOS password dialog, read-only fd"]
 ```
 
 | Module | What it holds | Key files |
 | --- | --- | --- |
 | `SalvageCore` | Volume discovery (MBR/GPT, lost-partition search), parsers for FAT32/exFAT, NTFS, EXT2/3/4, HFS+ and APFS, APFS FileVault decryption, the carving engine and its JSON signatures, recovery confidence, and the `BlockReader` port. Foundation only. | `ScanSession.swift`, `Parsers/`, `Carving/`, `Confidence/RecoveryConfidence.swift`, `Ports/BlockReader.swift` |
-| `SalvageDiskIO` | The device list and tree, unmounting, `RawBlockReader` (read-only, validated descriptor), the boot-disk check, recovery-destination safety, and the helper client. | `RawBlockReader.swift`, `DeviceWatcher.swift`, `DeviceTree.swift`, `BootDiskSafety.swift`, `DestinationSafety.swift`, `PrivilegedOpenClient.swift`, `HelperShared/` |
+| `SalvageDiskIO` | The device list and tree, unmounting, `RawBlockReader` (read-only, validated descriptor), the boot-disk check, recovery-destination safety, the `authopen` password fallback and the helper client. | `RawBlockReader.swift`, `DeviceWatcher.swift`, `DeviceTree.swift`, `BootDiskSafety.swift`, `DestinationSafety.swift`, `AuthopenClient.swift`, `PrivilegedOpenClient.swift`, `HelperShared/` |
 | `Salvage` (app) | SwiftUI views, view models, recovery writing, and the one network file. `ContentView` is the composition root, the only place a `RawBlockReader` is handed to a `ScanSession`. | `Views/`, `ViewModels/`, `Updates/UpdateChecker.swift` |
 | `SalvageHelper` | A launchd daemon registered with `SMAppService`. Its one operation opens a validated whole disk `O_RDONLY` and returns the descriptor. It compiles only `main.swift` and `SalvageDiskIO/.../HelperShared/`. | `SalvageHelper/main.swift`, `dev.hsmith.Salvage.Helper.plist` |
 
@@ -63,14 +64,46 @@ staples the app, packages it with `scripts/package-release.sh` into a signed, no
 1. `DeviceWatcher` (DiskArbitration) feeds the device tree. `UnlockViewModel` may offer the
    FileVault sheet first.
 2. `RawBlockReader.prepare` checks the drive identity, refuses the boot disk, unmounts it, confirms
-   it is unmounted, then opens `/dev/rdiskN` directly. On `EACCES`/`EPERM` it asks the helper. It
-   then checks that the descriptor is read-only and is the expected device.
+   it is unmounted, then opens `/dev/rdiskN` directly. On `EACCES`/`EPERM` (physical drives are
+   `root:operator 0640`) it follows the AD-13 fallback chain below. It then checks that the
+   descriptor is read-only and is the expected device (`validateRawDescriptor`), whichever path
+   opened it.
 3. `ScanSession.run` discovers volumes, runs each parser (emitting `ScanEvent.found`), then sweeps
    the volumes' bytes for the carver. Progress, checkpoints and `ScanNotice`s travel on their own
    streams (AD-11).
 4. After the scan, the open read-only session (`SourceSession`) stays alive for preview
    (`PreviewLoader`) and recovery (`RecoveryCoordinator`). Recovery checks the destination with
    `DestinationSafety` when it is chosen and again before writing (AD-8).
+
+### AD-13 fallback chain (opening a physical drive)
+
+`openRawDevice` in `RawBlockReader.swift`, after every safety check in `prepare` (whole-disk
+name, boot-disk refusal, unmount, identity re-check):
+
+1. **Direct `open(O_RDONLY)`.** Enough for anything the user owns, such as a disk image they
+   attached. Any error other than `EACCES`/`EPERM` stops here.
+2. **The privileged helper, only if `SMAppService` reports it `.enabled`.** A signed build whose
+   user approved it in Login Items. Its safety refusals (boot disk, mounted, changed, not
+   root-owned) are final. Only "couldn't be reached" errors (not approved any more, missing,
+   no reply) move on to step 3.
+3. **macOS's administrator-password dialog** (`AuthopenClient.swift`). Salvage runs
+   `/usr/libexec/authopen -stdoutpipe -o 0 /dev/rdiskN` through `Process`: absolute path, fixed
+   argv, no shell, stdin and stderr on `/dev/null`. Its stdout is one end of a
+   `socketpair(AF_UNIX, SOCK_STREAM)`, and the descriptor comes back with `recvmsg` and
+   `SCM_RIGHTS`. `-o 0` is `O_RDONLY`, so authopen asks for the
+   `sys.openfile.readonly./dev/rdiskN` right, which only grants read-only descriptors. Salvage
+   never passes `-w`, `-c` or `-extauth`. Exactly one descriptor from a zero exit is accepted.
+   Anything else closes every descriptor received. A failed run with no descriptor (the user
+   cancelled) becomes `ScanError.administratorPasswordNeeded`, which the app shows with
+   **Try Again**, unless a re-check shows the drive was unplugged or replaced
+   (`deviceChanged`). After a successful open, the drive's identity and unmounted state are
+   checked again, because the dialog may have been up for minutes. A three-minute timeout, or
+   cancelling the scan, terminates authopen (SIGTERM, then SIGKILL).
+
+`prepare(device:onAdministratorPasswordPrompt:)` calls its hook just before step 3, so the scan
+screen and the saved-scan banner can say why the dialog is coming. Scan, saved-scan reconnect,
+FileVault verification and the CLI all open drives through `RawBlockReader.prepare`, so they all
+use this chain. Recovery and preview reuse the scan's open session.
 
 ## Where the code has moved past the planning documents
 
@@ -84,5 +117,9 @@ staples the app, packages it with `scripts/package-release.sh` into a signed, no
   offers the unlock sheet for each such volume and re-scans the drive with the volume unlocked
   (`ContentView`, `UnlockViewModel`).
 - **Full Disk Access.** The plain-terms architecture doc describes the app as prompting for Full
-  Disk Access. The app has no such prompt. Physical drives are read through the helper (AD-13),
-  and the Full Disk Access text appears only as the `ScanError.permissionDenied` message.
+  Disk Access. The app has no such prompt. Physical drives are read through the
+  administrator-password dialog or the helper (AD-13), and the Full Disk Access text appears only
+  as the `ScanError.permissionDenied` message.
+- **The helper is optional (AD-13).** The spine makes the SMAppService helper the way to read
+  physical drives. Since spec-tech-authopen it is a secondary "skip the password next time" path
+  for signed builds. Without it, `authopen` asks for an administrator password.

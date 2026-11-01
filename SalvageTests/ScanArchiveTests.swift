@@ -60,7 +60,7 @@ struct ScanArchiveTests {
         let notices: [ScanNotice] = [.partitionTableIgnored(reason: "Bad CRC."), .lostPartitionSearchLimited(searchedBytes: 5, deviceBytes: 9),
                                      .unreadableAreasSkipped(count: 3), .signaturesSkipped(["jpeg.json"])]
         let outcomes: [ScanArchive.Outcome] = [.completed, .cancelled, .failed(.io("Gone.")), .failed(.permissionDenied),
-                                               .failed(.malformed("m")), .failed(.deviceChanged)]
+                                               .failed(.malformed("m")), .failed(.deviceChanged), .failed(.administratorPasswordNeeded)]
         for outcome in outcomes {
             let archive = ScanArchive(device: device, files: [Self.sampleFile(1)], lostPartitions: [], notices: notices,
                                       checkpoint: nil, outcome: outcome, bytesScanned: 0, totalBytes: 0,
@@ -207,6 +207,20 @@ struct ScanArchiveTests {
         #expect(model.source != nil && model.reopened?.status == .connected)
         #expect(opener.opened == 1 && opener.closed == 0)
         #expect(model.deviceWithFinishedResults == device)
+    }
+
+    /// spec-tech-authopen: a cancelled password dialog is told apart from a missing drive, and
+    /// Reconnect stays offered.
+    @Test func cancelledPasswordLeavesReconnectOffered() async throws {
+        let model = ScanViewModel { _, _ in }
+        model.openArchive(try archive(fingerprintOf: Self.image))
+        #expect(await model.reconnect(device, open: { _ in throw ScanError.administratorPasswordNeeded }) == .needsAdministratorPassword)
+        #expect(model.source == nil && model.reopened?.status == .waiting)
+        #expect(await model.reconnect(device, open: { _ in throw ScanError.deviceChanged }) == .unavailable)
+        #expect(SavedScanBanner.message(.waiting, device: "Backup Drive", openFailed: false, password: .declined)
+                == "Salvage needs your administrator password to read Backup Drive. Click Reconnect to try again.")
+        #expect(SavedScanBanner.message(.checking, device: "Backup Drive", openFailed: false, password: .asking)
+                == "Waiting for your administrator password\u{2026}")
     }
 
     @Test func refusesADeviceWithAnotherIdentityOrSizeWithoutOpeningIt() async throws {

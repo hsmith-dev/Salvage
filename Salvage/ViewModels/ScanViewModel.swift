@@ -15,6 +15,9 @@ struct ScanRun: Sendable {
     var credentials: [String: VolumeCredential] = [:]
     /// Hands the still-open source reader to the view model when the scan ends, for preview and recovery.
     let keepSource: @Sendable (SourceSession) async -> Void
+    /// spec-tech-authopen: called just before macOS's administrator-password dialog is requested
+    /// for a physical drive, so the scan screen can say why first.
+    var willAskForAdministratorPassword: @Sendable () async -> Void = {}
 }
 
 @MainActor @Observable
@@ -46,6 +49,13 @@ final class ScanViewModel {
     private(set) var isActive = false
     /// The checkpoint found for `device` while `state == .resumable`.
     private(set) var pendingCheckpoint: ScanCheckpoint?
+    /// spec-tech-authopen: preparation is waiting on macOS's administrator-password dialog.
+    private(set) var isAwaitingAdministratorPassword = false
+    /// FileVault credentials of a run that stopped only because the administrator password was
+    /// cancelled, kept for Try Again. Such a run never read the drive, so they were never used.
+    /// Handed to the retry (which zeroes them as any run does), and zeroed by any other start,
+    /// opening a saved scan, or teardown.
+    private var passwordRetryCredentials: [String: VolumeCredential] = [:]
     /// True once the core has actually resumed from the checkpoint: the run's first progress event
     /// reports bytes already covered. A checkpoint the core rejected starts from zero and leaves this false.
     private(set) var resumedFromCheckpoint = false
@@ -128,6 +138,7 @@ final class ScanViewModel {
     /// Window teardown. Cancels the scan's Task like `cancel()`, but writes the latest checkpoint
     /// first and keeps it, so the interrupted scan can be resumed later.
     func stopForTeardown() {
+        discardPasswordRetryCredentials()
         releaseSource()
         guard let task else { return }
         if stopReason == nil { stopReason = .teardown }
@@ -135,7 +146,25 @@ final class ScanViewModel {
         task.cancel()
     }
 
+    /// Try Again after a cancelled administrator password: the same scan, with the same
+    /// FileVault credentials if it had any.
+    func retryAfterAdministratorPassword() {
+        guard state == .failed(.administratorPasswordNeeded), !isActive, let device else { return }
+        let credentials = passwordRetryCredentials
+        passwordRetryCredentials = [:]
+        start(device, credentials: credentials)
+    }
+
+    /// Whether Try Again would reuse FileVault credentials (exposed for tests).
+    var hasPasswordRetryCredentials: Bool { !passwordRetryCredentials.isEmpty }
+
+    private func discardPasswordRetryCredentials() {
+        for credential in passwordRetryCredentials.values { credential.zero() }
+        passwordRetryCredentials = [:]
+    }
+
     private func reset(for device: BlockDevice) {
+        discardPasswordRetryCredentials()
         self.device = device; files = []; seenFiles = []; bytesScanned = 0; totalBytes = 0
         lostPartitions = []; unlockRequests = []
         notices = []
@@ -143,7 +172,15 @@ final class ScanViewModel {
         pausedAt = nil; pausedTotal = 0; latestCheckpoint = nil; lastCheckpointSave = nil
         pendingCheckpoint = nil; resumedFromCheckpoint = false; canRetryFromCheckpoint = false
         requestedResume = false; stopReason = nil
-        reopened = nil
+        reopened = nil; isAwaitingAdministratorPassword = false
+    }
+
+    /// How long the explanation is on screen before the system dialog is requested.
+    static let passwordExplanationLead: Duration = .milliseconds(600)
+
+    private func explainAdministratorPassword() async {
+        guard isActive, state == .preparing else { return }
+        isAwaitingAdministratorPassword = true
     }
 
     /// Closes the kept source session (e.g. leaving results, or before scanning again).
@@ -177,7 +214,12 @@ final class ScanViewModel {
             let run = ScanRun(device: device, pauseGate: gate, checkpoints: checkpoints,
                               notices: notices,
                               resumeFrom: checkpoint, credentials: credentials,
-                              keepSource: { session in await self.adopt(session) })
+                              keepSource: { session in await self.adopt(session) },
+                              willAskForAdministratorPassword: {
+                                  await self.explainAdministratorPassword()
+                                  // Let the explanation render before the dialog takes focus.
+                                  try? await Task.sleep(for: Self.passwordExplanationLead)
+                              })
             var completed = false
             await withTaskGroup(of: Void.self) { group in
                 group.addTask {
@@ -206,6 +248,7 @@ final class ScanViewModel {
                             baselineBytes = resumedFromCheckpoint ? bytes : 0
                         }
                         if state == .preparing { state = .running }
+                        isAwaitingAdministratorPassword = false
                         bytesScanned = bytes; totalBytes = total
                     case .found(let file):
                         let key = FileKey(volumeOffset: file.sourceMetadata.volumeOffset,
@@ -221,7 +264,7 @@ final class ScanViewModel {
                 await group.waitForAll()
             }
             let ended = now()
-            endedAt = ended; isActive = false
+            endedAt = ended; isActive = false; isAwaitingAdministratorPassword = false
             if let pausedAt { pausedTotal += max(0, ended.timeIntervalSince(pausedAt)); self.pausedAt = nil }
             // A real error already delivered (e.g. device removed) wins over a racing Cancel.
             if case .failed = state { }
@@ -235,6 +278,9 @@ final class ScanViewModel {
             case .completed: keep = false
             case .cancelled: keep = stopReason == .teardown
             default: keep = true
+            }
+            if state == .failed(.administratorPasswordNeeded), stopReason == nil, !credentials.isEmpty {
+                passwordRetryCredentials = credentials
             }
             if keep {
                 if let latestCheckpoint { save(latestCheckpoint, for: device) }
@@ -301,7 +347,8 @@ final class ScanViewModel {
     }
 
     /// Why `reconnect` did or didn't adopt a device.
-    enum ReconnectResult: Equatable { case connected, notThisDevice, changed, unverifiable, unavailable, superseded }
+    /// `needsAdministratorPassword`: macOS's password dialog was cancelled (spec-tech-authopen).
+    enum ReconnectResult: Equatable { case connected, notThisDevice, changed, unverifiable, unavailable, needsAdministratorPassword, superseded }
 
     var canSaveArchive: Bool {
         !isActive && device != nil && ResultsViewModel.showsResults(state: state, isActive: isActive, fileCount: files.count)
@@ -361,7 +408,7 @@ final class ScanViewModel {
         let session: SourceSession
         do { session = try await open(candidate) } catch {
             if self.reopened?.token == token { self.reopened?.status = .waiting }
-            return .unavailable
+            return error as? ScanError == .administratorPasswordNeeded ? .needsAdministratorPassword : .unavailable
         }
         guard self.reopened?.token == token else { await session.close(); return .superseded }
         let fresh = try? await ExtentFingerprint.of(session.reader)

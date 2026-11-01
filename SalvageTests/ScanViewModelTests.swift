@@ -95,6 +95,73 @@ struct ScanViewModelTests {
         while model.isActive { await Task.yield() }
         #expect(model.state == .completed)
     }
+    /// spec-tech-authopen: the explanation shows while macOS's password dialog is up; a cancelled
+    /// dialog fails with its own error, which Try Again (a fresh start) clears.
+    @Test func administratorPasswordExplanationAndTryAgain() async {
+        let attempts = AttemptProbe()
+        let gate = AsyncStream<Void>.makeStream()
+        let observed = AttemptProbe()
+        let model = ScanViewModel { run, events in
+            let attempt = await attempts.next()
+            await run.willAskForAdministratorPassword()
+            if attempt == 1 {
+                _ = await observed.next()
+                for await _ in gate.stream { break }
+                throw ScanError.administratorPasswordNeeded
+            }
+            try await events.send(.progress(bytesScanned: 10, totalBytes: 1024))
+            try await events.send(.completed)
+        }
+        #expect(!model.isAwaitingAdministratorPassword)
+        model.start(device)
+        while await observed.count == 0 { await Task.yield() }
+        #expect(model.state == .preparing)
+        #expect(model.isAwaitingAdministratorPassword)
+        gate.continuation.yield()
+        while model.isActive { await Task.yield() }
+        #expect(model.state == .failed(.administratorPasswordNeeded))
+        #expect(!model.isAwaitingAdministratorPassword)
+        model.start(device)
+        while model.isActive { await Task.yield() }
+        #expect(model.state == .completed)
+        #expect(!model.isAwaitingAdministratorPassword)
+    }
+    /// Try Again after a cancelled password reuses the FileVault credentials of that run; any other
+    /// start zeroes kept ones.
+    @Test func tryAgainKeepsUnlockCredentialsAndOtherStartsZeroThem() async {
+        let attempts = AttemptProbe()
+        let seen = CredentialLog()
+        let model = ScanViewModel { run, events in
+            await seen.add(run.credentials)
+            if await attempts.next() <= 2 { throw ScanError.administratorPasswordNeeded }
+            try await events.send(.completed)
+        }
+        let credential = VolumeCredential(kind: .password, secret: "correct horse")
+        model.start(device, credentials: ["VOL": credential])
+        while model.isActive { await Task.yield() }
+        #expect(model.state == .failed(.administratorPasswordNeeded))
+        #expect(model.hasPasswordRetryCredentials && !credential.isZeroed)
+        model.retryAfterAdministratorPassword()
+        while model.isActive { await Task.yield() }
+        #expect(await seen.credentials.map { $0["VOL"] === credential } == [true, true])
+        #expect(model.hasPasswordRetryCredentials && !credential.isZeroed)
+        // A plain start (another scan) discards them, zeroed.
+        model.start(device)
+        while model.isActive { await Task.yield() }
+        #expect(model.state == .completed)
+        #expect(!model.hasPasswordRetryCredentials && credential.isZeroed)
+        #expect(await seen.credentials.last?.isEmpty == true)
+    }
+    @Test func tryAgainIsOnlyForACancelledPassword() async {
+        var runs = 0
+        let model = ScanViewModel { _, _ in throw ScanError.deviceChanged }
+        model.start(device)
+        while model.isActive { await Task.yield() }
+        model.retryAfterAdministratorPassword()
+        runs += model.isActive ? 1 : 0
+        #expect(runs == 0)
+        #expect(model.state == .failed(.deviceChanged))
+    }
     @Test func noticesAreCollectedInOrderAndResetPerScan() async {
         let attempts = AttemptProbe()
         let model = ScanViewModel { run, events in
@@ -594,6 +661,11 @@ private actor CleanupProbe {
     var didClean = false
     func cleaned() { didClean = true }
 }
+private actor CredentialLog {
+    var credentials: [[String: VolumeCredential]] = []
+    func add(_ value: [String: VolumeCredential]) { credentials.append(value) }
+}
+
 private actor AttemptProbe {
     var count = 0
     func next() -> Int { count += 1; return count }

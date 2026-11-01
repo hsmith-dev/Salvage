@@ -12,6 +12,8 @@ struct ScanProgressView: View {
             if let device = model.device { Text(device.displayName).foregroundStyle(.inkSecondary) }
             if model.state == .resumable {
                 resumeOffer
+            } else if model.state == .preparing, model.isAwaitingAdministratorPassword {
+                AdministratorPasswordExplanation()
             } else if model.state == .preparing {
                 HStack { ProgressView().controlSize(.small); Text("Preparing the device for read-only scanning…") }
             } else if model.totalBytes > 0 {
@@ -35,9 +37,16 @@ struct ScanProgressView: View {
                     Text("\(model.files.count) files indexed")
                 }.font(.subheadline).foregroundStyle(.inkSecondary)
             }
-            if case .failed(let error) = model.state {
+            if case .failed(let error) = model.state, error == .administratorPasswordNeeded {
+                // spec-tech-authopen: the password dialog was cancelled or left unanswered.
+                AdministratorPasswordExplanation(onTryAgain: { model.retryAfterAdministratorPassword() })
+            } else if case .failed(let error) = model.state {
                 let needsApproval = PrivilegedHelperApproval.isApprovalRequired(error)
-                if needsApproval { HelperApprovalView() } else { Text(error.description).textSelection(.enabled) }
+                Text(needsApproval ? PrivilegedHelperApproval.guidance : error.description).textSelection(.enabled)
+                if needsApproval {
+                    Button("Open System Settings") { PrivilegedHelperApproval.openSystemSettings() }
+                        .accessibilityHint("Opens Login Items in System Settings, where you allow Salvage to read drives")
+                }
                 if error == .permissionDenied || needsApproval || model.canRetryFromCheckpoint, !model.isActive, let device = model.device {
                     // With a kept checkpoint, retrying offers Resume again rather than starting from zero.
                     Button("Retry scan") { model.start(device) }
