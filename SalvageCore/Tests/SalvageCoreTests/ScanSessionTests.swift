@@ -518,10 +518,15 @@ struct PendingFormatDetectionTests {
         var image = Data(repeating: 0, count: 16 * 512); stamp(&image); return image
     }
     @Test func apfsContainerAndBareVolumeAreRecognised() async {
+        // Both signatures route to `APFSContainer`, which rejects a bare signature with nothing
+        // behind it as damage rather than reporting an empty volume (positive cases: APFSVolumeTests).
         let container = disk { $0.text(32, "NXSB") }
         let volume = disk { $0.text(32, "APSB") }
-        #expect(await scan(container) == [.error(.unsupportedFilesystem)])
-        #expect(await scan(volume) == [.error(.unsupportedFilesystem)])
+        for image in [container, volume] {
+            let events = await scan(image)
+            #expect(events.contains { if case .error(.malformed) = $0 { true } else { false } })
+            #expect(!events.contains(.completed))
+        }
     }
     @Test func hfsPlusAndHfsxAreRecognised() async {
         for signature: [UInt8] in [[0x48, 0x2B], [0x48, 0x58]] {
@@ -531,8 +536,9 @@ struct PendingFormatDetectionTests {
     }
     @Test func pendingFormatPartitionsAreSkippedNotFailed() async {
         let fat = exfatImage(), sectors = fat.count / 512
-        var apfs = Data(repeating: 0, count: 8 * 512); apfs.text(32, "NXSB")
-        var image = Data(repeating: 0, count: 512) + fat + apfs
+        // HFS+ is the remaining pending format (APFS now has a parser).
+        var hfs = Data(repeating: 0, count: 8 * 512); hfs[1024] = 0x48; hfs[1025] = 0x2B
+        var image = Data(repeating: 0, count: 512) + fat + hfs
         image.put(446+4, 7, 1); image.put(446+8, 1, 4); image.put(446+12, UInt64(sectors), 4)
         image.put(446+16+4, 0xAF, 1); image.put(446+16+8, UInt64(1 + sectors), 4); image.put(446+16+12, 8, 4)
         image.put(510, 0xaa55, 2)
