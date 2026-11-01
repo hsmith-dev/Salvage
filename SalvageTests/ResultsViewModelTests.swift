@@ -380,6 +380,44 @@ struct ResultsViewModelTests {
         #expect(ResultsViewModel(files: []).lostPartitions.isEmpty)
     }
 
+    @Test func lostPartitionWhoseFilesAreAllUnrecoverableOrHiddenStillOpens() {
+        let mib: Int64 = 1 << 20
+        let unmappedOnly = LostPartitionCandidate(offset: mib, sizeBytes: 65536, formatName: "exFAT (damaged)")
+        let hiddenOnly = LostPartitionCandidate(offset: 2 * mib, sizeBytes: 65536, formatName: "exFAT")
+        let mixed = LostPartitionCandidate(offset: 3 * mib, sizeBytes: 65536, formatName: "NTFS")
+        let empty = LostPartitionCandidate(offset: 4 * mib, sizeBytes: 65536, formatName: "APFS (damaged)")
+        let model = ResultsViewModel(files: [
+            lostFile("a.jpg", volume: mib, content: .unmapped), lostFile("b.jpg", volume: mib, content: .unmapped),
+            lostFile("._c.jpg", volume: 2 * mib),
+            lostFile("d.jpg", volume: 3 * mib), lostFile("e.jpg", volume: 3 * mib, content: .unmapped),
+        ], lostPartitions: [unmappedOnly, hiddenOnly, mixed, empty])
+        // No recoverable file, but the row opens so the files can be seen in the scoped browser.
+        #expect(model.fileCount(in: unmappedOnly) == 0)
+        #expect(model.lostPartitionSummary(unmappedOnly).text == "2 files can't be recovered")
+        #expect(model.lostPartitionSummary(unmappedOnly).opens)
+        #expect(model.lostPartitionSummary(hiddenOnly).text == "No recoverable files, 1 system file hidden")
+        #expect(model.lostPartitionSummary(hiddenOnly).opens)
+        #expect(model.lostPartitionSummary(mixed).text == "1 file, 1 can't be recovered")
+        #expect(model.lostPartitionSummary(mixed).opens)
+        #expect(model.lostPartitionSummary(empty).text == "No recoverable files")
+        #expect(!model.lostPartitionSummary(empty).opens)
+        model.showSystemFiles = true
+        #expect(model.lostPartitionSummary(hiddenOnly).text == "1 file")
+        // The damaged suffix from the scan carries into the card's title.
+        #expect(ResultsViewModel.lostPartitionTitle(unmappedOnly).hasPrefix("Lost partition — exFAT (damaged), "))
+    }
+
+    @Test func lostPartitionCardRendersAtMostItsRowLimit() {
+        let limit = ResultsViewModel.lostPartitionRowLimit
+        let many = (0..<(limit + 12)).map { LostPartitionCandidate(offset: Int64($0 + 1) << 20, sizeBytes: 65536, formatName: "exFAT") }
+        let model = ResultsViewModel(files: [], lostPartitions: many.reversed())
+        #expect(model.displayedLostPartitions.count == limit)
+        #expect(model.displayedLostPartitions.first?.offset == 1 << 20)
+        #expect(model.moreLostPartitionsText == "and 12 more lost partitions; their files are under Browse all files.")
+        let few = ResultsViewModel(files: [], lostPartitions: Array(many.prefix(3)))
+        #expect(few.displayedLostPartitions.count == 3 && few.moreLostPartitionsText == nil)
+    }
+
     @Test func scanViewModelCollectsLostPartitionsInEventOrder() async {
         let a = LostPartitionCandidate(offset: 1 << 20, sizeBytes: 65536, formatName: "exFAT")
         let b = LostPartitionCandidate(offset: 8 << 20, sizeBytes: 1 << 20, formatName: "EXT2/3/4")

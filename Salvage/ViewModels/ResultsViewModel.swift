@@ -85,6 +85,8 @@ final class ResultsViewModel {
         var unrecoverableCount: Int
         /// Recoverable files per lost partition (FR-9), keyed by the partition's device offset.
         var lostPartitionFileCounts: [Int64: Int] = [:]
+        /// Unrecoverable (unmapped) files per lost partition, under the same system-files setting.
+        var lostPartitionUnrecoverableCounts: [Int64: Int] = [:]
         /// Recoverable files that were reconstructed by carving; included in the totals above.
         var reconstructedCount = 0
     }
@@ -186,9 +188,14 @@ final class ResultsViewModel {
         var byCategory = Dictionary(uniqueKeysWithValues: FileCategory.allCases.map { ($0, Bucket(category: $0, count: 0, totalBytes: 0)) })
         var recoverable = 0, unrecoverable = 0, reconstructed = 0
         var bytes: Int64 = 0
-        var lostCounts = Dictionary(uniqueKeysWithValues: lostPartitions.map { ($0.offset, 0) })
+        var lostCounts = Dictionary(lostPartitions.map { ($0.offset, 0) }, uniquingKeysWith: { first, _ in first })
+        var lostUnrecoverable = lostCounts
         for row in rows where includingSystemFiles || !row.isSystemFile {
-            guard row.isRecoverable else { unrecoverable += 1; continue }
+            guard row.isRecoverable else {
+                unrecoverable += 1
+                if !lostUnrecoverable.isEmpty { lostUnrecoverable[row.file.sourceMetadata.volumeOffset]? += 1 }
+                continue
+            }
             let size = max(0, row.sizeBytes)
             recoverable += 1
             bytes += size
@@ -202,7 +209,8 @@ final class ResultsViewModel {
         }
         let result = Aggregates(buckets: FileCategory.allCases.compactMap { byCategory[$0] }, recoverableCount: recoverable,
                                 recoverableBytes: bytes, unrecoverableCount: unrecoverable,
-                                lostPartitionFileCounts: lostCounts, reconstructedCount: reconstructed)
+                                lostPartitionFileCounts: lostCounts, lostPartitionUnrecoverableCounts: lostUnrecoverable,
+                                reconstructedCount: reconstructed)
         aggregateCache[includingSystemFiles] = result
         return result
     }
@@ -225,6 +233,46 @@ final class ResultsViewModel {
 
     /// Recoverable files found inside one lost partition, under the current system-files setting.
     func fileCount(in partition: LostPartitionCandidate) -> Int { current.lostPartitionFileCounts[partition.offset] ?? 0 }
+
+    /// Unrecoverable files inside one lost partition, under the current system-files setting.
+    func unrecoverableFileCount(in partition: LostPartitionCandidate) -> Int {
+        current.lostPartitionUnrecoverableCounts[partition.offset] ?? 0
+    }
+
+    /// System files inside one lost partition that the current setting hides.
+    func hiddenSystemFileCount(in partition: LostPartitionCandidate) -> Int {
+        guard !showSystemFiles else { return 0 }
+        let all = aggregates(includingSystemFiles: true)
+        let total = (all.lostPartitionFileCounts[partition.offset] ?? 0) + (all.lostPartitionUnrecoverableCounts[partition.offset] ?? 0)
+        return total - fileCount(in: partition) - unrecoverableFileCount(in: partition)
+    }
+
+    /// The card row's file line, and whether the row opens the scoped browser. A partition whose
+    /// files are all unrecoverable or hidden still opens, so they can be inspected there.
+    func lostPartitionSummary(_ partition: LostPartitionCandidate) -> (text: String, opens: Bool) {
+        let recoverable = fileCount(in: partition), unrecoverable = unrecoverableFileCount(in: partition)
+        let hidden = hiddenSystemFileCount(in: partition)
+        var parts: [String] = []
+        if recoverable > 0 { parts.append(Self.filesText(recoverable)) }
+        if unrecoverable > 0 {
+            parts.append(recoverable > 0 ? "\(unrecoverable.formatted()) can't be recovered"
+                                         : "\(Self.filesText(unrecoverable)) can't be recovered")
+        }
+        if hidden > 0 { parts.append("\(hidden.formatted()) system \(hidden == 1 ? "file" : "files") hidden") }
+        if recoverable == 0 && unrecoverable == 0 { parts.insert("No recoverable files", at: 0) }
+        return (parts.joined(separator: ", "), recoverable + unrecoverable + hidden > 0)
+    }
+
+    /// The card lists at most this many partitions; the rest are summarized in one line.
+    nonisolated static let lostPartitionRowLimit = 50
+    /// The partitions the card renders as rows, in device order.
+    var displayedLostPartitions: ArraySlice<LostPartitionCandidate> { lostPartitions.prefix(Self.lostPartitionRowLimit) }
+    /// "and 12 more lost partitions", or nil when every partition has a row.
+    var moreLostPartitionsText: String? {
+        let more = lostPartitions.count - displayedLostPartitions.count
+        guard more > 0 else { return nil }
+        return "and \(more.formatted()) more lost \(more == 1 ? "partition" : "partitions"); their files are under Browse all files."
+    }
 
     /// The lost partition the browser is scoped to, if any.
     var scopedLostPartition: LostPartitionCandidate? {

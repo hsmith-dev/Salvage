@@ -34,3 +34,7 @@
 - source_spec: `spec-3-1-3-2-carve-and-organize-reconstructed-files.md`
   summary: Surface carving diagnostics in the app: skipped signature files (`SignatureLibrary.skipped`), the carved-file cap (`SignatureCarver.hitFileLimit`), and complete the dashboard wording for reconstructed files.
   evidence: Skipped signatures are only NSLogged; hitting maxCarvedFiles silently stops emission. `ResultsDashboardView`'s closing sentence ("indexed from intact metadata") and the tile accessibility label don't mention reconstructed files; the spec allowed only the "(n reconstructed)" caption line in that file.
+
+- source_spec: `spec-3-3-3-4-discover-and-recover-lost-partitions.md`
+  summary: Surface the lost-partition search's limits in the app: "Search for lost partitions was limited to the first N GB" (`VolumeDiscovery.Result.probesTruncated` / `searchedBytes`), skipped unreadable probes, and "the partition table is damaged and was ignored" (`Result.warnings`).
+  evidence: Review patch P3 computes these in Core and unit-tests them, but `ScanSession` emits nothing for them. `ScanEvent` is closed (AD-11), and the alternatives (a fake `.lostPartitionFound` named "Search limited", an `.error` for a non-error) would mislead the app. Needs a non-terminal diagnostic event or a scan-summary value on `.completed`, an AD-11 change for the architect, then a dashboard line fed through `ScanViewModel` → `ResultsViewModel`.

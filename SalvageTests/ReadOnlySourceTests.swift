@@ -37,7 +37,7 @@ private actor NullDeviceOperations: RawDeviceOperations {
     func closeDescriptor(_ descriptor: Int32) async { _ = close(descriptor) }
 }
 
-@Suite("Source devices are read-only (Story 3.4)")
+@Suite("Source devices are read-only (Story 3.4)", .serialized)
 struct ReadOnlySourceTests {
     @Test func diskIOBlockReaderExposesNoWriteMethod() async throws {
         let device = BlockDevice(bsdName: "disk42", displayName: "Fixture", sizeBytes: 65536,
@@ -51,13 +51,18 @@ struct ReadOnlySourceTests {
         await reader.close()
     }
 
-    @Test func blockReaderPortIsReadOnly() {
-        // The Core port that every adapter satisfies has exactly one I/O requirement: `read`.
-        struct ReadOnly: BlockReader {
+    @Test func blockReaderPortIsReadOnly() async throws {
+        // The Core port that every adapter satisfies has exactly one I/O requirement: `read`. A
+        // conformer declaring nothing else compiles, and the probe's default `write` is its witness
+        // too, so the port itself contributes no write method that an adapter could be reached through.
+        struct ReadOnly: BlockReader, SourceWriteProbe {
             let sizeBytes: Int64 = 512
             func read(at offset: Int64, count: Int) async throws -> Data { Data(count: count) }
         }
-        let conformers: [any BlockReader.Type] = [RawBlockReader.self, ReadOnly.self]
-        #expect(conformers.count == 2)
+        let reader: any BlockReader = ReadOnly()
+        #expect(try await reader.read(at: 0, count: 4) == Data(count: 4))
+        let before = await ProbeLog.shared.defaultWitnessCalls
+        try await (reader as? any SourceWriteProbe)?.write(Data([0]), at: 0)
+        #expect(await ProbeLog.shared.defaultWitnessCalls == before + 1)
     }
 }
