@@ -54,6 +54,79 @@ public struct DeviceTreeNode: Identifiable, Equatable, Sendable {
     }
 }
 
+/// Why a device is listed under the sidebar's collapsed "Hidden" group instead of its section.
+public enum HiddenDeviceReason: Equatable, Sendable {
+    /// The disk the Mac is running from (Architecture AD-4): never a scan target.
+    case startupDisk
+    /// A disk image macOS attached for itself (simulator runtimes, system assets), which Disk
+    /// Utility doesn't list either. Still a valid scan target.
+    case systemDiskImage
+
+    /// The one-line reason shown under the row and spoken by VoiceOver.
+    public var text: String {
+        switch self {
+        case .startupDisk: return "Startup disk — Salvage can't scan the disk your Mac is running from"
+        case .systemDiskImage: return "System disk image, used by macOS"
+        }
+    }
+
+    /// Whether a row with this reason can be selected (and so scanned).
+    public var isScannable: Bool { self == .systemDiskImage }
+}
+
+/// One row of the "Hidden" group.
+public struct HiddenDevice: Identifiable, Equatable, Sendable {
+    public let device: BlockDevice
+    public let reason: HiddenDeviceReason
+    public var id: String { device.id }
+
+    /// The row's title. A system disk image's file name ("094-56039-099.dmg") says little, so it
+    /// is named after its volumes ("iOS 26.5 Simulator") when it has any.
+    public var title: String {
+        guard reason == .systemDiskImage else { return device.displayName }
+        let names = Self.volumeNames(device.partitions)
+        return names.isEmpty ? device.displayName : names.joined(separator: ", ")
+    }
+
+    private static func volumeNames(_ partitions: [DevicePartition]) -> [String] {
+        partitions.flatMap { $0.children.isEmpty ? [$0.displayName] : volumeNames($0.children) }
+            .filter { !["Untitled", "EFI", "Unnamed partition", DeviceTreeLabel.apfsContainer].contains($0) }
+    }
+}
+
+/// The Device Picker's sections, as in Disk Utility: physical drives split into Internal and
+/// External, attached disk images on their own, and everything that can't (or needn't) be scanned
+/// collected in a "Hidden" group at the bottom.
+public struct DeviceSidebar: Equatable, Sendable {
+    public var internalDrives: [DeviceTreeNode] = []
+    public var externalDrives: [DeviceTreeNode] = []
+    /// Disk images attached by the user (in Finder, Disk Utility or `hdiutil`).
+    public var diskImages: [DeviceTreeNode] = []
+    public var hidden: [HiddenDevice] = []
+
+    /// Groups `devices`, leaving out the whole disks in `excluding` (images Salvage attached
+    /// itself, already listed by their file). The startup disk is hidden whatever its kind.
+    public static func sections(for devices: [BlockDevice], excluding: Set<String> = []) -> DeviceSidebar {
+        var sidebar = DeviceSidebar()
+        for device in devices where !excluding.contains(device.id) {
+            if device.isBootVolume {
+                sidebar.hidden.append(HiddenDevice(device: device, reason: .startupDisk))
+            } else if device.isSystemImage {
+                sidebar.hidden.append(HiddenDevice(device: device, reason: .systemDiskImage))
+            } else {
+                let node = DeviceTreeNode.tree(for: [device])[0]
+                if device.isDiskImage { sidebar.diskImages.append(node) }
+                else if device.isInternal { sidebar.internalDrives.append(node) }
+                else { sidebar.externalDrives.append(node) }
+            }
+        }
+        return sidebar
+    }
+
+    /// No drive or image in the main sections: everything attached is hidden.
+    public var hasNoVisibleDrives: Bool { internalDrives.isEmpty && externalDrives.isEmpty && diskImages.isEmpty }
+}
+
 /// Drives the Device Picker (`DeviceListView`): consumes `DeviceWatcher.watch()`'s live device
 /// stream and exposes the current `[BlockDevice]`, any watcher-level error state, and the user's
 /// current selection. This story's scope ends at capturing which device is selected -- starting
@@ -61,9 +134,8 @@ public struct DeviceTreeNode: Identifiable, Equatable, Sendable {
 @MainActor
 @Observable
 public final class DeviceListViewModel {
-    /// The current device set, in the order `DeviceWatcher` reports it. Internal and external
-    /// devices are intermixed here deliberately -- the view renders one unified list (FR-1),
-    /// never separate sections.
+    /// The current device set, in the order `DeviceWatcher` reports it. The view groups it into
+    /// sections with `DeviceSidebar.sections(for:)`.
     public private(set) var devices: [BlockDevice] = []
 
     /// Startup failure, including inability to safely identify the boot disk. The view renders
@@ -83,6 +155,11 @@ public final class DeviceListViewModel {
     /// The device set as a tree (Disk Utility style): each drive with its partitions, APFS
     /// containers and volumes beneath it. Selection still targets drives only.
     public var tree: [DeviceTreeNode] { DeviceTreeNode.tree(for: devices) }
+
+    /// The device set in the sidebar's sections, leaving out `excluding` (images Salvage attached).
+    public func sidebar(excluding: Set<String> = []) -> DeviceSidebar {
+        DeviceSidebar.sections(for: devices, excluding: excluding)
+    }
 
     /// The watcher delivered a snapshot with no devices at all. Since the startup disk always
     /// enumerates, this is an anomaly the view reports as such, distinct from loading or error.

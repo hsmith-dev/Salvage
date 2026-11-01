@@ -37,10 +37,10 @@ final class DiskImageUITests: XCTestCase {
         // File > Open Disk Image… is in the menu.
         XCTAssertTrue(app.menuBars.menuItems["Open Disk Image…"].waitForExistence(timeout: 10), "File > Open Disk Image… exists")
 
-        // The image is listed under "Disk images" with its name and size.
+        // The image is listed under "Disk Images" with its name and size.
         let row = element("image-row-Card Backup.img")
         XCTAssertTrue(row.waitForExistence(timeout: 10), "The opened image is listed")
-        XCTAssertTrue(hasText(containing: "Disk images"), "In its own section")
+        XCTAssertTrue(hasText(containing: "Disk Images"), "In its own section")
         XCTAssertTrue(row.label.hasPrefix("Card Backup.img"), row.label)
         XCTAssertTrue((row.value as? String ?? "").contains("Disk image, 8.4 MB"), "\(row.value ?? "")")
         let before = try Data(contentsOf: image)

@@ -25,6 +25,31 @@ private func slice(_ name: String, size: Int64, content: String, mediaName: Stri
     return RawDiskDescription(bsdName: name, description: description)
 }
 
+private let simulatorPath = "/System/Library/AssetsV2/com_apple_MobileAsset_iOSSimulatorRuntime/26c9.asset/AssetData/Restore/094-56039-099.dmg"
+
+/// A disk image's whole disk, as DiskArbitration describes one: model "Disk Image" on a
+/// "Virtual Interface", no internal/external key; plus the driver's owner uid and file path.
+private func imageWhole(_ name: String, size: Int64, identity: UInt64, owner: UInt32?, path: String?) -> RawDiskDescription {
+    RawDiskDescription(bsdName: name,
+                       description: ["DAMediaWhole": true, "DAMediaSize": NSNumber(value: size), "DADeviceModel": "Disk Image",
+                                     "DADeviceProtocol": "Virtual Interface", "DAMediaContent": "GUID_partition_scheme",
+                                     "DAMediaName": "Apple disk image Media"],
+                       mediaIdentity: identity, ancestorMedia: [], imageOwnerUID: owner, imagePath: path)
+}
+
+/// An Xcode simulator runtime image: GPT, one APFS store, its synthesized container and volume.
+private func simulatorImage(owner: UInt32) -> [RawDiskDescription] { [
+    imageWhole("disk11", size: 18_083_776_000, identity: 11, owner: owner, path: simulatorPath),
+    slice("disk11s1", size: 18_083_741_696, content: "7C3457EF-0000-11AA-AA11-00306543ECAC"),
+    RawDiskDescription(bsdName: "disk12",
+                       description: ["DAMediaWhole": true, "DAMediaSize": NSNumber(value: 18_083_741_696),
+                                     "DADeviceModel": "Disk Image", "DADeviceProtocol": "Virtual Interface",
+                                     "DAMediaContent": "EF57347C-0000-11AA-AA11-00306543ECAC"],
+                       mediaIdentity: 12, ancestorMedia: ["disk11s1", "disk11"]),
+    slice("disk12s1", size: 18_083_741_696, content: "41504653-0000-11AA-AA11-00306543ECAC",
+          mediaName: "iOS 26.5 Simulator", volumeName: "iOS 26.5 Simulator", kind: "apfs"),
+] }
+
 private let efiGUID = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
 private let basicDataGUID = "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7"
 private let apfsGUID = "7C3457EF-0000-11AA-AA11-00306543ECAC"
@@ -97,7 +122,7 @@ struct DeviceTreeTests {
     @Test("A disk image stays a top-level device, with its partition and APFS volume nested")
     func diskImage() throws {
         let image = [
-            whole("disk4", model: "Disk Image", size: 18_559_829_504, identity: 4),
+            imageWhole("disk4", size: 18_559_829_504, identity: 4, owner: 501, path: nil),
             slice("disk4s1", size: 18_559_795_200, content: apfsGUID, mediaName: "Untitled 1"),
             whole("disk5", model: "Disk Image", size: 18_559_795_200, content: "EF57347C-0000-11AA-AA11-00306543ECAC",
                   identity: 5, ancestors: ["disk4s1", "disk4"]),
@@ -108,6 +133,7 @@ struct DeviceTreeTests {
         let disk = try #require(devices.last)
         #expect(!disk.isBootVolume)
         #expect(disk.displayName == "Disk Image")
+        #expect(disk.isDiskImage && !disk.isSystemImage && !disk.isInternal)
         #expect(disk.partitions == [
             DevicePartition(bsdName: "disk4s1", displayName: "APFS container", sizeBytes: 18_559_795_200, formatName: "APFS",
                             children: [DevicePartition(bsdName: "disk5s1", displayName: "iOS 27.0 Simulator",
@@ -194,6 +220,55 @@ struct DeviceTreeTests {
         #expect(plainFormatName(volumeKind: nil, mediaContent: apfsGUID) == "APFS")
         #expect(plainFormatName(volumeKind: nil, mediaContent: basicDataGUID) == "Unknown")
         #expect(plainFormatName(volumeKind: nil, mediaContent: nil) == "Unknown")
+    }
+
+    @Test("An unnamed partition of a known format is \"Untitled\", as in Disk Utility")
+    func unnamedKnownPartition() {
+        let disks = [whole("disk17", model: "MK3252GSX", size: 320_072_933_376, content: "FDisk_partition_scheme"),
+                     slice("disk17s1", size: 306_018_516_992, content: "Windows_NTFS"),
+                     slice("disk17s2", size: 14_049_869_824, content: "Windows_NTFS", volumeName: "RECOVERY", kind: "ntfs")]
+        let drive = buildDeviceTree(disks, bootDisks: []).first
+        #expect(drive?.partitions.map(\.displayName) == ["Untitled", "RECOVERY"])
+        #expect(drive?.partitions.map(\.formatName) == ["NTFS", "NTFS"])
+        #expect(drive?.isDiskImage == false)
+    }
+
+    // MARK: Disk images: which are macOS's own ("Hidden")
+
+    @Test("A disk image a system daemon attached (owner uid 0) is a system image, named after its file")
+    func systemOwnedImage() throws {
+        let image = simulatorImage(owner: 0)
+        let disk = try #require(buildDeviceTree(image, bootDisks: []).only)
+        #expect(disk.isDiskImage && disk.isSystemImage)
+        #expect(disk.displayName == "094-56039-099.dmg")
+        #expect(disk.diskImagePath == simulatorPath)
+    }
+
+    @Test("A user's image mounted nobrowse is a system image too; mounted normally it is not")
+    func noBrowseImage() throws {
+        let image = simulatorImage(owner: 501)
+        #expect(buildDeviceTree(image, bootDisks: []).only?.isSystemImage == false)
+        #expect(buildDeviceTree(image, bootDisks: [], noBrowseVolumes: ["disk12s1"]).only?.isSystemImage == true)
+        #expect(buildDeviceTree(image, bootDisks: [], noBrowseVolumes: ["disk3s5"]).only?.isSystemImage == false)
+    }
+
+    @Test("A disk image is recognized by its virtual interface even with another model name")
+    func imageByProtocol() throws {
+        var raw = imageWhole("disk13", size: 21_491_200, identity: 13, owner: 501, path: "/Users/me/Desktop/Salvage-1.0.0.dmg")
+        var description = try #require(raw.description)
+        description["DADeviceModel"] = "Something"
+        raw = RawDiskDescription(bsdName: raw.bsdName, description: description, mediaIdentity: 13, ancestorMedia: [],
+                                 imageOwnerUID: 501, imagePath: raw.imagePath)
+        let disk = try #require(buildDeviceTree([raw], bootDisks: []).only)
+        #expect(disk.isDiskImage && !disk.isSystemImage)
+        #expect(disk.displayName == "Salvage-1.0.0.dmg")
+    }
+
+    @Test("A physical drive is never a system image, even with a nobrowse volume or unknown owner")
+    func physicalDriveNeverSystemImage() throws {
+        let devices = buildDeviceTree(bootDrive, bootDisks: ["disk0", "disk3"], noBrowseVolumes: ["disk3s5"])
+        let drive = try #require(devices.only)
+        #expect(!drive.isDiskImage && !drive.isSystemImage && drive.isInternal)
     }
 
     @Test("An unnamed partition of unknown type gets plain words, not an empty name")

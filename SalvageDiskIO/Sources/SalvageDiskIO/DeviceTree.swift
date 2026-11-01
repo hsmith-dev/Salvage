@@ -30,6 +30,47 @@ struct RawDiskDescription {
     /// Where a partition starts on its whole disk, in bytes: the IOMedia `Base` property (the
     /// DiskArbitration description carries no offset). `nil` when it couldn't be read.
     var baseOffset: Int64?
+    /// For a disk image's whole disk: the `owner-uid` its disk-image driver reports (the user that
+    /// attached it; 0 when a system daemon did). `nil` when not read or not a disk image.
+    var imageOwnerUID: UInt32?
+    /// For a disk image's whole disk: the image file's path, from the same IORegistry entry.
+    var imagePath: String?
+}
+
+/// The IORegistry properties a disk image's driver publishes above its whole-disk IOMedia, read
+/// by searching the media's parents (both the DiskImages2 `AppleDiskImageDevice` and the
+/// in-kernel `IOHDIXHDDriveInKernel` publish `owner-uid`). Metadata only.
+func ioDiskImageProperties(_ media: io_registry_entry_t) -> (ownerUID: UInt32?, path: String?) {
+    guard media != 0 else { return (nil, nil) }
+    func search(_ key: String) -> Any? {
+        IORegistryEntrySearchCFProperty(media, kIOServicePlane, key as CFString, kCFAllocatorDefault,
+                                        IOOptionBits(kIORegistryIterateRecursively | kIORegistryIterateParents))
+    }
+    let owner = (search("owner-uid") as? NSNumber).flatMap { UInt32(exactly: $0.int64Value) }
+    var path: String?
+    if let url = search("DiskImageURL") as? String, let parsed = URL(string: url), parsed.isFileURL {
+        path = parsed.path
+    } else if let kdi = search("KDIURLPath") as? String, !kdi.isEmpty {
+        path = kdi
+    } else if let data = search("image-path") as? Data {
+        path = String(decoding: data.prefix { $0 != 0 }, as: UTF8.self)
+    }
+    return (owner, path?.isEmpty == false ? path : nil)
+}
+
+/// BSD names of the volumes currently mounted with `MNT_DONTBROWSE` ("nobrowse": hidden from the
+/// Finder and Disk Utility), from the mount table. Metadata only.
+func noBrowseMountedBSDNames() -> Set<String> {
+    var mounts: UnsafeMutablePointer<statfs>?
+    let count = getmntinfo(&mounts, MNT_NOWAIT)
+    guard count > 0, let mounts else { return [] }
+    var names: Set<String> = []
+    for index in 0..<Int(count) where mounts[index].f_flags & UInt32(MNT_DONTBROWSE) != 0 {
+        var from = mounts[index].f_mntfromname
+        let source = withUnsafeBytes(of: &from) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+        if source.hasPrefix("/dev/"), isDiskNodeBSDName(String(source.dropFirst(5))) { names.insert(String(source.dropFirst(5))) }
+    }
+    return names
 }
 
 /// The IOMedia `Base` property of `media` (a partition's byte offset on its whole disk), or nil
@@ -53,6 +94,18 @@ enum DiskKey {
     static let volumeKind = kDADiskDescriptionVolumeKindKey as String       // "DAVolumeKind"
     static let deviceModel = kDADiskDescriptionDeviceModelKey as String     // "DADeviceModel"
     static let deviceInternal = kDADiskDescriptionDeviceInternalKey as String // "DADeviceInternal"
+    static let deviceProtocol = kDADiskDescriptionDeviceProtocolKey as String // "DADeviceProtocol"
+}
+
+/// What DiskArbitration reports for an attached disk image's device.
+enum DiskImageDevice {
+    static let virtualInterface = "Virtual Interface"
+    static let model = "Disk Image"
+
+    static func isDiskImage(_ description: [String: Any]) -> Bool {
+        description[DiskKey.deviceProtocol] as? String == virtualInterface
+            || (description[DiskKey.deviceModel] as? String)?.trimmingCharacters(in: .whitespaces) == model
+    }
 }
 
 /// Partition-type identifiers (GPT GUIDs and the names DiskArbitration reports for MBR and Apple
@@ -151,7 +204,12 @@ private func sliceNumber(_ name: String) -> Int {
 ///   flagged `isBootVolume`, with its tree.
 /// - Fail soft: a drive any of whose partitions (or nested volumes) has a missing or malformed
 ///   description is shown with no children, never with a partial or guessed tree.
-func buildDeviceTree(_ disks: [RawDiskDescription], bootDisks: Set<String>) -> [BlockDevice] {
+/// - A disk image is flagged `isDiskImage` and named after its file. It is `isSystemImage` --
+///   listed under "Hidden", as Disk Utility doesn't list it -- when a system daemon attached it
+///   (`imageOwnerUID` 0, e.g. simulator runtimes and MobileAsset images) or any of its volumes is
+///   mounted nobrowse (`noBrowseVolumes`).
+func buildDeviceTree(_ disks: [RawDiskDescription], bootDisks: Set<String>,
+                     noBrowseVolumes: Set<String> = []) -> [BlockDevice] {
     var byWhole: [String: [RawDiskDescription]] = [:]
     var wholes: [RawDiskDescription] = []
     for disk in disks {
@@ -224,7 +282,9 @@ func buildDeviceTree(_ disks: [RawDiskDescription], bootDisks: Set<String>) -> [
                                               offsetBytes: slice.baseOffset))
             } else {
                 let format = slice.format
-                let name = slice.volumeName ?? (format == "Unknown" ? "Unnamed partition" : format)
+                // Unnamed: "Untitled", as Disk Utility says; EFI and unknown types keep plain words.
+                let name = slice.volumeName
+                    ?? (format == "Unknown" ? "Unnamed partition" : format == "EFI" ? "EFI" : "Untitled")
                 result.append(DevicePartition(bsdName: slice.bsdName, displayName: name,
                                               sizeBytes: slice.sizeBytes, formatName: format, children: children,
                                               offsetBytes: slice.baseOffset))
@@ -237,17 +297,36 @@ func buildDeviceTree(_ disks: [RawDiskDescription], bootDisks: Set<String>) -> [
     for drive in topLevel {
         guard let description = drive.description, let mediaIdentity = drive.mediaIdentity else { continue }
         let model = ((description[DiskKey.deviceModel] as? String) ?? "").trimmingCharacters(in: .whitespaces)
+        let isImage = DiskImageDevice.isDiskImage(description)
+        let tree = partitions(of: drive)
+        let imageFile = isImage ? drive.imagePath.map { URL(fileURLWithPath: $0).lastPathComponent } : nil
+        var isSystemImage = false
+        if isImage {
+            let names = allBSDNames(tree)
+            isSystemImage = drive.imageOwnerUID == 0 || !names.isDisjoint(with: noBrowseVolumes)
+                || noBrowseVolumes.contains(drive.bsdName)
+        }
         devices.append(BlockDevice(
             bsdName: drive.bsdName,
-            displayName: model.isEmpty ? drive.bsdName : model,
+            displayName: imageFile ?? (model.isEmpty ? drive.bsdName : model),
             sizeBytes: (description[DiskKey.size] as? NSNumber)?.int64Value ?? 0,
-            isInternal: (description[DiskKey.deviceInternal] as? Bool) ?? false,
+            isInternal: !isImage && ((description[DiskKey.deviceInternal] as? Bool) ?? false),
             isBootVolume: isWithinBootDiskSet(drive.bsdName, bootDisks: bootDisks),
             mediaIdentity: mediaIdentity,
-            partitions: partitions(of: drive)
+            partitions: tree,
+            isDiskImage: isImage,
+            diskImagePath: isImage ? drive.imagePath : nil,
+            isSystemImage: isSystemImage
         ))
     }
     return devices
+}
+
+private func allBSDNames(_ partitions: [DevicePartition]) -> Set<String> {
+    partitions.reduce(into: Set<String>()) { names, partition in
+        names.insert(partition.bsdName)
+        names.formUnion(allBSDNames(partition.children))
+    }
 }
 
 private func isAPFSStore(_ content: String) -> Bool {
@@ -287,7 +366,8 @@ func debugDescription(ofDeviceTree devices: [BlockDevice]) -> String {
         }
     }
     for device in devices {
-        lines.append("\(device.bsdName) \(device.sizeBytes) \"\(device.displayName)\"\(device.isBootVolume ? " [startup disk, can't scan]" : "")")
+        let image = device.isDiskImage ? (device.isSystemImage ? " [system disk image]" : " [disk image]") : ""
+        lines.append("\(device.bsdName) \(device.sizeBytes) \"\(device.displayName)\"\(device.isBootVolume ? " [startup disk, can't scan]" : "")\(image)")
         walk(device.partitions, depth: 1)
     }
     return lines.joined(separator: "\n")

@@ -25,14 +25,13 @@ public struct BlockDevice: Identifiable, Equatable, Sendable {
     /// The device's total size in bytes.
     public let sizeBytes: Int64
 
-    /// `true` for an internal device, `false` for external. Internal and external devices still
-    /// render together in one unified list (FR-1) -- this flag is row metadata, not a basis for
-    /// splitting the list into sections.
+    /// `true` for an internal device, `false` for external. The Device Picker groups drives into
+    /// "Internal" and "External" sections by it, as Disk Utility does.
     public let isInternal: Bool
 
-    /// `true` if this device is, or backs, the live, currently-running boot volume. A boot
-    /// device is never omitted from the list: it is shown grayed with a stated reason and is not
-    /// a valid scan-selection target (Architecture AD-4's boot-volume exception).
+    /// `true` if this device is, or backs, the live, currently-running boot volume. It is never a
+    /// valid scan-selection target (Architecture AD-4's boot-volume exception); the Device Picker
+    /// lists it under "Hidden" with that reason rather than omitting it silently.
     public let isBootVolume: Bool
 
     /// Set only on the value carried by `ScanEvent.unlockRequired`: the encrypted APFS volume
@@ -44,6 +43,18 @@ public struct BlockDevice: Identifiable, Equatable, Sendable {
     /// beneath the drive in the Device Picker. Informational only: never a scan target. Empty when
     /// the tree is unknown or couldn't be read.
     public let partitions: [DevicePartition]
+
+    /// `true` for an attached disk image (macOS reports it on a virtual interface), which the
+    /// Device Picker lists under "Disk Images" rather than with the physical drives.
+    public let isDiskImage: Bool
+
+    /// For a disk image: the image file's path, when the system reports it. Display only.
+    public let diskImagePath: String?
+
+    /// `true` for a disk image macOS attached for its own use (a simulator runtime, a downloaded
+    /// system asset): attached by the system rather than the logged-in user, or mounted hidden
+    /// ("nobrowse"). Disk Utility doesn't list these; the Device Picker puts them under "Hidden".
+    public let isSystemImage: Bool
 
     /// What identifies this drive across unplugging and restarts (spec-tech-batch-7 §B), read by
     /// `SalvageDiskIO` from DiskArbitration and IORegistry metadata only, never from the device's
@@ -86,7 +97,10 @@ public struct BlockDevice: Identifiable, Equatable, Sendable {
         encryptedVolumeUUID: String? = nil,
         encryptedVolumeName: String? = nil,
         partitions: [DevicePartition] = [],
-        stableIdentity: StableIdentity? = nil
+        stableIdentity: StableIdentity? = nil,
+        isDiskImage: Bool = false,
+        diskImagePath: String? = nil,
+        isSystemImage: Bool = false
     ) {
         self.bsdName = bsdName
         self.mediaIdentity = mediaIdentity
@@ -98,6 +112,9 @@ public struct BlockDevice: Identifiable, Equatable, Sendable {
         self.encryptedVolumeName = encryptedVolumeName
         self.partitions = partitions
         self.stableIdentity = stableIdentity
+        self.isDiskImage = isDiskImage
+        self.diskImagePath = diskImagePath
+        self.isSystemImage = isSystemImage
     }
 
     /// The same device, annotated with the encrypted volume that blocked part of its scan.
@@ -105,7 +122,17 @@ public struct BlockDevice: Identifiable, Equatable, Sendable {
         BlockDevice(bsdName: bsdName, displayName: displayName, sizeBytes: sizeBytes, isInternal: isInternal,
                     isBootVolume: isBootVolume, mediaIdentity: mediaIdentity,
                     encryptedVolumeUUID: volumeUUID, encryptedVolumeName: volumeName, partitions: partitions,
-                    stableIdentity: stableIdentity)
+                    stableIdentity: stableIdentity, isDiskImage: isDiskImage, diskImagePath: diskImagePath,
+                    isSystemImage: isSystemImage)
+    }
+
+    /// The same device with its replug-stable identity filled in.
+    public func withStableIdentity(_ identity: StableIdentity?) -> BlockDevice {
+        BlockDevice(bsdName: bsdName, displayName: displayName, sizeBytes: sizeBytes, isInternal: isInternal,
+                    isBootVolume: isBootVolume, mediaIdentity: mediaIdentity,
+                    encryptedVolumeUUID: encryptedVolumeUUID, encryptedVolumeName: encryptedVolumeName,
+                    partitions: partitions, stableIdentity: identity, isDiskImage: isDiskImage,
+                    diskImagePath: diskImagePath, isSystemImage: isSystemImage)
     }
 
     public var id: String { bsdName }
