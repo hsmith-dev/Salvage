@@ -15,17 +15,23 @@ struct LostPartitionsCard: View {
             Text("Lost partitions").font(.headline)
             Text("Found in unallocated space, outside the current partition table. Their files are listed separately from the mounted volumes; the partition table itself is never modified.")
                 .font(.subheadline).foregroundStyle(.secondary)
-            ForEach(model.lostPartitions) { partition in row(partition) }
+            // Lazy, and capped at `lostPartitionRowLimit` rows: a damaged disk can yield hundreds.
+            LazyVStack(alignment: .leading, spacing: 12) {
+                ForEach(model.displayedLostPartitions) { partition in row(partition) }
+            }
+            if let more = model.moreLostPartitionsText {
+                Text(more).font(.subheadline).foregroundStyle(.secondary)
+            }
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Lost partitions")
     }
 
     private func row(_ partition: LostPartitionCandidate) -> some View {
-        let count = model.fileCount(in: partition)
+        let summary = model.lostPartitionSummary(partition)
         let title = ResultsViewModel.lostPartitionTitle(partition)
         let location = ResultsViewModel.lostPartitionLocation(partition)
-        let files = count == 0 ? "No recoverable files" : ResultsViewModel.filesText(count)
+        let files = summary.text
         return Button { onOpen(partition) } label: {
             HStack(spacing: 12) {
                 Image(systemName: "externaldrive.badge.questionmark").font(.title2).foregroundStyle(.secondary)
@@ -34,7 +40,7 @@ struct LostPartitionsCard: View {
                     Text("\(files) · \(location)").font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 0)
-                if count > 0 { Image(systemName: "chevron.forward").foregroundStyle(.tertiary) }
+                if summary.opens { Image(systemName: "chevron.forward").foregroundStyle(.tertiary) }
             }
             .frame(maxWidth: 560, alignment: .leading)
             .padding(16)
@@ -43,7 +49,7 @@ struct LostPartitionsCard: View {
             .contentShape(RoundedRectangle(cornerRadius: 10))
         }
         .buttonStyle(.plain)
-        .disabled(count == 0)
+        .disabled(!summary.opens)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(title), \(files), \(location)")
     }

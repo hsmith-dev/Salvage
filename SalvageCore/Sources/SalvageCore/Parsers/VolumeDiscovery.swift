@@ -43,18 +43,59 @@ struct VolumeExtent: Sendable {
     var formatName: String? = nil
 }
 
+/// Counts the bytes requested through a reader, so the probe byte budget measures real reads.
+final class ByteCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Int64 = 0
+    func add(_ count: Int) { lock.withLock { value += Int64(count) } }
+    var bytes: Int64 { lock.withLock { value } }
+}
+struct CountingBlockReader: BlockReader {
+    let base: any BlockReader
+    let counter: ByteCounter
+    var logicalBlockSize: Int { base.logicalBlockSize }
+    var sizeBytes: Int64 { base.sizeBytes }
+    func read(at offset: Int64, count: Int) async throws -> Data {
+        counter.add(count)
+        return try await base.read(at: offset, count: count)
+    }
+}
+
 struct VolumeDiscovery {
     let reader: any BlockReader
-    /// Bounds for the unallocated-space search: header probes and header bytes read per device.
-    /// Probing is sparse (one or two 512-byte reads per probe), so the byte cap mostly guards the
-    /// header-length reads that follow a hit.
-    var maxProbes = 16384
-    var maxProbeBytes: Int64 = 64 << 20
-    /// Candidate offsets: every MiB; 4 KiB steps across the first 64 MiB of the device and the
-    /// first MiB after each known or found extent; and the classic first-partition sectors (GPT's
-    /// first usable LBA 34, CHS's sector 63) that none of those alignments reach.
-    static let fineStride: Int64 = 4096, coarseStride: Int64 = 1 << 20, fineRegion: Int64 = 64 << 20
+    /// Bounds for the unallocated-space search. `maxProbes` is sized so a 2 TiB device is walked end
+    /// to end (16,384 fine probes in the first 64 MiB, 65,536 at 1 MiB across the first 64 GiB, then
+    /// one per 8 MiB: about 336k for 2 TiB); each probe is one 512-byte read, so the byte cap
+    /// (which counts every header read exactly) mostly guards the follow-up reads after a hit.
+    var maxProbes = 1 << 19
+    var maxProbeBytes: Int64 = 512 << 20
+    /// Consecutive probes that failed with an I/O error before the search gives up on the device.
+    var maxConsecutiveProbeFailures = 64
+    /// Lost volumes reported per device; later hits are dropped and a warning recorded.
+    var maxCandidates = 256
+    /// A header claiming less than this is implausible as a volume and is dropped.
+    static let minimumVolumeLength: Int64 = 64 << 10
+    /// Candidate offsets. Pass 1 (fine): 4 KiB steps across the first 64 MiB of the device and the
+    /// first MiB after each known or found extent, every gap's own start, and the classic
+    /// first-partition sectors (GPT's first usable LBA 34, CHS's sector 63) that no alignment
+    /// reaches. Pass 2 (coarse): every MiB across the first 64 GiB, every 8 MiB beyond.
+    static let fineStride: Int64 = 4096, coarseStride: Int64 = 1 << 20, sparseStride: Int64 = 8 << 20
+    static let fineRegion: Int64 = 64 << 20, coarseRegion: Int64 = 64 << 30
     static let classicStarts: [Int64] = [34 * 512, 63 * 512]
+
+    /// What discovery found, plus how far the lost-partition search was trusted.
+    struct Result: Sendable {
+        var extents: [VolumeExtent]
+        /// Plain-language reasons the result may be incomplete (a damaged table that was ignored,
+        /// a search cut short); empty when there is nothing to say.
+        var warnings: [String] = []
+        /// True when the unallocated-space search stopped before covering the device (budget,
+        /// repeated read failures, or the candidate cap); `searchedBytes` says how far it got.
+        var probesTruncated = false
+        var searchedBytes: Int64? = nil
+        /// Probes skipped because the device could not be read there.
+        var failedProbes = 0
+    }
 
     func read(_ offset: Int64, _ count: Int) async throws -> Data {
         try Task.checkCancellation()
@@ -70,33 +111,44 @@ struct VolumeDiscovery {
         }
         return data
     }
-    func discover() async throws -> [VolumeExtent] {
+    func discover() async throws -> Result {
         guard reader.logicalBlockSize == 512 else {
             throw ScanError.malformed("Only devices with 512-byte logical sectors are supported in this version.")
         }
         let boot = try await read(0, 512)
         if let format = try await format(boot: boot, at: 0, length: reader.sizeBytes) {
             guard format.isScannable else { throw ScanError.unsupportedFilesystem }
-            return [VolumeExtent(offset: 0, length: reader.sizeBytes, format: format)]
+            return Result(extents: [VolumeExtent(offset: 0, length: reader.sizeBytes, format: format)])
         }
         // Every table entry is a known extent, supported or not: the unallocated-space search never
         // probes inside one, so a mapped partition always wins over a stale header within it.
         var known: [VolumeExtent] = []
-        if try boot.number(510, 2) == 0xaa55 { known = try await partitions(boot) }
+        var warnings: [String] = []
+        if try boot.number(510, 2) == 0xaa55 {
+            do { known = try await partitions(boot) }
+            catch ScanError.malformed(let reason) {
+                // A damaged table (bad GPT checksum, overlapping or out-of-range entries, a map this
+                // version can't read) is treated as absent: nothing is known, so the whole device is
+                // searched for signatures instead of failing before any volume is looked at.
+                warnings.append("The partition table is damaged and was ignored (\(reason)) The whole device was searched for filesystem signatures instead.")
+            }
+        }
         var supported: [VolumeExtent] = []
         for extent in known {
             if let format = try await format(at: extent.offset, length: extent.length), format.isScannable {
                 supported.append(VolumeExtent(offset: extent.offset, length: extent.length, format: format))
             }
         }
-        let lost = try await lostVolumes(excluding: known)
-        let result = (supported + lost).sorted { $0.offset < $1.offset }
-        if result.isEmpty {
+        let search = try await lostVolumes(excluding: known)
+        var result = Result(extents: (supported + search.found).sorted { $0.offset < $1.offset },
+                            warnings: warnings + search.warnings, probesTruncated: search.truncated,
+                            searchedBytes: search.searchedBytes, failedProbes: search.failedProbes)
+        if result.extents.isEmpty {
             // A table whose volumes are all recognized but unsupported keeps the honest "not supported"
             // answer. With no table and no signature anywhere, one raw extent lets the sweep and the
             // carver still run, so completion reports carved files or none, never a silent skip.
             guard known.isEmpty else { throw ScanError.unsupportedFilesystem }
-            return [VolumeExtent(offset: 0, length: reader.sizeBytes, format: .raw)]
+            result.extents = [VolumeExtent(offset: 0, length: reader.sizeBytes, format: .raw)]
         }
         return result
     }
@@ -130,7 +182,7 @@ struct VolumeDiscovery {
 
     // MARK: Unallocated space (FR-9)
 
-    /// Unallocated byte ranges: the device minus `known` (sorted, non-overlapping).
+    /// Unallocated byte ranges: the device minus `known` (sorted, non-overlapping, within the device).
     static func gaps(in sizeBytes: Int64, excluding known: [VolumeExtent]) -> [Range<Int64>] {
         var gaps: [Range<Int64>] = [], cursor: Int64 = 0
         for extent in known {
@@ -141,37 +193,88 @@ struct VolumeDiscovery {
         return gaps
     }
 
+    enum Pass { case fine, coarse }
+    enum Stop: Equatable { case budget, failures, candidates }
+
     struct ProbeState {
-        var found: [VolumeExtent] = []
+        /// Found lost extents, sorted by offset and disjoint, so containment and overlap checks are
+        /// binary searches.
+        private(set) var found: [VolumeExtent] = []
+        /// Offsets the fine pass probed, so the coarse pass skips them. Only fine-pass offsets go in
+        /// (at most the first 64 MiB at 4 KiB plus a MiB per extent); the coarse pass never repeats.
         var probed: Set<Int64> = []
         var probes = 0
         var bytes: Int64 = 0
+        var failedProbes = 0
+        var consecutiveFailures = 0
+        var stop: Stop?
+        var stoppedAt: Int64?
+
+        /// Index of the first found extent starting at or after `offset`.
+        func index(startingAtOrAfter offset: Int64) -> Int {
+            var low = 0, high = found.count
+            while low < high {
+                let middle = (low + high) / 2
+                if found[middle].offset < offset { low = middle + 1 } else { high = middle }
+            }
+            return low
+        }
+        func hit(containing offset: Int64) -> VolumeExtent? {
+            let index = index(startingAtOrAfter: offset)
+            if index < found.count, found[index].offset == offset { return found[index] }
+            if index > 0, offset < found[index - 1].offset + found[index - 1].length { return found[index - 1] }
+            return nil
+        }
+        func overlaps(_ range: Range<Int64>) -> Bool {
+            let index = index(startingAtOrAfter: range.lowerBound)
+            if index < found.count, found[index].offset < range.upperBound { return true }
+            if index > 0, range.lowerBound < found[index - 1].offset + found[index - 1].length { return true }
+            return false
+        }
+        mutating func insert(_ extent: VolumeExtent) {
+            found.insert(extent, at: index(startingAtOrAfter: extent.offset))
+        }
     }
 
-    /// Filesystem headers in unallocated space. Two bounded passes in device order, the likelier
-    /// starts first: every gap's own start, the classic first-partition sectors, 4 KiB steps for the
-    /// first MiB after each known or found extent, and every MiB; then 4 KiB steps across the first
-    /// 64 MiB. A hit's span (from its own header geometry) is skipped, and a candidate that would
-    /// run into a known extent or an earlier hit is dropped: known extents and earlier hits win.
-    func lostVolumes(excluding known: [VolumeExtent]) async throws -> [VolumeExtent] {
+    struct Search {
+        var found: [VolumeExtent]
+        var warnings: [String] = []
+        var truncated = false
+        var searchedBytes: Int64? = nil
+        var failedProbes = 0
+    }
+
+    /// Filesystem headers in unallocated space. Two bounded passes in device order: the fine pass
+    /// (every gap's start, the classic first-partition sectors, 4 KiB steps across the first 64 MiB
+    /// and across the first MiB after each known or found extent) spends budget before the coarse
+    /// walk (every MiB to 64 GiB, every 8 MiB beyond). A hit's span (from its own header geometry)
+    /// is skipped, and a candidate that would run into a known extent or an earlier hit is dropped:
+    /// known extents and earlier hits win. An unreadable probe is skipped and counted; too many in a
+    /// row, an exhausted budget, or the candidate cap end the search early and say so.
+    func lostVolumes(excluding known: [VolumeExtent]) async throws -> Search {
         let gaps = Self.gaps(in: reader.sizeBytes, excluding: known)
+        let counter = ByteCounter()
+        let probing = VolumeDiscovery(reader: CountingBlockReader(base: reader, counter: counter))
         // `discover()` has already checked offset 0 against the whole device.
         var state = ProbeState(probed: [0])
-        for pass in 0..<2 {
-            // The first pass keeps a quarter of the budget for the fine pass.
-            let cap = pass == 0 ? maxProbes - maxProbes / 4 : maxProbes
-            for gap in gaps where pass == 0 || gap.lowerBound < Self.fineRegion {
-                var offset = gap.lowerBound, fineUntil = gap.lowerBound + Self.coarseStride
-                while offset < gap.upperBound, state.probes < cap, state.bytes < maxProbeBytes {
+        passes: for pass in [Pass.fine, .coarse] {
+            for gap in gaps {
+                var offset = gap.lowerBound
+                var fineUntil = pass == .fine ? gap.lowerBound + Self.coarseStride : gap.lowerBound
+                while offset < gap.upperBound {
                     try Task.checkCancellation()
-                    if let hit = state.found.first(where: { $0.offset <= offset && offset < $0.offset + $0.length }) {
+                    if state.probes >= maxProbes || state.bytes >= maxProbeBytes { state.stop = .budget }
+                    if state.found.count >= maxCandidates { state.stop = .candidates }
+                    if state.stop != nil { state.stoppedAt = offset; break passes }
+                    if let hit = state.hit(containing: offset) {
                         // Probe finely right after a found volume, as after a known extent.
                         offset = hit.offset + hit.length; fineUntil = offset + Self.coarseStride; continue
                     }
-                    if pass == 1, offset >= Self.fineRegion { break }
+                    if pass == .fine, offset >= Self.fineRegion, offset >= fineUntil { break }
                     if !state.probed.contains(offset) {
-                        if let extent = try await probe(at: offset, gapEnd: gap.upperBound, state: &state) {
-                            state.found.append(extent); continue
+                        if pass == .fine { state.probed.insert(offset) }
+                        if let extent = try await probe(at: offset, gapEnd: gap.upperBound, state: &state, probing: probing, counter: counter) {
+                            state.insert(extent); continue
                         }
                     }
                     guard let next = Self.nextCandidate(after: offset, fineUntil: fineUntil, pass: pass) else { break }
@@ -179,41 +282,79 @@ struct VolumeDiscovery {
                 }
             }
         }
-        return state.found
+        var search = Search(found: state.found, failedProbes: state.failedProbes)
+        if let stop = state.stop, let at = state.stoppedAt {
+            search.truncated = true
+            search.searchedBytes = at
+            let reached = ByteCountFormatter.string(fromByteCount: at, countStyle: .file)
+            switch stop {
+            case .budget: search.warnings.append("The search for lost partitions was limited to the first \(reached) of the device.")
+            case .failures: search.warnings.append("The search for lost partitions stopped at \(reached): \(maxConsecutiveProbeFailures) consecutive reads failed there.")
+            case .candidates: search.warnings.append("The search for lost partitions stopped at \(reached) after \(maxCandidates) candidates.")
+            }
+        } else if state.failedProbes > 0 {
+            search.warnings.append("\(state.failedProbes) unreadable spots were skipped while searching for lost partitions.")
+        }
+        return search
     }
 
     /// The next candidate offset after `offset`, or nil when the pass has none left in this gap.
-    static func nextCandidate(after offset: Int64, fineUntil: Int64, pass: Int) -> Int64? {
+    static func nextCandidate(after offset: Int64, fineUntil: Int64, pass: Pass) -> Int64? {
         func aligned(_ stride: Int64) -> Int64 { (offset / stride + 1) * stride }
-        if pass == 1 { return offset < fineRegion ? aligned(fineStride) : nil }
-        var next = aligned(coarseStride)
-        if offset + 1 < fineUntil { next = min(next, aligned(fineStride)) }
-        if let classic = classicStarts.first(where: { $0 > offset }) { next = min(next, classic) }
-        return next
+        switch pass {
+        case .fine:
+            var next = aligned(fineStride)
+            if let classic = classicStarts.first(where: { $0 > offset }) { next = min(next, classic) }
+            return next
+        case .coarse:
+            var next = offset < coarseRegion ? aligned(coarseStride) : aligned(sparseStride)
+            if offset + 1 < fineUntil { next = min(next, aligned(fineStride)) }
+            return next
+        }
     }
 
     /// One header probe. A hit returns a lost extent whose length comes from the header and fits the
-    /// gap (clamped to the device end); a header with implausible geometry, or one that overlaps a
-    /// known extent or an earlier hit, is dropped.
-    func probe(at offset: Int64, gapEnd: Int64, state: inout ProbeState) async throws -> VolumeExtent? {
-        state.probes += 1; state.probed.insert(offset)
+    /// gap (clamped to the device end); a header with implausible geometry (zero, overflowing or
+    /// under `minimumVolumeLength`), or one that overlaps a known extent or an earlier hit, is
+    /// dropped. A read failure skips the probe: the device is unreadable there, which says nothing
+    /// about the rest of it, but `maxConsecutiveProbeFailures` in a row ends the search.
+    func probe(at offset: Int64, gapEnd: Int64, state: inout ProbeState,
+               probing: VolumeDiscovery, counter: ByteCounter) async throws -> VolumeExtent? {
+        state.probes += 1
+        defer { state.bytes = counter.bytes }
         let remaining = gapEnd - offset
         guard remaining >= 512 else { return nil }
-        let boot = try await read(offset, 512)
-        state.bytes += 1024
-        guard let format = try await format(boot: boot, at: offset, length: remaining) else { return nil }
-        state.bytes += 2048
-        let length: Int64?
-        do { length = try await volumeLength(format: format, boot: boot, at: offset) }
-        catch ScanError.malformed { return nil } catch ScanError.unsupportedFilesystem { return nil }
-        guard let length, length > 0 else { return nil }
+        let header: (format: VolumeFormat, boot: Data, length: Int64)?
+        do { header = try await probing.header(at: offset, remaining: remaining) }
+        catch ScanError.io {
+            state.failedProbes += 1; state.consecutiveFailures += 1
+            if state.consecutiveFailures >= maxConsecutiveProbeFailures { state.stop = .failures }
+            return nil
+        }
+        state.consecutiveFailures = 0
+        guard let header, header.length > 0 else { return nil }
         // A header running past the device end is clamped (a short image or an overwritten tail);
-        // one running into a known extent is dropped, since the mapped partition wins.
-        let end = min(offset + length, reader.sizeBytes)
-        guard end > offset, end <= gapEnd else { return nil }
-        guard !state.found.contains(where: { $0.offset < end && offset < $0.offset + $0.length }) else { return nil }
-        let name = format == .fat ? (String(decoding: boot[3..<11], as: UTF8.self) == "EXFAT   " ? "exFAT" : "FAT32") : format.displayName
-        return VolumeExtent(offset: offset, length: end - offset, format: format, isLost: true, formatName: name)
+        // one running into a known extent is dropped, since the mapped partition wins. Header
+        // values are untrusted: an end that overflows is dropped, never computed.
+        let (declaredEnd, overflow) = offset.addingReportingOverflow(header.length)
+        guard !overflow else { return nil }
+        let end = min(declaredEnd, reader.sizeBytes)
+        guard end <= gapEnd, end - offset >= Self.minimumVolumeLength else { return nil }
+        guard !state.overlaps(offset..<end) else { return nil }
+        let boot = header.boot
+        let name = header.format == .fat ? (String(decoding: boot[3..<11], as: UTF8.self) == "EXFAT   " ? "exFAT" : "FAT32") : header.format.displayName
+        return VolumeExtent(offset: offset, length: end - offset, format: header.format, isLost: true, formatName: name)
+    }
+
+    /// The signature at `offset` and the length its header declares, or nil when there is no
+    /// recognizable or well-formed header there. I/O errors and cancellation propagate.
+    func header(at offset: Int64, remaining: Int64) async throws -> (format: VolumeFormat, boot: Data, length: Int64)? {
+        do {
+            let boot = try await read(offset, 512)
+            guard let format = try await format(boot: boot, at: offset, length: remaining),
+                  let length = try await volumeLength(format: format, boot: boot, at: offset) else { return nil }
+            return (format, boot, length)
+        } catch ScanError.malformed { return nil } catch ScanError.unsupportedFilesystem { return nil }
     }
 
     /// A volume's byte length from its own header only: FAT BPB total sectors, NTFS total sectors

@@ -300,8 +300,14 @@ struct ScanSessionTests {
         let events = await scan(image)
         #expect(events.last == .completed)
         #expect(events.contains { if case .found(let file) = $0 { file.sourceMetadata.volumeOffset == 512 } else { false } })
+        // An entry running past the device end is a damaged table: it is ignored and the device
+        // searched instead (FR-9). The volume at sector 1 sits on no probed alignment, so nothing is
+        // found by signature and the scan completes with a raw sweep, never reading past the end.
         image.put(446+12, 129, 4)
-        #expect(!(await scan(image)).contains(.completed))
+        let damaged = await scan(image)
+        #expect(damaged.last == .completed)
+        #expect(!damaged.contains { if case .found(let file) = $0 { file.sourceMetadata.volumeOffset == 512 } else { false } })
+        #expect(damaged.contains(.progress(bytesScanned: Int64(image.count), totalBytes: Int64(image.count))))
     }
     @Test func unrecognizedPartitionsAreSkipped() async {
         let volume = exfatImage()
@@ -335,6 +341,33 @@ struct ScanSessionTests {
         #expect(result.isEmpty)
     }
     @Test func GPTPartitionWithChecksumsScansWithinExtent() async {
+        var image = gptImage()
+        let events = await scan(image)
+        #expect(events.last == .completed)
+        #expect(events.contains { if case .found(let file) = $0 { file.sourceMetadata.volumeOffset == 64*512 } else { false } })
+        #expect(events.contains(.progress(bytesScanned: 128*512, totalBytes: 128*512)))
+        #expect(!events.contains { if case .lostPartitionFound = $0 { true } else { false } })
+        // A damaged partition-entry array no longer stops the scan: the table is ignored, the whole
+        // device searched, and the same volume found by its signature as a lost partition.
+        image[1024] ^= 1
+        let damaged = await scan(image)
+        #expect(damaged.last == .completed)
+        #expect(damaged.contains(.lostPartitionFound(LostPartitionCandidate(
+            id: lostID(damaged), offset: 64*512, sizeBytes: 128*512, formatName: "exFAT"))))
+        #expect(damaged.contains { if case .found(let file) = $0 { file.path == "/file.txt" && file.sourceMetadata.volumeOffset == 64*512 } else { false } })
+    }
+    @Test func damagedGPTHeaderIsReportedAndTheVolumeStillFound() async throws {
+        var image = gptImage()
+        image[512 + 40] ^= 1   // first usable LBA: header CRC no longer matches
+        let result = try await VolumeDiscovery(reader: ImageReader(data: image)).discover()
+        #expect(result.extents.map(\.offset) == [64*512] && result.extents.allSatisfy(\.isLost))
+        #expect(result.warnings.count == 1)
+        #expect(result.warnings.first?.contains("Invalid GPT header checksum") == true)
+    }
+    private func lostID(_ events: [ScanEvent]) -> UUID {
+        events.lazy.compactMap { if case .lostPartitionFound(let c) = $0 { c.id } else { nil } }.first ?? UUID()
+    }
+    private func gptImage() -> Data {
         var image = Data(repeating: 0, count: 256*512)
         image.replaceSubrange(64*512..<192*512, with: exfatImage())
         image.put(510, 0xaa55, 2); image.put(450, 0xee, 1)
@@ -349,12 +382,7 @@ struct ScanSessionTests {
         header.put(88, UInt64(crc32(table)), 4)
         header.put(16, UInt64(crc32(header.subdata(in: 0..<92))), 4)
         image.replaceSubrange(512..<1024, with: header)
-        let events = await scan(image)
-        #expect(events.last == .completed)
-        #expect(events.contains { if case .found(let file) = $0 { file.sourceMetadata.volumeOffset == 64*512 } else { false } })
-        #expect(events.contains(.progress(bytesScanned: 128*512, totalBytes: 128*512)))
-        image[1024] ^= 1
-        #expect(!(await scan(image)).contains(.completed))
+        return image
     }
     @Test func corruptBootAndTruncatedVolumeStop() async {
         var image = exfatImage(); image[120] ^= 1
@@ -457,13 +485,17 @@ struct ScanSessionTests {
         #expect(await reader.measured == Int64(size))
         #expect(await reader.ranges == [0..<Int64(size)])
     }
-    @Test func invalidGPTChecksumFails() async {
+    @Test func invalidGPTChecksumIsIgnoredAndTheDeviceSearched() async {
+        // A GPT header that fails its checksum is treated as no table: nothing is found by signature
+        // here, so the device is swept raw and the scan completes honestly with no files.
         var image = Data(repeating: 0, count: 128*512)
         image.put(510, 0xaa55, 2); image.put(450, 0xee, 1)
         image.text(512, "EFI PART"); image.put(524, 92, 4); image.put(536, 1, 8)
         let events = await scan(image)
-        #expect(events.contains { if case .error(.malformed) = $0 { true } else { false } })
-        #expect(!events.contains(.completed))
+        #expect(!events.contains { if case .error = $0 { true } else { false } })
+        #expect(events.last == .completed)
+        #expect(!events.contains { if case .found = $0 { true } else { false } })
+        #expect(events.contains(.progress(bytesScanned: Int64(image.count), totalBytes: Int64(image.count))))
     }
 }
 

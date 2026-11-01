@@ -32,7 +32,8 @@ public struct ScanSession: Sendable, Identifiable {
         let carver: any Carver = SignatureCarver(emit: { try await emit(.found($0)) })
         do {
             try Task.checkCancellation()
-            let extents = try await VolumeDiscovery(reader: reader).discover()
+            let discovery = try await VolumeDiscovery(reader: reader).discover()
+            let extents = discovery.extents
             var total: Int64 = 0
             for extent in extents { total = try checkedAdd(total, extent.length) }
             let fingerprint = extents.map { ScanCheckpoint.Extent(offset: $0.offset, length: $0.length) }
@@ -46,22 +47,29 @@ public struct ScanSession: Sendable, Identifiable {
                 }
             }
             try await emit(.progress(bytesScanned: await measured.measured, totalBytes: total))
-            // Lost partitions (FR-9) are announced before any scanning so the app can show them while
-            // their files stream in; they are then scanned and swept exactly like mapped volumes.
-            for extent in extents where extent.isLost {
-                try await emit(.lostPartitionFound(LostPartitionCandidate(
-                    offset: extent.offset, sizeBytes: extent.length, formatName: extent.formatName ?? extent.format.displayName)))
-            }
-            for extent in extents {
+            // Per lost extent: whether its own parser finished, and whether the device failed to read
+            // inside it (then nothing more is read there).
+            var parserFailed = Set<Int>(), unreadable = Set<Int>()
+            for (index, extent) in extents.enumerated() {
                 do {
                     try await scanVolume(extent, reader: measured, device: device, emit: { event in
                         if case .found(let file) = event, case .runs(let runs) = file.content { await claimed.add(runs) }
                         try await emit(event)
                     })
-                } catch let error as ScanError where extent.isLost && error.isMetadataFailure {
-                    // A lost partition is detected, not confirmed: damaged or unsupported metadata inside it
-                    // stops only its own parser. Its files found so far stay, mapped volumes are unaffected,
-                    // and the sweep below still reads (and carves) every byte of it.
+                } catch let error as ScanError where extent.isLost && error.isContainedInLostExtent {
+                    // A lost partition is detected, not confirmed: damaged or unsupported metadata, or an
+                    // unreadable spot, inside it stops only its own parser. Its files found so far stay and
+                    // every other volume is unaffected. Mapped volumes keep failing closed.
+                    parserFailed.insert(index)
+                    if case .io = error { unreadable.insert(index) }
+                }
+                // Lost partitions (FR-9) are announced once their parser has finished, so the name can
+                // say whether it got through: " (damaged)" when it stopped part-way.
+                if extent.isLost {
+                    let name = extent.formatName ?? extent.format.displayName
+                    try await emit(.lostPartitionFound(LostPartitionCandidate(
+                        offset: extent.offset, sizeBytes: extent.length,
+                        formatName: parserFailed.contains(index) ? name + Self.damagedSuffix : name)))
                 }
             }
             // Finish a bounded, read-only pass over supported volumes. Progress measures unique
@@ -70,13 +78,22 @@ public struct ScanSession: Sendable, Identifiable {
             try await carver.begin(claimed: await claimed.runs, deviceSizeBytes: reader.sizeBytes)
             for (index, extent) in extents.enumerated() {
                 guard index >= (start?.volume ?? 0) else { continue }
+                // Every lost extent is swept for the carver, including one whose parser failed or
+                // stopped on damaged metadata; only one the device couldn't read is left alone.
+                if unreadable.contains(index) { continue }
                 var offset: Int64 = index == start?.volume ? start?.offset ?? 0 : 0
                 while offset < extent.length {
                     try Task.checkCancellation()
                     try await pauseGate?.wait()
                     let count = Int(min(1024 * 1024, extent.length - offset))
                     let deviceOffset = try checkedAdd(extent.offset, offset)
-                    let chunk = try await measured.read(at: deviceOffset, count: count)
+                    let chunk: Data
+                    do { chunk = try await measured.read(at: deviceOffset, count: count) }
+                    catch ScanError.io(let reason) {
+                        // An unreadable spot in a lost partition ends that partition's sweep only.
+                        guard extent.isLost else { throw ScanError.io(reason) }
+                        break
+                    }
                     try await carver.consume(chunk, at: deviceOffset)
                     offset += Int64(count)
                     checkpoints?.yield(ScanCheckpoint(deviceSizeBytes: reader.sizeBytes, totalBytes: total,
@@ -95,6 +112,9 @@ public struct ScanSession: Sendable, Identifiable {
         checkpoints?.finish()
         events.finish()
     }
+
+    /// Appended to a lost partition's format name when its parser stopped part-way.
+    static let damagedSuffix = " (damaged)"
 
     /// The sweep position a checkpoint resumes from, or nil when it does not fit this device's layout.
     /// The checkpoint's extent fingerprint must equal the freshly discovered layout exactly, so a
@@ -191,6 +211,12 @@ extension ScanError {
         case .malformed, .unsupportedFilesystem: true
         default: false
         }
+    }
+    /// Failures a lost extent's parser may hit without stopping the scan: its metadata, or an
+    /// unreadable spot inside it. Device removal, permissions and cancellation still propagate.
+    var isContainedInLostExtent: Bool {
+        if case .io = self { return true }
+        return isMetadataFailure
     }
 }
 
