@@ -38,3 +38,7 @@
 - source_spec: `spec-3-3-3-4-discover-and-recover-lost-partitions.md`
   summary: Surface the lost-partition search's limits in the app: "Search for lost partitions was limited to the first N GB" (`VolumeDiscovery.Result.probesTruncated` / `searchedBytes`), skipped unreadable probes, and "the partition table is damaged and was ignored" (`Result.warnings`).
   evidence: Review patch P3 computes these in Core and unit-tests them, but `ScanSession` emits nothing for them. `ScanEvent` is closed (AD-11), and the alternatives (a fake `.lostPartitionFound` named "Search limited", an `.error` for a non-error) would mislead the app. Needs a non-terminal diagnostic event or a scan-summary value on `.completed`, an AD-11 change for the architect, then a dashboard line fed through `ScanViewModel` → `ResultsViewModel`.
+
+- source_spec: `spec-3-1-3-2-carve-and-organize-reconstructed-files.md`
+  summary: Surface the carver's file-limit flag (`hitFileLimit`) and the lost-partition search-limited/table-warning results in the UI, and decide how a resumed scan treats carving of already-swept bytes.
+  evidence: These are computed and unit-tested in Core, but the app shows none of them. ScanEvent is closed (AD-11), so it needs a non-event channel or an AD-11 amendment. A resumed scan carves only the bytes after the checkpoint, so files that started earlier are missed or carved as partial.
