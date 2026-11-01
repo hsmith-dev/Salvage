@@ -310,22 +310,36 @@ A finished scan (or one you cancelled, or one that stopped early with files foun
 so you can come back to its results without scanning again.
 
 - **Save Scan…** (⌘S, in the File menu or at the top of the results) saves a `.salvagescan` file
-  where you choose. The save panel says: "This file lists the names of the files Salvage found."
-  The file holds the file list, where each file's bytes are on the drive, the scan's notices and
-  lost partitions, and the drive's name, size and identity. Only your user account can read it.
-  It never holds a password, recovery key or decryption key.
+  where you choose. The save panel says: "This file lists the names, folders, sizes and dates of
+  the files Salvage found, and where each one is on the drive. It doesn't contain the files
+  themselves." Besides that list, the file holds the scan's notices and lost partitions, and the
+  drive's name, size and identity. It holds none of your files' contents: not even the contents
+  of very small files, which some drives (NTFS) keep inside their file records, nor the first
+  bytes of reconstructed files. Only your user account can read it. It never holds a password,
+  recovery key or decryption key.
 - **Open Scan…** (⇧⌘O) shows the saved results again. Until the drive is reconnected, the results
   say "Reconnect <drive name> to preview or recover these files." and Preview and Recover are off.
 
 **Reconnecting.** When the same drive is attached, a **Reconnect** button appears next to that
-message. Salvage then opens the drive read-only, as a scan does (its volumes are unmounted), and
-checks it's the same drive before it reads any file from it: the same attachment, the same size,
-and the same partition layout as when it was scanned. If the layout is different, the results say
-the drive "has changed since this scan was saved", and Salvage won't read from it. Scan it again
-instead.
+message. Salvage recognises the drive even after it was unplugged or the Mac was restarted, by
+what's stored on the drive and in its hardware: its partition table's ID, the IDs of its volumes,
+its size, and its serial number when it has one. A drive whose volume was erased since, even to
+the same format, counts as a different drive. Nothing is read from a drive that doesn't match.
 
-Salvage recognises a drive by its current connection. If the drive was unplugged, or the Mac was
-restarted, since the scan, the saved scan can't be reconnected: scan the drive again.
+Salvage then opens the drive read-only, as a scan does (its volumes are unmounted), and checks the
+partition layout is the same as when it was scanned before it reads any file from it. If the
+layout is different, the results say the drive "has changed since this scan was saved", and
+Salvage won't read from it. Scan it again instead.
+
+Very small files on NTFS drives are read again from their file records when you preview or
+recover them. If a record no longer holds the same file (its name, date or size changed), or the
+record is split across two places on the drive, Preview and Recover say "Rescan to recover this
+file."
+
+Some drives can't be recognised after a replug: a drive with no partition table ID and no
+volume Salvage can identify (for example, one whose volumes are all damaged). Their saved scans
+reconnect only while the drive stays connected and the Mac isn't restarted; otherwise scan it
+again. Scans saved by the first version of this feature work the same way.
 
 Files on encrypted (FileVault) volumes need the password again after reopening. Scan the drive
 again and unlock the volume to preview or recover them.

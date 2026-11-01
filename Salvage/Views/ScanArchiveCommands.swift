@@ -114,17 +114,91 @@ extension FocusedValues {
     }
 }
 
-/// Opens a reconnected device for a saved scan, read-only, exactly as a scan does.
+/// Opens a reconnected device for a saved scan, read-only, exactly as a scan does. Reads of a
+/// resident file's runs pass through `ResidentRecordGuard`, so they are served only after its MFT
+/// record has been re-read and found to still hold that file.
 enum ScanArchiveSource {
     @Sendable static func open(_ device: BlockDevice) async throws -> SourceSession {
+        try await open(device, guarding: [])
+    }
+
+    static func open(_ device: BlockDevice, guarding entries: [ResidentRecordGuard.Entry]) async throws -> SourceSession {
         #if DEBUG
         if let fixture = UITestFixture.active {
-            let reader = InMemoryArchiveReader(data: fixture.image)
+            let reader = ResidentRecordGuard.wrapping(InMemoryArchiveReader(data: fixture.image), entries: entries)
             return SourceSession(device: device, reader: reader, close: {})
         }
         #endif
-        let reader = try await RawBlockReader.prepare(device: device)
-        return SourceSession(device: device, reader: reader, close: { await reader.close() })
+        let raw = try await RawBlockReader.prepare(device: device)
+        return SourceSession(device: device, reader: ResidentRecordGuard.wrapping(raw, entries: entries),
+                             close: { await raw.close() })
+    }
+}
+
+/// A reader for a reconnected device that checks each resident NTFS file's MFT record before any
+/// read touches it (`NTFSResidentData.revalidate`: the same record number, name, date, size, and
+/// runs that still map its resident data). A record that no longer holds its file makes every
+/// read overlapping it fail with "Rescan to recover this file." instead of returning other bytes.
+/// Verdicts are kept for the session; other reads pass straight through.
+struct ResidentRecordGuard: BlockReader {
+    struct Entry: Sendable {
+        let file: RecoveredFile
+        let recordBytes: Int
+        var range: Range<Int64> { file.sourceMetadata.recordOffset..<file.sourceMetadata.recordOffset + Int64(recordBytes) }
+    }
+
+    let base: any BlockReader
+    private let entries: [Entry]
+    private let verdicts = Verdicts()
+    var sizeBytes: Int64 { base.sizeBytes }
+    var logicalBlockSize: Int { base.logicalBlockSize }
+
+    /// `base` itself when there is nothing to guard.
+    static func wrapping(_ base: any BlockReader, entries: [Entry]) -> any BlockReader {
+        entries.isEmpty ? base : ResidentRecordGuard(base: base, entries: entries)
+    }
+
+    init(base: any BlockReader, entries: [Entry]) {
+        self.base = base
+        self.entries = entries.sorted { $0.range.lowerBound < $1.range.lowerBound }
+    }
+
+    /// The guarded files of a reopened scan.
+    static func entries(files: [RecoveredFile], residentRecords: [UUID: Int]) -> [Entry] {
+        guard !residentRecords.isEmpty else { return [] }
+        return files.compactMap { file in
+            guard let bytes = residentRecords[file.id], file.sourceMetadata.recordOffset >= 0,
+                  file.sourceMetadata.recordOffset <= Int64.max - Int64(bytes) else { return nil }
+            return Entry(file: file, recordBytes: bytes)
+        }
+    }
+
+    func read(at offset: Int64, count: Int) async throws -> Data {
+        let (end, overflow) = offset.addingReportingOverflow(Int64(max(count, 0)))
+        guard !overflow else { throw ScanError.io("Read outside the device.") }
+        // Records don't overlap, so ranges are sorted by both bounds: find the first that ends past
+        // `offset`, then walk while they start before `end`.
+        var low = 0, high = entries.count
+        while low < high {
+            let mid = (low + high) / 2
+            if entries[mid].range.upperBound <= offset { low = mid + 1 } else { high = mid }
+        }
+        var index = low
+        while index < entries.count, entries[index].range.lowerBound < end {
+            guard await verdicts.holds(entries[index], on: base) else { throw ScanError.io(ScanArchive.rescanToRecover) }
+            index += 1
+        }
+        return try await base.read(at: offset, count: count)
+    }
+
+    private actor Verdicts {
+        private var known: [UUID: Bool] = [:]
+        func holds(_ entry: Entry, on reader: any BlockReader) async -> Bool {
+            if let verdict = known[entry.file.id] { return verdict }
+            let verdict = await NTFSResidentData.revalidate(entry.file, recordBytes: entry.recordBytes, reader: reader)
+            known[entry.file.id] = verdict
+            return verdict
+        }
     }
 }
 
@@ -144,7 +218,8 @@ private struct InMemoryArchiveReader: BlockReader {
 
 /// Above a reopened scan's results (stacked above them in `ResultsView`, not a safe-area inset,
 /// which pushed the File Browser's header out of the window): what it takes to preview or recover again. It watches the
-/// attached devices and offers Reconnect once one has the saved media identity and size; the
+/// attached devices and offers Reconnect once one is the same drive (`ScanArchive.admits`: the
+/// same attachment, or the same replug-stable identity, and the saved size); the
 /// fingerprint check then runs in `ScanViewModel.reconnect`. Reconnecting is the user's choice,
 /// because opening the device unmounts its volumes, as a scan does.
 struct SavedScanBanner: View {
@@ -193,7 +268,10 @@ struct SavedScanBanner: View {
 
     private func reconnect(_ device: BlockDevice) {
         openFailed = false
-        Task { openFailed = await scan.reconnect(device, open: ScanArchiveSource.open) == .unavailable }
+        let entries = ResidentRecordGuard.entries(files: scan.files, residentRecords: scan.reopened?.residentRecords ?? [:])
+        Task {
+            openFailed = await scan.reconnect(device, open: { try await ScanArchiveSource.open($0, guarding: entries) }) == .unavailable
+        }
     }
 
     private func watch(for device: BlockDevice) async {

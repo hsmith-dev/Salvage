@@ -318,7 +318,7 @@ The spec's sample High sentence ended "and wasn't overwritten". I didn't use tha
 5. A saved scan with no checkpoint (stopped before mapping) can never be reconnected.
 6. Each reopening carries a token, so a reconnect that finishes after another scan or saved scan replaced it is closed and dropped.
 
-**Privacy warning.** It appears once, in the save panel's message ("This file lists the names of the files Salvage found."), and is defined once as `ScanArchive.privacyNotice`. The package stores what the spec asks for ("every `RecoveredFile`"). Besides names and paths, that includes `rawRecord` (metadata record bytes; for carved files, their first 64 bytes) and NTFS resident data (the contents of very small files). The warning mentions only names. A reviewer may want the wording widened or those fields dropped.
+**Privacy warning.** It appears once, in the save panel's message, and is defined once as `ScanArchive.privacyNotice`. Version 1 stored `rawRecord` (metadata record bytes; for carved files, their first 64 bytes) and NTFS resident data while the warning mentioned only names. Format version 2 drops all file content and the wording now matches what remains (see the follow-up below).
 
 **Commands.** File → **Open Scan…** (⇧⌘O) and **Save Scan…** (⌘S) live in `Salvage/Views/ScanArchiveCommands.swift`, reaching the window's scan through `focusedSceneValue`. The dashboard also has a **Save Scan…** button.
 - Without a UTI declaration (that would need an Info.plist entry in `project.yml`, which this item doesn't own), macOS treats the package as an ordinary folder. The open panel therefore allows choosing folders and validates the `.salvagescan` extension.
@@ -332,7 +332,7 @@ The spec's sample High sentence ended "and wasn't overwritten". I didn't use tha
 - `docs/USER-GUIDE.md`: a new section, "Save and reopen a scan".
 - `Salvage.xcodeproj` regenerated.
 
-**Known limitation (important).** `BlockDevice.mediaIdentity` is the IORegistry entry ID. It is stable only while the drive stays attached during one boot; unplugging the drive or restarting the Mac gives it a new ID. Because identity matching is mandatory, a saved scan reconnects only while the drive has stayed connected, for example after quitting and reopening Salvage. After a replug it is refused, safely, and the user must scan again. Making the "rescan takes hours" case work across replugs needs a stable identity, such as a disk or partition-table UUID or a media serial number, from SalvageDiskIO. That is a decision for the spec owner.
+**Known limitation (important; resolved by the follow-up below for drives with a stable identity).** `BlockDevice.mediaIdentity` is the IORegistry entry ID. It is stable only while the drive stays attached during one boot; unplugging the drive or restarting the Mac gives it a new ID. Because identity matching is mandatory, a saved scan reconnects only while the drive has stayed connected, for example after quitting and reopening Salvage. After a replug it is refused, safely, and the user must scan again. Making the "rescan takes hours" case work across replugs needs a stable identity, such as a disk or partition-table UUID or a media serial number, from SalvageDiskIO. That is a decision for the spec owner.
 
 **Tests.**
 - `SalvageTests/ScanArchiveTests.swift` (14 tests): 100k-file round trip; every outcome and notice; version rejection in JSON and binary; damaged and foreign packages and truncation; no key material; reopened state; reconnecting the same device; refusing another identity, a missing identity, another size or a boot volume without opening it; refusing a changed layout and closing its session; a scan without a checkpoint; a failed open; a real `ScanSession` scan saved, reopened and reconnected end to end; reconnects superseded by a new archive or scan; the privacy sentence.
@@ -348,3 +348,84 @@ The spec's sample High sentence ended "and wasn't overwritten". I didn't use tha
   - **Interference.** Four failures came from other agents' Salvage UI tests running at the same time. Every worktree builds the same bundle ID, so concurrent runs launch and terminate each other's apps and windows. Another session's Xcode also held the foreground throughout.
   - **A real bug.** Run 1 and the runs from the gated retry onward also failed at Reconnect. That was a bug of mine: the banner was first a top `safeAreaInset`, which pushed the File Browser's header and the Reconnect button out of the window (the button's frame was about 280 pt above the window). It is now a plain `VStack` row, and the test asserts the button is hittable.
   - The test re-activates Salvage before clicks and presses Reconnect a second time if the first click was lost. A second press is harmless.
+
+### Follow-up: reconnecting after a replug, and no file contents (format version 2)
+
+**Stable identity.** `BlockDevice` gained an optional `stableIdentity` (a small `StableIdentity` value type nested in `BlockDevice.swift`, defaulted nil; `requiringUnlock` carries it). `SalvageDiskIO/StableDiskIdentity.swift` reads it from metadata only, and `DeviceWatcher.enumerateDevices` fills it in. It never opens or reads the device.
+- **GPT:** the disk GUID. On this macOS it is the `UUID` property of the `IOGUIDPartitionScheme` child of the whole disk's IOMedia. The whole disk's DiskArbitration description has no `DAMediaUUID`, and its IOMedia has no `UUID`. A test checks the value against the GUID in the image's GPT header.
+- **MBR, or no partition table:** macOS publishes no MBR disk signature, neither in the description nor on `IOFDiskPartitionScheme` (checked on this machine), and hdiutil's MBR images have a zero signature anyway. Reading the signature would need raw I/O before the checks. The identity uses each volume's offset (IOMedia `Base`) and its `DAVolumeUUID` instead, which comes from the filesystem's own serial number or UUID.
+- **Also recorded:** size, model (`DADeviceModel`) and serial number (`USB Serial Number` / `kUSBSerialNumberString`, `Device Characteristics` → `Serial Number`, or `Serial Number`).
+- **No identity:** a drive with no GPT GUID and no volume UUIDs has none.
+
+**Matching rule** (`ScanArchive.admits`, before anything is opened):
+- Not the boot volume, and the same size.
+- Then either the same media identity (as before), or both sides have a stable identity that matches (`sameDrive`):
+  - the same size;
+  - the same serial number when both report one;
+  - the same GPT GUID, or, without a GPT, the same non-empty list of volume offsets and UUIDs.
+- The model is recorded but not compared.
+- After opening, the fresh extent fingerprint must still match exactly, or the session closes at once (unchanged).
+- Version 1 packages have no stable identity. They are read with `stableIdentity` forced to nil, so they fall back to media identity only.
+
+**No file contents.** `Files.bin` and `Info.json` are version 2. Version 1 is still read; any other version is refused.
+- A v2 record has no `rawRecord` blob, and content kind 1 (resident bytes) is never written.
+- **Resident data:** a fresh scan's NTFS resident file is saved as content kind 4: the MFT record size plus device runs that hold the value inside its record (`NTFSResidentData.runs`). The update-sequence fixup means a stride tail's real two bytes live in the record's update-sequence array, so those runs point at the array slot. At save time the runs are checked by rebuilding the value from the fixed-up record. A resident file that can't be located this way is saved as unmapped.
+- **Reopening:** kind 4 becomes `.runs`, plus `ScanArchive.residentRecords` (file ID → record size). The view model holds only files, so `ReopenedArchives` keeps that map by the reopening's token, for the reconnect and for a later re-save.
+- **On reconnect:** the banner wraps the session's reader in `ResidentRecordGuard`. Before any read touching a resident file's record is served, `NTFSResidentData.revalidate` re-reads the volume's boot sector and that record. It parses them with the existing `NTFSGeometry`/`applyNTFSFixup`/`NTFSRecord`, and requires all of the following:
+  - the same record number, name, modified date and deleted state;
+  - no attribute list;
+  - a resident, uncompressed unnamed `$DATA` of the saved size;
+  - runs recomputed from the record equal the saved ones;
+  - the bytes at those runs equal the parsed value.
+
+  A record that fails makes overlapping reads throw `ScanError.io("Rescan to recover this file.")`. The recovery and preview code (not owned here) shows that as a generic read failure. Verdicts are cached per session.
+- **Carved files** keep only their runs. Their first 64 bytes are gone, which `FileDetails` used to tell apart signatures sharing an id and extension. For a reopened scan it falls back to the first candidate. Nothing else reads `rawRecord`.
+- **Privacy text:** "This file lists the names, folders, sizes and dates of the files Salvage found, and where each one is on the drive. It doesn't contain the files themselves."
+
+**Known gaps.**
+- A resident file's content can change without its name, date or size changing, and that isn't detected. Storing a hash of the content would leak information about it. This is the same exposure as any non-resident file's clusters.
+- After a replug the view model's `device` keeps the saved BSD name: the sidebar's "Recover all files…" row matches by it (`ScanViewModel` isn't owned here). Recovery itself uses the session's device (the new BSD name) for destination safety.
+- Resident files now count as one to three fragments (`.runs`) for confidence, and File Details shows their runs instead of "Stored inside the filesystem record".
+
+**Tests.**
+- `SalvageTests/ScanArchiveTests.swift`:
+  - Existing tests are updated for v2 (no `rawRecord` or resident bytes after reading; version 3 refused; a v1 list under a v2 `Info.json` is damage).
+  - New suite "Saved scans: stable identity and privacy" (5 tests): the matching rule for GUID, serial, size and volumes; the v2 identity round trip and the v1 fallback (a replugged drive is refused for a v1 package and accepted for v2; a changed layout still closes).
+  - The privacy test: a real `ScanSession` over an NTFS image with a resident file whose data crosses a stride tail, plus a carved PDF, both containing a unique marker. It greps every package byte for the marker (raw, UTF-16LE, base64), the text, the PDF header and "FILE0", then reconnects and reads both files byte for byte through the guard.
+  - The changed-record test: a different size, or a renamed record, is refused while other files still read.
+  - New suite "Saved scans reconnect after a replug" (GPT exFAT and MBR exFAT, real hdiutil images in a temp dir, attached `-nomount`, detached and deleted afterwards). It covers: scan via `RawBlockReader`; save; detach; re-attach (new /dev/diskN and media identity, same stable identity); reconnect through `ScanArchiveSource.open`; all three files byte-identical. A second image with the same size, layout and files is refused without being opened.
+- `SalvageDiskIO/Tests/SalvageDiskIOTests/StableDiskIdentityTests.swift` (4 tests): the pure identity rules; a live GPT image's GUID equals its header's and survives re-attaching; a live MBR image is identified by its volume UUID (as `diskutil` reports it), and another image's differs.
+- `SalvageCore/Tests/SalvageCoreTests/ExtentFingerprintTests.swift` (+2 tests, 6 cases): resident runs read the fixed-up value from the raw record (including across a stride tail); non-resident or damaged records yield none.
+
+**Verification.**
+- `swift test`: SalvageCore 429 tests passed; SalvageDiskIO 183 passed.
+- The three check scripts passed.
+- The Debug `SalvageTests` run passed (233 tests).
+- `build-for-testing` (ad-hoc signing) and the Release build succeeded.
+- The `SalvageUITests` suite was not run (the lead runs it centrally).
+
+### Review fixes (second commit on p7-archive)
+
+1. **Media identity can't override a stable identity, and counts only within one boot.** `admits` now requires `sameDrive` whenever both sides have a stable identity, even when the media identity is equal (IORegistry IDs restart each boot and can be reused). Without stable identities on both sides, only an equal media identity counts. `Info.json` v2 records `bootSessionUUID` (`kern.bootsessionuuid`). `ScanArchive.read(from:boot:)` drops a saved media identity from another boot. A version 1 package has no session UUID, so its media identity is kept only when `savedAt` is after `kern.boottime`.
+2. **GPT drives also match by volume UUIDs.** `StableIdentity.volumes` (offset plus `DAVolumeUUID`) is now recorded for every drive and must be equal in `sameDrive`, so a volume erased in place to the same format (same GUID, same extents) is a different drive. `ExtentFingerprint`'s doc comment now says what the fingerprint does and doesn't catch. A live test patches the exFAT serial (and boot checksum) on a copy of the image file. It confirms the GUID and offset are the same, the volume UUID differs, and the drive is refused without being opened.
+3. **MFT records that straddle `$MFT` runs.** `NTFSResidentData.revalidate` now locates record N through `$MFT`'s own run list, read from its record 0. It requires the whole record to lie in one run starting at the saved record offset. A straddling record (its saved runs assumed contiguity) is refused: "Rescan to recover this file." Test: 512-byte clusters, 1 KiB records, `$MFT` in runs (16, 33) and (120, 31). Record 16's file is refused on reconnect and record 17's reads.
+4. **Confidence unchanged by save and reopen.** `RecoveredFile.liesInsideOwnNTFSRecord` (in `RecoveryConfidence.swift`) counts an NTFS metadata file whose runs all lie within 64 KiB (the largest MFT record) past its own record's start as one fragment. A non-resident file's data can't start inside its own record. This is a structural inference, because `RecoveredFile` carries no explicit marker.
+5. **Resident records live with the scan.** `ScanViewModel.ReopenedScan.residentRecords` is set by `openArchive` and written by `makeArchive`. The 16-entry `ReopenedArchives` side table is gone.
+6. **User-facing text and sidebar.**
+   - `RecoveryEngine.CopyFailure.needsRescan` and `PreviewUnavailableReason.needsRescan` show "Rescan to recover this file." for the guard's error.
+   - `ScanViewModel.reconnect` now sets `device` to the reconnected candidate, so the sidebar's "Recover all files…" row, the dashboard's partitions and a later save all use the drive as attached now (new BSD name, media identity and partition names).
+
+Edits outside the earlier file list, as asked by review:
+- `ScanViewModel.swift` (ReopenedScan field, `makeArchive`, `reconnect`);
+- `RecoveryConfidence.swift`;
+- `RecoveryCoordinator.swift`;
+- `PreviewLoader.swift`.
+
+- `SalvageCLI/Sources/SalvageCLIKit/RecoveryEngine.swift` re-copied (docs/CLI.md, Maintenance), since the engine gained `needsRescan`. The engine holds the "Rescan to recover this file." text itself, so the CLI copy stays self-contained. `ScanArchive.rescanToRecover` refers to it.
+
+Verification of the fixes:
+- `swift test`: SalvageCore 429, SalvageDiskIO 183 and SalvageCLI 28 tests passed.
+- `check-core-boundary`, `check-no-network` and `check-xcodeproj-sync` passed.
+- The Debug `SalvageTests` run passed (236 tests).
+- `build-for-testing` and the Release build succeeded.
+- `SalvageUITests` was not run.
