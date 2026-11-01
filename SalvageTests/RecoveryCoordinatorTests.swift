@@ -83,6 +83,7 @@ private func recover(_ files: [RecoveredFile], reader: MemoryReader, into url: U
     let coordinator = RecoveryCoordinator(files: files, content: FileContentReader(reader: reader, chunkSize: chunk),
                                           deviceName: "Fixture", now: { Date(timeIntervalSince1970: 0) },
                                           sync: sync, destinationCheck: checked(verdict))
+    coordinator.setSaveReport(false)  // these tests check exact folder contents; RecoveryReportTests covers the report
     await coordinator.chooseDestination(url)
     coordinator.start()
     await coordinator.waitUntilFinished()

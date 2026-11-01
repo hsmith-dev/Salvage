@@ -482,7 +482,9 @@ struct PartitionSummaryTests {
         print("E2E: \(RecoverySummaryView.headline(summary, sourceName: coordinator.sourceLabel)) into \(summary.root.lastPathComponent)")
         // Same folders, same files (live and deleted), byte for byte.
         let expected = live.merging(doomed) { first, _ in first }
+        let report = Set(summary.attachments.map(\.lastPathComponent))  // the recovery report (batch 7 §D)
         let recovered = regularFiles(under: summary.root).filter { !ResultsViewModel.isSystemFile(found("/" + $0, volume: 0)) }
+            .filter { !report.contains($0) }
         #expect(Set(recovered) == Set(expected.keys))
         for (path, data) in expected {
             #expect(try Data(contentsOf: summary.root.appendingPathComponent(path)) == data, "\(path) differs")

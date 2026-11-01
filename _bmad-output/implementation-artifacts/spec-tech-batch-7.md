@@ -253,3 +253,49 @@ The spec's sample High sentence ended "and wasn't overwritten". I didn't use tha
   - **Interference.** Other agents ran UI tests for the same bundle ID (`dev.hsmith.Salvage`) at the same time, with load averages near 50. In those runs XCUITest reported other Salvage windows as interrupting elements. Clicks took up to 19 s to synthesize, one runner restarted after a timeout, and one scan didn't finish within 90 s.
   - **Real bug found.** Three consecutive failures at the preview step were not interference: clicking the disclosure didn't open it. That was fixed with the button label described above.
   - **Passing run.** The passing run waited until no other Salvage or UI-test runner process was alive. It still reported one interrupting Salvage window at the start.
+
+## Implementation Notes — D
+
+**Shape.** `Salvage/ViewModels/RecoveryReport.swift` (new) builds the report from the selected files and the engine's `RecoverySummary`. The report has one row per selected file, in selection order: recovered, failed with its reason, or not attempted after a cancel. Its header totals come from the summary, so they can't disagree with the summary. It produces the CSV and JSON bytes. The engine writes them.
+
+**Engine (additive edits in `RecoveryCoordinator.swift`, above `// MARK: - Coordinator`).**
+- `RecoveredCopy.fileID` pairs each copy with its file. Matching by path would be ambiguous, because duplicate paths happen.
+- `RecoverySummary` gains `attachments` (the URLs written) and `attachmentFailure`.
+- A new `RootAttachment` type, plus an optional `attachments:` closure on `RecoveryEngine.run`. The engine calls it with the finished summary, including after a cancel, and writes each file through the new `RecoveryEngine.writeAttachment`.
+- `writeAttachment` follows the same rules as a recovered file:
+  - the name goes through `RecoveryPaths.sanitize` and the path-length check;
+  - the file is written relative to the open root descriptor, and the root is confirmed by `(st_dev, st_ino)`;
+  - the temporary file is created with `O_CREAT | O_EXCL | O_NOFOLLOW`, then durably synced;
+  - the same `publish` makes it visible, so an existing name is never replaced or followed. A recovered file that is itself called `Salvage Recovery Report.csv` pushes the report to `… (2).csv`;
+  - on failure, the `.partial` file is removed.
+
+  A failed report write doesn't fail the recovery. The summary shows "The recovery report couldn't be saved. <reason>".
+- `RecoveryCoordinator` gets `saveReport` (on by default), changed with `setSaveReport(_:)` only before a run starts. It also gets an optional `device:` for the header; the `SourceSession` convenience init passes it. The DEBUG fixture path in `ContentView` passes only the device name, so its report has no model or identifier line. I didn't edit `ContentView`, because it isn't D's file.
+
+**CSV.**
+- UTF-8 with a BOM and CRLF line ends.
+- A key/value header (app version and build, ISO 8601 date, source device, model, BSD identifier, size, the "Recovered from" partition label, recovery folder, totals), a blank line, then the table.
+- Fields are quoted per RFC 4180 when they contain a comma, quote, CR or LF, or have a leading or trailing space.
+- **Formula injection:** a value whose first character is `=` `+` `-` `@`, tab or CR gets a leading `'`. So does one that starts with one of these after leading spaces, or with a full-width `＝ ＋ － ＠`. NUL becomes U+FFFD.
+- The JSON is pretty-printed with sorted keys, `formatVersion: 1` and ISO 8601 dates. It keeps names exactly as found; only the CSV neutralizes formulas.
+
+**"Model".** `BlockDevice` has no separate model field: its `displayName` is the vendor and model string. So "Model" repeats the device name, and the header also carries the BSD name and size.
+
+**Sheet (`RecoverySheet.swift`).** One checkbox, "Save a report with the recovered files" (`recovery-report-toggle`). The summary gets a "Show Report" button (`recovery-show-report-button`), which opens the CSV in its default app, and the failure line above.
+
+**CLI.** `SalvageCLIKit/RecoveryEngine.swift` was re-copied with the documented `docs/CLI.md` command, and the drift test passes. I did not add `--report`. The report builder lives in the app target and uses `PartitionGrouping`, so the CLI would need a second copy or a move to a shared module, which isn't trivial. The CLI engine already supports `attachments:`, so adding the flag later is small.
+
+**Tests outside D's file list.**
+- `SalvageTests/RecoveryReportTests.swift` (new): CSV escaping, including hostile names parsed back with a strict RFC 4180 parser; JSON validity and agreement with the CSV; report totals equal to the summary; cancelled and not-attempted rows; no-overwrite through a recovered file that has the report's name; no-overwrite and no-follow through a pre-existing file and a symlink; containment of a `../` name; cleanup after a failed sync; the toggle defaults and locking.
+- `SalvageUITests/RecoveryReportUITests.swift` (new): the report is written by default and Show Report is offered; with the toggle off, no report is written. The test never presses Show Report, because that would open another app.
+- Two minimal edits to existing tests, because the report is on by default:
+  - `RecoveryCoordinatorTests`' shared `recover(…)` helper turns the report off, since those tests assert exact folder contents;
+  - `PartitionSummaryTests`' real-exFAT end-to-end test ignores the report files when comparing recovered files.
+
+**Verification.**
+- `swift test`: SalvageCore 410 tests passed, SalvageDiskIO 168 passed, SalvageCLI 28 passed (including the engine drift test).
+- `check-core-boundary`, `check-no-network` and `check-xcodeproj-sync` all passed. The Xcode project was regenerated with xcodegen 2.46.0.
+- The Debug `SalvageTests` run passed: 197 tests in 17 suites, including the new "Recovery report" suite.
+- The Release build succeeded.
+- `SalvageUITests/RecoveryReportUITests` passed, 2 of 2.
+- **Interference:** while other agents' UI test runners were driving the screen, `testRecoveryWritesReportByDefaultAndOffersShowReport` failed three times. Once it couldn't find the hit point for the device row; twice the sheet's toggle didn't appear in time. Each time the other test passed in the same run. After those runners exited, the test passed alone and then both passed together. I also raised the toggle wait from 5 s to 15 s.

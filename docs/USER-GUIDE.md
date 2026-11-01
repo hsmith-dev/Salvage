@@ -256,6 +256,29 @@ When the copy finishes, the summary says how many files were recovered and how m
 written. It lists any files that couldn't be recovered, with the reason. **Show in Finder** opens
 the folder. If you cancel partway, the summary also counts the files that weren't attempted.
 
+## Recovery report
+
+Each recovery also saves a record of what came back: `Salvage Recovery Report.csv` and
+`Salvage Recovery Report.json`, inside the new recovery folder, next to the files. To skip it,
+untick **Save a report with the recovered files** before you click **Recover**. It's on by default.
+
+- The report starts with the Salvage version, the date, the drive you recovered from and the
+  totals: files selected, recovered, failed and not attempted, and bytes written.
+- Then there's one row for every file you selected, including any that couldn't be recovered or
+  that weren't attempted because you cancelled. Each row has the file's original path, where it
+  was saved inside the recovery folder, its size, and the SHA-256 checksum of the bytes written.
+  It also has the confidence, how the file was found, whether it was deleted, reconstructed or
+  possibly incomplete, and where it was on the drive (filesystem, volume and record offset).
+- **Show Report** in the summary opens the CSV file. Spreadsheet apps open it directly.
+- If one of your recovered files is already called `Salvage Recovery Report.csv`, the report is
+  saved as `Salvage Recovery Report (2).csv` instead. Like recovered files, the report never
+  overwrites anything.
+- In the CSV, a value that starts with `=`, `+`, `-` or `@` gets a leading apostrophe, so a
+  spreadsheet shows a file name like `=SUM(A1).txt` as text and never runs it as a formula. The
+  JSON file keeps names exactly as they are.
+- The report lists the names and paths of your files. It's saved only in the folder you chose and
+  goes nowhere else.
+
 ## FileVault volumes
 
 Salvage can read a software-encrypted (FileVault) APFS volume. It decrypts the volume itself,

@@ -69,6 +69,11 @@ struct RecoverySheet: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
+            Toggle("Save a report with the recovered files",
+                   isOn: Binding(get: { coordinator.saveReport }, set: { coordinator.setSaveReport($0) }))
+                .toggleStyle(.checkbox)
+                .disabled(!coordinator.isConfirming)
+                .accessibilityIdentifier("recovery-report-toggle")
             Text("\(byteString(coordinator.totalBytes)) will be copied into a new folder inside the destination you choose. Nothing is written to the drive you're recovering from.")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -227,9 +232,18 @@ struct RecoverySummaryView: View {
                 .frame(maxHeight: 200)
             }
 
+            if let failure = summary.attachmentFailure {
+                Text("The recovery report couldn't be saved. \(failure)")
+                    .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+
             HStack {
                 Button("Show in Finder") {
                     NSWorkspace.shared.activateFileViewerSelecting([summary.root])
+                }
+                if let report = summary.attachments.first {
+                    Button("Show Report") { NSWorkspace.shared.open(report) }
+                        .accessibilityIdentifier("recovery-show-report-button")
                 }
                 Spacer()
                 Button("Done", action: onDone).keyboardShortcut(.defaultAction)
