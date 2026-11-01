@@ -64,7 +64,7 @@ struct TrustPanelView: View {
 
 enum TrustPanelCopy {
     static let reads = "Salvage reads only the drive you select. Before it scans, it unmounts that drive so nothing else can change it, then reads it in read-only mode. It doesn't look at your other drives, and it can't scan your startup drive while macOS is running from it."
-    static let writes = "Salvage never writes anything to the drive it scans. When you recover files, it saves copies only to a folder you choose, and nowhere else. A scan on its own saves nothing."
+    static let writes = "Salvage never writes anything to the drive it scans. When you recover files, it saves copies only to a folder you choose, and nowhere else. When you image a drive, it saves the image and its list of unreadable areas only to the file you choose, on another drive. A scan on its own saves nothing."
     static let network = "Salvage connects to the internet only when you choose Check for Updates. It then asks GitHub for the version number of the newest Salvage release. That request contains nothing about you, your Mac, or your drives, though like any website GitHub can see your internet address. Salvage never downloads or installs anything. If a newer version exists, it can open the release page in your web browser. It never checks on its own, and Check for Updates is unavailable while a scan is running."
     static let telemetry = "Salvage collects no usage data, analytics, or crash reports, and there is no account to sign in to."
     static let afterScan = "The drive stays unmounted after a scan. To use it in Finder again, disconnect it and plug it back in."

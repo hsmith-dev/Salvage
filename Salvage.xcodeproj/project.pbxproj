@@ -23,6 +23,7 @@
 		2FD108EE2A5426F71CB91DF0 /* PartitionSummary.swift in Sources */ = {isa = PBXBuildFile; fileRef = E364E57A64DCAC59C9074615 /* PartitionSummary.swift */; };
 		35D156385907C3D8CBD6FAF6 /* ConfidenceLabel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9B3CBFEBAF88D26B71FD597C /* ConfidenceLabel.swift */; };
 		3F53290BFDE28BA33A144610 /* ImageSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5599FD8F6B70B6BFC5CC8E0 /* ImageSource.swift */; };
+		429C1C5AD8FC3A7EE54D0B72 /* ImageDriveSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2BBB9A3E311CACA269F756F3 /* ImageDriveSheet.swift */; };
 		46AFE6F0A945A97A98DA3C7F /* FileVaultUnlockSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCB9F0B50D00C384779EDE2C /* FileVaultUnlockSheet.swift */; };
 		4D398A0ADFE72188D424D15E /* ResultsDashboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 32F1F12AAAACFF6920FA4E1E /* ResultsDashboardView.swift */; };
 		4E4930C119561323B128C398 /* DeviceListViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99D08CCB19B88001DA0D7837 /* DeviceListViewModel.swift */; };
@@ -34,6 +35,7 @@
 		5ECDE4CDCE98C199F17C3DC5 /* FileDetails.swift in Sources */ = {isa = PBXBuildFile; fileRef = F488B001145B7FA242D79A4F /* FileDetails.swift */; };
 		66722FEAF35922CE34E58F2F /* FileDetailsUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC43AA2956FB8CEC04339818 /* FileDetailsUITests.swift */; };
 		680844754611EBBCB5945B3F /* TrustPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71F3E757E68865FD5D2FA447 /* TrustPanelView.swift */; };
+		6989FCCC51644ADA234D53B6 /* DriveImaging.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5FB3C27B68A5D9856A4A8FB /* DriveImaging.swift */; };
 		6A926703E084480718248DBB /* SourceSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 033C52D0FB3387397999220A /* SourceSession.swift */; };
 		6B36BAC9E4F5198FB84D405F /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = C6E7241D5AD37F29105C795E /* PrivacyInfo.xcprivacy */; };
 		6B72BE7198AFA1AD22773D13 /* UpdateChecker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A78CB2252556649B9DABE08 /* UpdateChecker.swift */; };
@@ -41,6 +43,7 @@
 		6C09923FBE34998BE106218D /* FileDetailsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD7A9D6DBF1CB9D732DF45E0 /* FileDetailsView.swift */; };
 		7258392A62CEBE52A5E50D56 /* FilePreviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E17D8A77B7537474A88104D /* FilePreviewView.swift */; };
 		73E0F92F5CB9AE58C3AB227D /* AppIconTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C504F6515FC245842FF3C263 /* AppIconTests.swift */; };
+		7402BC9637FB8BABEC8631EF /* DriveImagingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5BFE7E9C4FADC903DD203020 /* DriveImagingTests.swift */; };
 		74B11B07E7A978036AF8F18E /* UnlockViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1FC8E8A7A76780EA029855E8 /* UnlockViewModel.swift */; };
 		75CF67744D8200F5CEFB8E8A /* ResultsViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B552735CFF0ADC1F523CD01 /* ResultsViewModel.swift */; };
 		7B14EB76F7C371B58EEE4AC1 /* ScanArchiveTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBB926F161BB14C61854049C /* ScanArchiveTests.swift */; };
@@ -136,6 +139,7 @@
 		1FC8E8A7A76780EA029855E8 /* UnlockViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnlockViewModel.swift; sourceTree = "<group>"; };
 		200C8811715FB24AA7CA8091 /* DeviceListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceListView.swift; sourceTree = "<group>"; };
 		207452AAAA5C899682CD4D98 /* PrivilegedDiskQueries.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivilegedDiskQueries.swift; sourceTree = "<group>"; };
+		2BBB9A3E311CACA269F756F3 /* ImageDriveSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageDriveSheet.swift; sourceTree = "<group>"; };
 		32F1F12AAAACFF6920FA4E1E /* ResultsDashboardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResultsDashboardView.swift; sourceTree = "<group>"; };
 		3709825BAFDE3BFED067D1F2 /* dev.hsmith.Salvage.Helper.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = dev.hsmith.Salvage.Helper.plist; sourceTree = "<group>"; };
 		3A78CB2252556649B9DABE08 /* UpdateChecker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateChecker.swift; sourceTree = "<group>"; };
@@ -147,6 +151,7 @@
 		4819ECC045B83359DFD76CB0 /* SalvageUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SalvageUITests.swift; sourceTree = "<group>"; };
 		5482A784FE2B89690AB6EF74 /* PreviewLoaderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewLoaderTests.swift; sourceTree = "<group>"; };
 		549541C95F4646E67EF8911D /* UITestFixtures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UITestFixtures.swift; sourceTree = "<group>"; };
+		5BFE7E9C4FADC903DD203020 /* DriveImagingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DriveImagingTests.swift; sourceTree = "<group>"; };
 		5C0D0F9FA3E8E62AA8B12EE1 /* PrivilegedOpenProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivilegedOpenProtocol.swift; sourceTree = "<group>"; };
 		60831A6A039845291F0B3420 /* PartitionsSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PartitionsSection.swift; sourceTree = "<group>"; };
 		6EE1CBB0EF29CD529E222C75 /* ScanArchive.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScanArchive.swift; sourceTree = "<group>"; };
@@ -163,6 +168,7 @@
 		9B3CBFEBAF88D26B71FD597C /* ConfidenceLabel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfidenceLabel.swift; sourceTree = "<group>"; };
 		A242CDC4F6EB012427768849 /* UpdateCommands.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateCommands.swift; sourceTree = "<group>"; };
 		A5599FD8F6B70B6BFC5CC8E0 /* ImageSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageSource.swift; sourceTree = "<group>"; };
+		A5FB3C27B68A5D9856A4A8FB /* DriveImaging.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DriveImaging.swift; sourceTree = "<group>"; };
 		A7DB823E723D530B40CFA8B2 /* ScanArchiveCommands.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScanArchiveCommands.swift; sourceTree = "<group>"; };
 		A823EAB151C49C3DEBC69CF6 /* ScanCheckpointStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScanCheckpointStore.swift; sourceTree = "<group>"; };
 		A8BC066F58470D98B3D889DA /* OpenImageCommand.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenImageCommand.swift; sourceTree = "<group>"; };
@@ -244,6 +250,7 @@
 				C504F6515FC245842FF3C263 /* AppIconTests.swift */,
 				1C2D2ED0C4A1ED14B5FABCB6 /* DesignTokensTests.swift */,
 				E40E27E6E6443F51724D8027 /* DeviceListViewModelTests.swift */,
+				5BFE7E9C4FADC903DD203020 /* DriveImagingTests.swift */,
 				039ECC6AB2A66A87C8990558 /* FileDetailsTests.swift */,
 				E871C8A5E8EA4F5ADF5B1C3E /* ImageSourceTests.swift */,
 				0CE9048A70B014288771126E /* PartitionSummaryTests.swift */,
@@ -307,6 +314,7 @@
 				8E17D8A77B7537474A88104D /* FilePreviewView.swift */,
 				BCB9F0B50D00C384779EDE2C /* FileVaultUnlockSheet.swift */,
 				181533C1F6458A10898E049A /* HelperApprovalView.swift */,
+				2BBB9A3E311CACA269F756F3 /* ImageDriveSheet.swift */,
 				16A95B3E1FAD0DD697F774E3 /* LostPartitionsCard.swift */,
 				A8BC066F58470D98B3D889DA /* OpenImageCommand.swift */,
 				60831A6A039845291F0B3420 /* PartitionsSection.swift */,
@@ -353,6 +361,7 @@
 			isa = PBXGroup;
 			children = (
 				99D08CCB19B88001DA0D7837 /* DeviceListViewModel.swift */,
+				A5FB3C27B68A5D9856A4A8FB /* DriveImaging.swift */,
 				F488B001145B7FA242D79A4F /* FileDetails.swift */,
 				A5599FD8F6B70B6BFC5CC8E0 /* ImageSource.swift */,
 				E364E57A64DCAC59C9074615 /* PartitionSummary.swift */,
@@ -574,12 +583,14 @@
 				544C93F234E2D74C9554F6D4 /* DesignTokens.swift in Sources */,
 				82973B300A3833E3A4CAE166 /* DeviceListView.swift in Sources */,
 				4E4930C119561323B128C398 /* DeviceListViewModel.swift in Sources */,
+				6989FCCC51644ADA234D53B6 /* DriveImaging.swift in Sources */,
 				B7B0C2A5219E6799897814A2 /* FileBrowserView.swift in Sources */,
 				5ECDE4CDCE98C199F17C3DC5 /* FileDetails.swift in Sources */,
 				6C09923FBE34998BE106218D /* FileDetailsView.swift in Sources */,
 				7258392A62CEBE52A5E50D56 /* FilePreviewView.swift in Sources */,
 				46AFE6F0A945A97A98DA3C7F /* FileVaultUnlockSheet.swift in Sources */,
 				C7C0D2892751F06B6080B61C /* HelperApprovalView.swift in Sources */,
+				429C1C5AD8FC3A7EE54D0B72 /* ImageDriveSheet.swift in Sources */,
 				3F53290BFDE28BA33A144610 /* ImageSource.swift in Sources */,
 				1027B642F1C02B9E6BB77D81 /* LostPartitionsCard.swift in Sources */,
 				ED7FF70D95700B11D5234DBB /* OpenImageCommand.swift in Sources */,
@@ -613,6 +624,7 @@
 				73E0F92F5CB9AE58C3AB227D /* AppIconTests.swift in Sources */,
 				998B445F79379D4A401CC7CE /* DesignTokensTests.swift in Sources */,
 				D86AD77E4FE679401396EFA9 /* DeviceListViewModelTests.swift in Sources */,
+				7402BC9637FB8BABEC8631EF /* DriveImagingTests.swift in Sources */,
 				F5E8464D6D6A84FE7DD21DBA /* FileDetailsTests.swift in Sources */,
 				97888E8DFF91BCCC70E558AA /* ImageSourceTests.swift in Sources */,
 				04A038799D0197C4393FDF37 /* PartitionSummaryTests.swift in Sources */,

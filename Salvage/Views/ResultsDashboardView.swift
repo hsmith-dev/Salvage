@@ -80,7 +80,8 @@ struct ResultsDashboardView: View {
                     Text(statusLine).foregroundStyle(.inkSecondary)
                         .accessibilityIdentifier("results-status")
                 }
-                Button("Save Scan…") { ScanArchiveActions.save(scan) }.disabled(!scan.canSaveArchive).accessibilityIdentifier("save-scan")
+                HStack { Button("Save Scan…") { ScanArchiveActions.save(scan) }.disabled(!scan.canSaveArchive).accessibilityIdentifier("save-scan")
+                    ImageDriveButton(scan: scan) }
                 if case .failed(let error) = scan.state {
                     VStack(alignment: .leading, spacing: 8) {
                         Text(error.description).textSelection(.enabled)

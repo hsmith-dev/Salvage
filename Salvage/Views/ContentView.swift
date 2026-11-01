@@ -56,6 +56,8 @@ struct ContentView: View {
         return result
     }
     @State private var showsTrust = false
+    /// spec-tech-image-drive: this window's "Image This Drive…" run.
+    @State private var imaging = DriveImagingCenter()
     @State private var partitionRequest: PartitionRecoveryRequest?
     /// Story 2.4/2.5: the FileVault unlock sheet, offered before scanning a device the picker knows
     /// is locked, and after a scan that met encrypted volumes. A correct credential re-scans the
@@ -66,7 +68,8 @@ struct ContentView: View {
         NavigationSplitView {
             DeviceListView(isScanning: scan.isActive, activeDeviceID: scan.device?.id,
                            finishedScanDevice: scan.deviceWithFinishedResults,
-                           onRecoverPartition: { partitionRequest = PartitionRecoveryRequest(partition: $0) }) { device in
+                           onRecoverPartition: { partitionRequest = PartitionRecoveryRequest(partition: $0) },
+                           onImageDrive: { imaging.begin($0, session: scan.source) }) { device in
                 if !unlock.offerBeforeScan(device) { startAfterPendingUnlock(device) }
             }
             .navigationSplitViewColumnWidth(min: 220, ideal: 280)
@@ -85,7 +88,7 @@ struct ContentView: View {
         }
         // Closing the window stops the scan but keeps its checkpoint; only Cancel scan discards it.
         // The unlock flow's keys go with the window (the session's own are dropped as it closes).
-        .onDisappear { scan.stopForTeardown(); unlock.tearDown() }
+        .onDisappear { scan.stopForTeardown(); unlock.tearDown(); imaging.tearDown() }
         .toolbar {
             Button("What Salvage reads and writes", systemImage: "info.circle") { showsTrust = true }
         }
@@ -94,6 +97,12 @@ struct ContentView: View {
         // Every scan's encrypted volumes, each once per flow (queued by the model).
         .onChange(of: scan.endedAt) { _, ended in if ended != nil, !scan.isActive { unlock.offer(fromScan: scan.unlockRequests) } }
         .focusedSceneValue(\.scanArchiveTarget, scan)
+        .focusedSceneValue(\.driveImagingTarget, imaging)
+        .environment(\.driveImaging, imaging)
+        .sheet(item: $imaging.active) { model in
+            ImageDriveSheet(model: model, onChooseAgain: { imaging.chooseAgain(session: scan.source) },
+                            onDone: { imaging.dismiss() })
+        }
         .frame(minWidth: 760, minHeight: 480)
     }
 

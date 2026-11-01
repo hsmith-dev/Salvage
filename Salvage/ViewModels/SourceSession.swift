@@ -23,6 +23,9 @@ final class SourceSession: @unchecked Sendable {
     /// The unlocked volumes' decryptors; empty once closed.
     var decryptors: [String: any ContentDecryptor] { lock.withLock { keys } }
 
+    /// True once `close()` has begun; the reader may fail any read from then on.
+    var isClosed: Bool { lock.withLock { closed } }
+
     var content: FileContentReader { FileContentReader(reader: reader, decryptors: decryptors) }
 
     func close() async {

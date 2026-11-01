@@ -395,6 +395,64 @@ The supported types are in the [README](../README.md#what-it-can-read). Office 2
 (docx/xlsx/pptx) are ZIP containers, so they are reconstructed as `.zip`. Older Office files are
 saved as `.doc`.
 
+## Make an image first (failing drives)
+
+A drive that clicks, disconnects by itself, reads very slowly or reports read errors may not last
+long. Every scan, preview and recovery reads it again. The safer order is to copy the whole drive
+**once** into an image file on another drive, put the failing drive away, and then scan the image
+as many times as you need.
+
+1. Control-click the drive in the left column and choose **Image This Drive…**. You can also choose
+   **File > Image This Drive…** for the drive you last selected, or click **Image This Drive…** on
+   its results.
+2. In the save panel, choose a folder on a **different drive** with at least as much free space
+   as the whole drive (the panel says how much), and a name ending in `.img`. Click **Image**.
+3. The sheet shows the bytes copied, the speed, the time remaining and how many areas couldn't be
+   read so far. Copying a large drive takes hours. It runs at the drive's own speed.
+4. When it finishes, click **Open Image**. The image appears under **Disk images**. Click it to
+   scan it, as described in [Scan a disk-image file](#scan-a-disk-image-file).
+
+Salvage only reads the drive. It never writes to the drive. It opens the drive the same way as for
+a scan, so the drive's volumes are unmounted first and your startup drive is refused. Disconnect
+the drive when the image is done.
+
+What Salvage refuses before it copies anything:
+
+- a destination on the drive you are imaging ("This destination is on the drive you're imaging.
+  Choose a folder on a different drive.");
+- a destination without enough free space ("The image needs … of free space, but the destination
+  has only …");
+- a destination formatted MS-DOS (FAT) when the drive is larger than 4 GB, because FAT can't hold
+  a file that large;
+- an existing file, unless you agreed to replace it in the save panel. A file that is the disk
+  image behind an attached drive is never replaced, even then. The space a replaced file takes
+  up isn't counted as free.
+
+**Unreadable sectors.** Salvage reads the drive in 4 MB pieces. When a piece can't be read, Salvage
+reads it again in smaller pieces, down to single 512-byte sectors, so as little as possible is
+lost. What still can't be read is written to the image as zeros, so everything after it stays at
+the right place. Once more than 32 KB in a row couldn't be read, Salvage stops retrying single
+sectors and reads the rest of that area in 64 KB pieces until something reads again. That keeps a
+badly damaged drive from taking days.
+
+**A drive that returns nothing.** When 64 MB in a row can't be read, Salvage checks whether the
+drive is still connected and stops, with "The drive stopped returning data" (or that the drive was
+removed). The image keeps everything up to that point.
+
+The unreadable areas are listed in the summary and in a file saved next to the image,
+`<name>.img.badblocks.json`. That file lists their byte offsets on the drive, the number of bytes
+copied, whether the copy finished, and the image's SHA-256 checksum (only for a finished copy). It
+holds no file contents.
+
+**If the drive stops responding.** A read that hasn't returned after two minutes stops the copy,
+with "The drive stopped responding". macOS can't interrupt a read that is stuck in the drive, so
+Salvage stops waiting instead of hanging. Disconnect and reconnect the drive before you try again.
+
+**Cancel.** Click **Cancel** to stop after the current read. The image file is kept but holds only
+the first part of the drive. The summary says how much ("The image file holds only the first … of
+…"), and so does the `.badblocks.json` file. You can still scan the partial image, but Salvage finds
+only what lies in the copied part. To get a full copy, image the drive again.
+
 ## Scan a disk-image file
 
 You can scan a disk image file, such as a backup of a memory card or a copy of a failing drive,
