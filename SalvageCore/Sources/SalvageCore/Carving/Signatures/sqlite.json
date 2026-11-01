@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "sqlite",
+  "extension": "sqlite",
+  "category": "other",
+  "header": "53514C69746520666F726D6174203300",
+  "sizeField": {
+    "offset": 28, "width": 4, "endian": "big",
+    "scale": { "offset": 16, "width": 2, "endian": "big", "oneMeans": 65536 }
+  },
+  "maxBytes": 17179869184,
+  "notes": "Size = page count (offset 28) times page size (offset 16, where 1 means 65536)."
+}

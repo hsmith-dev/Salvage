@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "mp4",
+  "extension": "mp4",
+  "category": "videos",
+  "headerOffset": 4,
+  "header": "6674797069736F6D",
+  "alternateHeaders": ["6674797069736F32", "667479706D703431", "667479706D703432", "6674797061766331", "667479704D345620", "6674797064617368", "667479706D703731", "667479704D534E56", "667479703367703?"],
+  "segments": {
+    "start": 0,
+    "size": { "offset": 0, "width": 4, "endian": "big" },
+    "minimum": 8,
+    "typeOffset": 4,
+    "typeLength": 4,
+    "typePrintable": true,
+    "largeSize": { "ifValue": 1, "offset": 8, "width": 8 }
+  },
+  "maxBytes": 17179869184,
+  "notes": "ISO-BMFF brands isom, iso2, mp41, mp42, avc1, M4V, dash, mp71, MSNV, 3gpN. A trailing box with size 0 (to end of file) ends the walk before that box."
+}

@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "id": "avi",
+  "extension": "avi",
+  "category": "videos",
+  "header": "52494646????????41564920",
+  "sizeField": { "offset": 4, "width": 4, "endian": "little", "adjust": 8 },
+  "maxBytes": 4294967304
+}

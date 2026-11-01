@@ -319,6 +319,55 @@ struct ResultsViewModelTests {
         #expect(model.visibleRows.count == 11)
     }
 
+    /// A file the carving engine produced (Story 3.1): generated name under /Reconstructed/<Type>/.
+    func carved(_ name: String, type: String = "Pictures", size: Int64 = 100, partial: Bool = false,
+                overwrite: Double = 0, offset: Int64 = 4096) -> RecoveredFile {
+        RecoveredFile(name: name, path: "/Reconstructed/\(type)/\(name)", sizeBytes: size,
+                      sourceMetadata: SourceMetadata(filesystem: .carved, volumeOffset: 0, recordOffset: offset,
+                                                     allocationStart: UInt64(offset), contiguous: true, rawRecord: Data()),
+                      content: .runs([DataRun(deviceOffset: offset, length: size)]), recoveryMethod: .carved,
+                      isPartial: partial, overwriteConfidence: overwrite)
+    }
+
+    @Test func reconstructedFilesAreGroupedAfterFilesystemFilesAndCountedPerBucket() async {
+        let model = ResultsViewModel(files: [
+            carved("jpeg-000000001000.jpg", size: 30), file("b.jpg", size: 10),
+            carved("jpeg-000000000800.jpg", size: 20, partial: true, overwrite: 0.6, offset: 2048), file("a.jpg", size: 40),
+            carved("zip-000000002000.zip", type: "Archives", size: 50, offset: 8192), file("lost.jpg", content: .unmapped),
+        ])
+        await model.refresh()
+        #expect(model.visibleRows.map(\.name) == ["a.jpg", "b.jpg", "lost.jpg", "jpeg-000000000800.jpg", "jpeg-000000001000.jpg", "zip-000000002000.zip"])
+        #expect(model.visibleReconstructedCount == 3)
+        #expect(model.visibleRows.prefix(3).allSatisfy { !$0.isReconstructed } && model.visibleRows.suffix(3).allSatisfy(\.isReconstructed))
+        #expect(model.visibleRows.map(\.confidence) == [.high, .high, nil, .low, .medium, .medium])
+        #expect(model.visibleRows.map(\.isPartial) == [false, false, false, true, false, false])
+        #expect(model.visibleRows.allSatisfy { !($0.isReconstructed && $0.confidence == .high) })
+        #expect(model.visibleRows.allSatisfy { !$0.isSystemFile })
+
+        // Buckets count reconstructed files in their totals and say how many they are.
+        let buckets = Dictionary(uniqueKeysWithValues: model.buckets.map { ($0.category, $0) })
+        #expect(buckets[.pictures]?.count == 4 && buckets[.pictures]?.reconstructedCount == 2 && buckets[.pictures]?.totalBytes == 100)
+        #expect(buckets[.archives]?.count == 1 && buckets[.archives]?.reconstructedCount == 1)
+        #expect(buckets[.audio]?.reconstructedCount == 0)
+        #expect(model.reconstructedCount == 3 && model.recoverableCount == 5 && model.unrecoverableCount == 1)
+        #expect(ResultsViewModel.reconstructedCaption(2) == "(2 reconstructed)")
+        #expect(ResultsViewModel.reconstructedCaption(0) == nil)
+        #expect(ResultsViewModel.partialTag == "Partial — may be incomplete")
+
+        // Each section keeps the chosen sort; the filter applies to both.
+        model.sort = .init(field: .size, ascending: false)
+        await model.refresh()
+        #expect(model.visibleRows.map(\.name) == ["lost.jpg", "a.jpg", "b.jpg", "zip-000000002000.zip", "jpeg-000000001000.jpg", "jpeg-000000000800.jpg"])
+        model.category = .pictures
+        await model.refresh()
+        #expect(model.visibleRows.count == 5 && model.visibleReconstructedCount == 2)
+        #expect(model.browserTitle == "Pictures — 4 files, 1 can't be recovered")
+        model.searchText = "reconstructed"
+        await model.refresh()
+        #expect(model.visibleRows.map(\.name) == ["jpeg-000000001000.jpg", "jpeg-000000000800.jpg"])
+        #expect(model.visibleReconstructedCount == 2)
+    }
+
     @Test func confidenceLabelAnnouncesTheWord() {
         #expect(ConfidenceLabel(confidence: .high).accessibilityText == "Recovery confidence High")
         #expect(ConfidenceLabel(confidence: .low).accessibilityText == "Recovery confidence Low")

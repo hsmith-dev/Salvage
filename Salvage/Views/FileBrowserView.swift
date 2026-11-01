@@ -99,8 +99,10 @@ struct FileBrowserView: View {
         .accessibilityHidden(true)
     }
 
+    /// Reconstructed (carved) files are listed in their own section after the filesystem's files
+    /// (EXPERIENCE.md "Carved/reconstructed results"); a listing without any shows no sections.
     private var table: some View {
-        Table(model.visibleRows, selection: $model.selection, sortOrder: $sortOrder) {
+        Table(of: ResultsViewModel.Row.self, selection: $model.selection, sortOrder: $sortOrder) {
             TableColumn("") { (row: ResultsViewModel.Row) in
                 Toggle("Select \(row.name) for recovery", isOn: Binding(
                     get: { model.isChecked(row.id) },
@@ -114,6 +116,8 @@ struct FileBrowserView: View {
                 HStack(spacing: 6) {
                     Text(row.name).lineLimit(1).truncationMode(.middle)
                     if row.file.isDeleted { Text("Deleted").font(.caption).foregroundStyle(.secondary) }
+                    if row.isReconstructed { Text(ResultsViewModel.reconstructedSectionTitle).font(.caption).foregroundStyle(.secondary) }
+                    if row.isPartial { Text(ResultsViewModel.partialTag).font(.caption).foregroundStyle(.secondary) }
                 }
             }
             .width(min: 160, ideal: 240)
@@ -132,6 +136,15 @@ struct FileBrowserView: View {
             .width(min: 110, ideal: 150)
             TableColumn("Confidence") { row in ConfidenceLabel(confidence: row.confidence) }
                 .width(min: 90, ideal: 120)
+        } rows: {
+            let rows = model.visibleRows
+            let split = rows.count - model.visibleReconstructedCount
+            if model.visibleReconstructedCount == 0 {
+                ForEach(rows) { TableRow($0) }
+            } else {
+                Section(ResultsViewModel.filesystemSectionTitle) { ForEach(rows[..<split]) { TableRow($0) } }
+                Section(ResultsViewModel.reconstructedSectionTitle) { ForEach(rows[split...]) { TableRow($0) } }
+            }
         }
         .focused($tableFocused)
         // Space previews, like Quick Look: it shows a hidden preview and never hides a shown one.
@@ -174,6 +187,14 @@ struct FileBrowserView: View {
                     .accessibilityLabel(ConfidenceLabel(confidence: row.confidence).accessibilityText)
                     if !row.isRecoverable {
                         Text("Salvage couldn't locate this file's contents on the device.")
+                            .font(.subheadline).foregroundStyle(.secondary)
+                    }
+                    if row.isReconstructed {
+                        Text("Reconstructed from raw bytes by its file signature. No original name, folder or date is available.")
+                            .font(.subheadline).foregroundStyle(.secondary)
+                    }
+                    if row.isPartial {
+                        Text("\(ResultsViewModel.partialTag). This file could not be fully reconstructed; its end was not found.")
                             .font(.subheadline).foregroundStyle(.secondary)
                     }
                 }

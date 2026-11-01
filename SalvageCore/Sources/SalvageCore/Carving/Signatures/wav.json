@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "id": "wav",
+  "extension": "wav",
+  "category": "audio",
+  "header": "52494646????????57415645",
+  "sizeField": { "offset": 4, "width": 4, "endian": "little", "adjust": 8 },
+  "maxBytes": 4294967304
+}

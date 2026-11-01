@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "id": "ole",
+  "extension": "doc",
+  "category": "documents",
+  "header": "D0CF11E0A1B11AE1",
+  "maxBytes": 268435456,
+  "notes": "OLE2 compound document (Office 97-2003 .doc/.xls/.ppt, .msg). The total size needs the sector allocation table, so the carve runs to the next header or maxBytes and is partial."
+}

@@ -27,3 +27,10 @@
 - source_spec: `spec-1-7-1-8-browse-results-and-confidence.md`
   summary: Hands-on UI pass of scan → browse → preview → recover in the running app (keyboard shortcuts, Cmd-A precedence, pane layout).
   evidence: Every flow is unit-tested, and the app launches with 0 network sockets, but computer use wasn't available to drive the UI. The core path was validated headlessly on real macOS-created exFAT/FAT32 images: live and deleted files were recovered byte-identical.
+
+- source_spec: `spec-3-1-3-2-carve-and-organize-reconstructed-files.md`
+  summary: Fragmented carving (reassembly across non-contiguous runs) and format-aware end detection for MP3 (frame walk), OLE2 (sector allocation table) and gzip.
+  evidence: v1 carves one contiguous run per file (Intent: fragmented reassembly out of scope). MP3, gzip, OLE and RAR5 have no end rule in the schema, so every such carve is partial/Low and ends at the next header or maxBytes. Needs either new `segments` capabilities (MP3 frame-size arithmetic from the header bitrate/sample-rate bits) or a format-specific walker, which AD-6 discourages; decide with real test files.
+- source_spec: `spec-3-1-3-2-carve-and-organize-reconstructed-files.md`
+  summary: Surface carving diagnostics in the app: skipped signature files (`SignatureLibrary.skipped`), the carved-file cap (`SignatureCarver.hitFileLimit`), and complete the dashboard wording for reconstructed files.
+  evidence: Skipped signatures are only NSLogged; hitting maxCarvedFiles silently stops emission. `ResultsDashboardView`'s closing sentence ("indexed from intact metadata") and the tile accessibility label don't mention reconstructed files; the spec allowed only the "(n reconstructed)" caption line in that file.

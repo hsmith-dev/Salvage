@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "id": "rar",
+  "extension": "rar",
+  "category": "archives",
+  "header": "526172211A0700",
+  "footer": "C43D7B00400700",
+  "maxBytes": 4294967296,
+  "notes": "RAR 1.5-4.x with the archive-end block as footer."
+}
