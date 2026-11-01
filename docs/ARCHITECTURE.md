@@ -54,8 +54,9 @@ graph TD
 
 `.github/workflows/release.yml` (AD-10) runs on a `v*.*.*` tag. It signs with Developer ID,
 verifies the nested helper's identifier, Team ID, hardened runtime and timestamp, and checks the
-helper's SpawnConstraint team (`scripts/check-helper-signing-team.sh`). It then notarizes, staples
-and publishes the zip with a SHA-256 checksum.
+helper's SpawnConstraint team (`scripts/check-helper-signing-team.sh`). It then notarizes and
+staples the app, packages it with `scripts/package-release.sh` into a signed, notarized, stapled
+`Salvage-<version>.dmg`, and publishes it with `SHA256SUMS`. See [RELEASING.md](RELEASING.md).
 
 ## How a scan flows
 

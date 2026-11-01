@@ -1,8 +1,8 @@
 name: Release
 
 # Architecture AD-10: build, sign, and release pipeline. Triggered by a pushed version tag;
-# produces a Developer-ID-signed, notarized .app published to GitHub Releases with SHA-256
-# checksums -- never a silent partial success. If any required secret is missing, this workflow
+# produces a Developer-ID-signed, notarized .app, packaged in a signed, notarized, stapled
+# Salvage-<version>.dmg and published to GitHub Releases with a SHA256SUMS file -- never a silent partial success. If any required secret is missing, this workflow
 # fails loudly, naming the missing secret, before building or publishing anything.
 on:
   push:
@@ -175,14 +175,32 @@ jobs:
           xcrun stapler staple "$APP_PATH"
           spctl --assess --type execute --verbose=4 "$APP_PATH" || true
 
-      - name: Package release artifact and compute SHA-256 checksum
+      # spec-tech-batch-6 §E: package the signed, notarized, stapled app into
+      # Salvage-<version>.dmg (Salvage.app + an /Applications symlink, volume "Salvage <version>"),
+      # then sign, notarize and staple the DMG itself and write SHA256SUMS. The script re-checks the
+      # bundle layout (helper + launchd plist), that the app is signed by DEVELOPMENT_TEAM and
+      # stapled, and that its version equals the tag. Logic in scripts/package-release.sh, covered
+      # by scripts/test-package-release.sh (which runs it with --dry-run only).
+      - name: Package, sign, and notarize the release disk image
+        env:
+          DEVELOPMENT_TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
+          NOTARIZATION_API_KEY: ${{ secrets.NOTARIZATION_API_KEY }}
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/release"
-          release_zip="$RUNNER_TEMP/release/Salvage-${GITHUB_REF_NAME}.zip"
-          ditto -c -k --keepParent "$APP_PATH" "$release_zip"
-          (cd "$(dirname "$release_zip")" && shasum -a 256 "$(basename "$release_zip")" > "$(basename "$release_zip").sha256")
-          echo "RELEASE_ZIP=$release_zip" >> "$GITHUB_ENV"
+          version="${GITHUB_REF_NAME#v}"
+          release_dir="$RUNNER_TEMP/release"
+          ./scripts/package-release.sh --release --keychain "$KEYCHAIN_PATH" \
+            "$APP_PATH" "$version" "$release_dir"
+          echo "RELEASE_DMG=$release_dir/Salvage-$version.dmg" >> "$GITHUB_ENV"
+          echo "RELEASE_SUMS=$release_dir/SHA256SUMS" >> "$GITHUB_ENV"
+
+      - name: Verify the release disk image
+        run: |
+          set -euo pipefail
+          (cd "$(dirname "$RELEASE_SUMS")" && shasum -a 256 -c --strict SHA256SUMS)
+          codesign --verify --strict --verbose=2 "$RELEASE_DMG"
+          xcrun stapler validate "$RELEASE_DMG"
+          spctl --assess --type open --context context:primary-signature --verbose=4 "$RELEASE_DMG"
 
       - name: Publish GitHub Release
         env:
@@ -193,11 +211,11 @@ jobs:
           # already exist -- fall back to uploading the assets to it (overwriting any stale ones
           # from the earlier attempt) instead of failing outright.
           if ! gh release create "${GITHUB_REF_NAME}" \
-            "$RELEASE_ZIP" "$RELEASE_ZIP.sha256" \
+            "$RELEASE_DMG" "$RELEASE_SUMS" \
             --title "Salvage ${GITHUB_REF_NAME}" \
             --generate-notes; then
             echo "Release ${GITHUB_REF_NAME} already exists -- uploading assets to it instead."
-            gh release upload "${GITHUB_REF_NAME}" "$RELEASE_ZIP" "$RELEASE_ZIP.sha256" --clobber
+            gh release upload "${GITHUB_REF_NAME}" "$RELEASE_DMG" "$RELEASE_SUMS" --clobber
           fi
 
       - name: Clean up temporary signing keychain
