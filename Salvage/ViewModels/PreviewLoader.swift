@@ -153,7 +153,7 @@ struct PreviewLoader: Sendable {
             } catch let error as FileContentError {
                 if Task.isCancelled { throw CancellationError() }
                 switch error {
-                case .unmapped, .runsShorterThanFile, .runOutsideDevice: throw Unavailable(reason: .unmapped)
+                case .unmapped, .runsShorterThanFile, .runOutsideDevice, .locked, .decryptionFailed: throw Unavailable(reason: .unmapped)
                 }
             } catch {
                 if Task.isCancelled { throw CancellationError() }

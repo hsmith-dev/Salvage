@@ -23,9 +23,11 @@ public struct ScanSession: Sendable, Identifiable {
     /// `resumingFrom` re-runs metadata traversal (rebuilding discoveries) but skips sweep bytes the
     /// checkpoint already covered, counting them as scanned. A checkpoint that does not fit this
     /// device's volumes is ignored and the scan starts from zero.
+    /// `credentials` (by encrypted APFS volume UUID) unlock FileVault volumes; each records its outcome.
     public func run(events: AsyncStream<ScanEvent>.Continuation, pauseGate: ScanPauseGate? = nil,
                     checkpoints: AsyncStream<ScanCheckpoint>.Continuation? = nil,
-                    resumingFrom checkpoint: ScanCheckpoint? = nil, device: BlockDevice? = nil) async {
+                    resumingFrom checkpoint: ScanCheckpoint? = nil, device: BlockDevice? = nil,
+                    credentials: [String: VolumeCredential] = [:]) async {
         let emit: @Sendable (ScanEvent) async throws -> Void = { try await events.send($0) }
         // Byte ranges owned by files found through metadata; the carver skips them.
         let claimed = ClaimedRuns()
@@ -52,7 +54,7 @@ public struct ScanSession: Sendable, Identifiable {
             var parserFailed = Set<Int>(), unreadable = Set<Int>()
             for (index, extent) in extents.enumerated() {
                 do {
-                    try await scanVolume(extent, reader: measured, device: device, emit: { event in
+                    try await scanVolume(extent, reader: measured, device: device, credentials: credentials, emit: { event in
                         if case .found(let file) = event, case .runs(let runs) = file.content { await claimed.add(runs) }
                         try await emit(event)
                     })

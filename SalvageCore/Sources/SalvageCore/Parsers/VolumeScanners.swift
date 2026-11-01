@@ -32,15 +32,17 @@ enum VolumeFormat: Sendable, Equatable {
 }
 
 /// Runs the metadata parser for one volume. Parsers emit `.found`; APFS may also emit
-/// `.unlockRequired` for an encrypted volume (carrying `device` annotated with the volume).
+/// `.unlockRequired` for an encrypted volume (carrying `device` annotated with the volume) that
+/// `credentials` (by volume UUID) doesn't unlock.
 func scanVolume(_ extent: VolumeExtent, reader: any BlockReader, device: BlockDevice?,
+                credentials: [String: VolumeCredential] = [:],
                 emit: @escaping @Sendable (ScanEvent) async throws -> Void) async throws {
     let found: @Sendable (RecoveredFile) async throws -> Void = { try await emit(.found($0)) }
     switch extent.format {
     case .fat: try await FATVolume(reader: reader, extent: extent, emit: found).scan()
     case .ntfs: try await NTFSVolume(reader: reader, extent: extent, emit: found).scan()
     case .ext: try await EXTVolume(reader: reader, extent: extent, emit: found).scan()
-    case .apfs: try await APFSContainer(reader: reader, extent: extent, device: device, emit: emit).scan()
+    case .apfs: try await APFSContainer(reader: reader, extent: extent, device: device, credentials: credentials, emit: emit).scan()
     case .hfsPlus: try await HFSPlusVolume(reader: reader, extent: extent, emit: found).scan()
     case .raw: break
     }

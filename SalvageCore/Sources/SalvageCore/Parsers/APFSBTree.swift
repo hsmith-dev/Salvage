@@ -143,6 +143,8 @@ struct APFSTree: Sendable {
     let rootReference: APFSObjectReference
     let kind: APFSTreeKind
     let compare: @Sendable (Data, Data) -> Int
+    /// The root is ciphertext, read through the active volume key (an unlocked FileVault volume).
+    var rootIsEncrypted = false
 }
 
 /// A record at a leaf position: key, value, and where the value sits for `recordOffset`.
