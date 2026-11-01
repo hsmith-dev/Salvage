@@ -15,20 +15,25 @@ public struct ImageOutputError: Error, Sendable, Equatable, CustomStringConverti
 ///   opened folder), so a volume mounted over the path since the check can't receive the image;
 /// - the file is created new with `O_CREAT | O_EXCL | O_NOFOLLOW`, never through a symlink and
 ///   never by opening something that exists. An existing item is removed first only when the
-///   caller says the user confirmed replacing it (the save panel's own prompt), and only when it
-///   is a regular file;
+///   caller says the user confirmed replacing it (the save panel's own prompt), only when it is
+///   a regular file, and never when it is the backing file of an attached disk image (which
+///   could be the very drive being imaged): `protectedFiles`, compared by `(st_dev, st_ino)`.
+///   When that set is unknown (nil), no existing file is replaced;
 /// - the opened file must be a regular file.
 public final class ImageOutputFile: ImageSink, @unchecked Sendable {
     public let url: URL
     private let folder: Int32
     private let name: String
+    private let replacingConfirmed: Bool
+    private let protectedFiles: Set<FileIdentity>?
     private let lock = NSLock()
     private var fd: Int32
 
     public static let sidecarSuffix = ".badblocks.json"
     public var sidecarURL: URL { url.deletingLastPathComponent().appendingPathComponent(name + Self.sidecarSuffix) }
 
-    public init(creating url: URL, replacingConfirmed: Bool, checked: DestinationAssessment) throws {
+    public init(creating url: URL, replacingConfirmed: Bool, checked: DestinationAssessment,
+                protectedFiles: Set<FileIdentity>?) throws {
         let name = url.lastPathComponent
         guard url.isFileURL, !name.isEmpty, name != ".", name != "..", !name.contains("/") else {
             throw ImageOutputError("That file name can't be used for an image.")
@@ -42,7 +47,7 @@ public final class ImageOutputFile: ImageSink, @unchecked Sendable {
         }
         let opened: Int32
         do {
-            try Self.removeConfirmed(name, in: folder, confirmed: replacingConfirmed)
+            try Self.removeConfirmed(name, in: folder, confirmed: replacingConfirmed, protected: protectedFiles)
             let fd = openat(folder, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o644)
             guard fd >= 0 else {
                 throw ImageOutputError(errno == EEXIST ? "A file named “\(name)” already exists there. Choose another name."
@@ -61,6 +66,8 @@ public final class ImageOutputFile: ImageSink, @unchecked Sendable {
         self.url = url.deletingLastPathComponent().appendingPathComponent(name)
         self.folder = folder
         self.name = name
+        self.replacingConfirmed = replacingConfirmed
+        self.protectedFiles = protectedFiles
         self.fd = opened
     }
 
@@ -69,16 +76,25 @@ public final class ImageOutputFile: ImageSink, @unchecked Sendable {
         Darwin.close(folder)
     }
 
-    /// Removes an existing *regular file* the user agreed to replace; refuses anything else.
-    private static func removeConfirmed(_ name: String, in folder: Int32, confirmed: Bool) throws {
+    /// Removes an existing *regular file* the user agreed to replace; refuses anything else,
+    /// and refuses any attached disk image's backing file whether or not replacing was confirmed.
+    private static func removeConfirmed(_ name: String, in folder: Int32, confirmed: Bool,
+                                        protected: Set<FileIdentity>?) throws {
         var info = stat()
         guard fstatat(folder, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else {
             if errno == ENOENT { return }
             throw ImageOutputError("Couldn't check the destination: \(text(errno)).")
         }
+        let identity = FileIdentity(device: Int64(info.st_dev), inode: UInt64(info.st_ino))
+        if protected?.contains(identity) == true {
+            throw ImageOutputError("“\(name)” is the disk image behind an attached drive, so it can't be replaced. Choose another name.")
+        }
         guard confirmed else { throw ImageOutputError("A file named “\(name)” already exists there. Choose another name.") }
         guard info.st_mode & S_IFMT == S_IFREG else {
             throw ImageOutputError("“\(name)” already exists there and isn't a regular file, so it can't be replaced.")
+        }
+        guard protected != nil else {
+            throw ImageOutputError("Salvage couldn't check whether “\(name)” is the disk image behind an attached drive, so it wasn't replaced. Choose another name.")
         }
         guard unlinkat(folder, name, 0) == 0 else { throw ImageOutputError("Couldn't replace “\(name)”: \(text(errno)).") }
     }
@@ -104,8 +120,16 @@ public final class ImageOutputFile: ImageSink, @unchecked Sendable {
     public func synchronize() throws {
         let fd = lock.withLock { self.fd }
         guard fd >= 0 else { return }
-        // F_FULLFSYNC asks the drive to flush its own cache too; not every filesystem supports it.
-        if fcntl(fd, F_FULLFSYNC) != 0, fsync(fd) != 0 { throw ImageOutputError(Self.text(errno)) }
+        try Self.fullSync(fd)
+    }
+
+    /// F_FULLFSYNC asks the drive to flush its own cache too. Only a filesystem that doesn't
+    /// support it (ENOTSUP, EINVAL) falls back to fsync; any other failure is a real error.
+    static func fullSync(_ fd: Int32) throws {
+        if fcntl(fd, F_FULLFSYNC) == 0 { return }
+        let code = errno
+        guard code == ENOTSUP || code == EINVAL else { throw ImageOutputError("Couldn't flush the image to disk: \(text(code)).") }
+        guard fsync(fd) == 0 else { throw ImageOutputError("Couldn't flush the image to disk: \(text(errno)).") }
     }
 
     public func close() {
@@ -113,25 +137,46 @@ public final class ImageOutputFile: ImageSink, @unchecked Sendable {
         if fd >= 0 { Darwin.close(fd) }
     }
 
-    /// Writes the sidecar next to the image, created new like the image (a stale sidecar of a
-    /// replaced image is replaced too).
+    /// Writes the sidecar next to the image, created new like the image. A stale sidecar is
+    /// replaced only when replacing the image itself was confirmed.
     public func writeSidecar(_ report: ImagingReport) throws {
         let data = try report.encoded()
         let sidecar = name + Self.sidecarSuffix
-        try Self.removeConfirmed(sidecar, in: folder, confirmed: true)
+        try Self.removeConfirmed(sidecar, in: folder, confirmed: replacingConfirmed, protected: protectedFiles)
         let fd = openat(folder, sidecar, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o644)
         guard fd >= 0 else { throw ImageOutputError("Couldn't save the bad-block list: \(Self.text(errno)).") }
-        defer { Darwin.close(fd) }
-        try data.withUnsafeBytes { raw in
-            guard let base = raw.baseAddress else { return }
-            var written = 0
-            while written < raw.count {
-                let result = Darwin.write(fd, base.advanced(by: written), raw.count - written)
-                if result < 0 { if errno == EINTR { continue }; throw ImageOutputError(Self.text(errno)) }
-                written += result
+        do {
+            try data.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                var written = 0
+                while written < raw.count {
+                    let result = Darwin.write(fd, base.advanced(by: written), raw.count - written)
+                    if result < 0 { if errno == EINTR { continue }; throw ImageOutputError(Self.text(errno)) }
+                    guard result > 0 else { throw ImageOutputError("The destination accepted no more bytes.") }
+                    written += result
+                }
             }
+            try Self.fullSync(fd)
+        } catch {
+            Darwin.close(fd)
+            throw error
         }
-        _ = fsync(fd)
+        guard Darwin.close(fd) == 0 else { throw ImageOutputError("Couldn't save the bad-block list: \(Self.text(errno)).") }
+    }
+
+    /// The backing files of every attached disk image (`hdiutil info -plist`, metadata only,
+    /// bounded), by `(st_dev, st_ino)`; nil when they can't be listed. Paths that can't be
+    /// stat'ed are left out (they can't be compared with a file that can).
+    public static func attachedImageBackingFiles() -> Set<FileIdentity>? {
+        guard let info = plistFromProcess(executable: URL(fileURLWithPath: "/usr/bin/hdiutil"), arguments: ["info", "-plist"]) else {
+            return nil
+        }
+        return backingFiles(fromHdiutilInfo: info, identity: liveFileIdentity(ofPath:))
+    }
+
+    static func backingFiles(fromHdiutilInfo info: [String: Any], identity: (String) -> FileIdentity?) -> Set<FileIdentity>? {
+        guard let images = info["images"] as? [[String: Any]] else { return info.isEmpty ? nil : [] }
+        return Set(images.compactMap { ($0["image-path"] as? String).flatMap { identity(URL(fileURLWithPath: $0).resolvingSymlinksInPath().path) } })
     }
 
     static func text(_ code: Int32) -> String { String(cString: strerror(code)) }

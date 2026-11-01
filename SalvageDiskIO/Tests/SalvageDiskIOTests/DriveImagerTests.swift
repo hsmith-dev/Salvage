@@ -187,7 +187,7 @@ struct ImageOutputFileTests {
     @Test func createsANewFileAndASidecarThatRoundTrips() throws {
         let dir = try folder(); defer { try? FileManager.default.removeItem(at: dir) }
         let url = dir.appendingPathComponent("card.img")
-        let file = try ImageOutputFile(creating: url, replacingConfirmed: false, checked: checked(dir))
+        let file = try ImageOutputFile(creating: url, replacingConfirmed: false, checked: checked(dir), protectedFiles: [])
         try file.write(Data(repeating: 7, count: 1024), at: 0)
         try file.write(Data(repeating: 8, count: 512), at: 1024)
         try file.synchronize()
@@ -207,10 +207,10 @@ struct ImageOutputFileTests {
         let dir = try folder(); defer { try? FileManager.default.removeItem(at: dir) }
         let url = dir.appendingPathComponent("old.img")
         try Data("keep".utf8).write(to: url)
-        #expect(throws: ImageOutputError.self) { try ImageOutputFile(creating: url, replacingConfirmed: false, checked: checked(dir)) }
+        #expect(throws: ImageOutputError.self) { try ImageOutputFile(creating: url, replacingConfirmed: false, checked: checked(dir), protectedFiles: []) }
         #expect(try Data(contentsOf: url) == Data("keep".utf8))
 
-        let file = try ImageOutputFile(creating: url, replacingConfirmed: true, checked: checked(dir))
+        let file = try ImageOutputFile(creating: url, replacingConfirmed: true, checked: checked(dir), protectedFiles: [])
         file.close()
         #expect(try Data(contentsOf: url).isEmpty, "a fresh, empty file replaced it")
     }
@@ -221,7 +221,7 @@ struct ImageOutputFileTests {
         try Data("untouched".utf8).write(to: target)
         let link = dir.appendingPathComponent("link.img")
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
-        #expect(throws: ImageOutputError.self) { try ImageOutputFile(creating: link, replacingConfirmed: true, checked: checked(dir)) }
+        #expect(throws: ImageOutputError.self) { try ImageOutputFile(creating: link, replacingConfirmed: true, checked: checked(dir), protectedFiles: []) }
         #expect(try Data(contentsOf: target) == Data("untouched".utf8))
         #expect((try? FileManager.default.destinationOfSymbolicLink(atPath: link.path)) != nil, "the link is left alone")
     }
@@ -232,9 +232,60 @@ struct ImageOutputFileTests {
         for assessment in [DestinationAssessment(verdict: .sameDevice, mountSource: mountSourceName(ofPath: dir.path)),
                            DestinationAssessment(verdict: .undetermined, mountSource: nil),
                            DestinationAssessment(verdict: .safe, mountSource: "/dev/disk999s9")] {
-            #expect(throws: ImageOutputError.self) { try ImageOutputFile(creating: url, replacingConfirmed: false, checked: assessment) }
+            #expect(throws: ImageOutputError.self) { try ImageOutputFile(creating: url, replacingConfirmed: false, checked: assessment, protectedFiles: []) }
         }
         #expect(!FileManager.default.fileExists(atPath: url.path))
+    }
+
+    @Test func theBackingFileOfAnAttachedImageIsNeverReplacedNorIsAnythingWhenThatIsUnknown() throws {
+        let dir = try folder(); defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("source.img")
+        try Data("backing".utf8).write(to: url)
+        let identity = try #require(liveFileIdentity(ofPath: url.path))
+        // Refused even without asking to replace, with its own message.
+        for confirmed in [false, true] {
+            #expect {
+                try ImageOutputFile(creating: url, replacingConfirmed: confirmed, checked: checked(dir), protectedFiles: [identity])
+            } throws: { ($0 as? ImageOutputError)?.description.contains("disk image behind an attached drive") == true }
+        }
+        // A hard link to it is the same file.
+        let link = dir.appendingPathComponent("link.img")
+        try FileManager.default.linkItem(at: url, to: link)
+        #expect(throws: ImageOutputError.self) {
+            try ImageOutputFile(creating: link, replacingConfirmed: true, checked: checked(dir), protectedFiles: [identity])
+        }
+        // Unknown attached images: nothing existing is replaced.
+        let other = dir.appendingPathComponent("other.img")
+        try Data("x".utf8).write(to: other)
+        #expect(throws: ImageOutputError.self) {
+            try ImageOutputFile(creating: other, replacingConfirmed: true, checked: checked(dir), protectedFiles: nil)
+        }
+        #expect(try Data(contentsOf: url) == Data("backing".utf8))
+        #expect(try Data(contentsOf: other) == Data("x".utf8))
+
+        let info: [String: Any] = ["images": [["image-path": url.path], ["image-path": "/nonexistent/x.dmg"], [:]]]
+        #expect(ImageOutputFile.backingFiles(fromHdiutilInfo: info, identity: liveFileIdentity(ofPath:)) == [identity])
+        #expect(ImageOutputFile.backingFiles(fromHdiutilInfo: [:], identity: liveFileIdentity(ofPath:)) == nil)
+        #expect(ImageOutputFile.attachedImageBackingFiles() != nil)
+    }
+
+    @Test func aStaleSidecarIsReplacedOnlyWhenReplacingTheImageWasConfirmed() throws {
+        let dir = try folder(); defer { try? FileManager.default.removeItem(at: dir) }
+        let report = ImagingReport(imageFile: "a.img", sourceName: "A", sourceDevice: "disk9", sourceSizeBytes: 0, blockSize: 512,
+                                   status: .complete, note: nil, bytesCopied: 0, unreadableBytes: 0, badRanges: [], sha256: nil,
+                                   startedAt: Date(), finishedAt: Date())
+        let sidecar = dir.appendingPathComponent("a.img.badblocks.json")
+        try Data("stale".utf8).write(to: sidecar)
+        let fresh = try ImageOutputFile(creating: dir.appendingPathComponent("a.img"), replacingConfirmed: false,
+                                        checked: checked(dir), protectedFiles: [])
+        #expect(throws: ImageOutputError.self) { try fresh.writeSidecar(report) }
+        #expect(try Data(contentsOf: sidecar) == Data("stale".utf8))
+        fresh.close()
+
+        let replacing = try ImageOutputFile(creating: dir.appendingPathComponent("a.img"), replacingConfirmed: true,
+                                            checked: checked(dir), protectedFiles: [])
+        try replacing.writeSidecar(report)
+        #expect(try ImagingReport.decode(Data(contentsOf: sidecar)).imageFile == "a.img")
     }
 
     @Test func fat32CantHoldAnImageOver4GB() {

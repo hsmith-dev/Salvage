@@ -38,7 +38,13 @@ struct LiveDriveImagingTests {
         let reader = try await RawBlockReader.prepare(device: device)
         let destination = folder.appendingPathComponent("copy.img")
         let checked = DestinationAssessment(verdict: .safe, mountSource: mountSourceName(ofPath: folder.path))
-        let output = try ImageOutputFile(creating: destination, replacingConfirmed: false, checked: checked)
+        // The attached source's own backing file is protected: saving over it is refused.
+        let protected = try #require(ImageOutputFile.attachedImageBackingFiles())
+        #expect(protected.contains(try #require(liveFileIdentity(ofPath: sourceFile.path))))
+        #expect(throws: ImageOutputError.self) {
+            try ImageOutputFile(creating: sourceFile, replacingConfirmed: true, checked: checked, protectedFiles: protected)
+        }
+        let output = try ImageOutputFile(creating: destination, replacingConfirmed: false, checked: checked, protectedFiles: [])
         var imager = DriveImager()
         imager.chunkSize = 1024 * 1024
         let result = await imager.run(reader: reader, sink: output)
