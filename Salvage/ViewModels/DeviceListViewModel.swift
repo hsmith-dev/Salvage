@@ -1,6 +1,58 @@
+import Foundation
 import Observation
 import SalvageCore
 import SalvageDiskIO
+
+/// One row of the Device Picker's Disk Utility-style tree: a drive (the only kind of row that can
+/// be selected, and so the only scan target) or one of its partitions/volumes, which are shown
+/// for information only.
+public struct DeviceTreeNode: Identifiable, Equatable, Sendable {
+    public enum Kind: Equatable, Sendable {
+        case drive(BlockDevice)
+        /// `drive` is the display name of the drive it belongs to; `container` the display name
+        /// of the APFS container a volume sits in, if any.
+        case partition(DevicePartition, drive: String, container: String?)
+    }
+
+    public let kind: Kind
+    public let children: [DeviceTreeNode]
+
+    /// A drive's id is its `BlockDevice.id`, so `List` selection tags stay drive ids. Partition
+    /// ids are their BSD names, which never collide with a whole-disk name.
+    public var id: String {
+        switch kind {
+        case .drive(let device): return device.id
+        case .partition(let partition, _, _): return partition.id
+        }
+    }
+
+    /// Only drives are scan targets; partitions are informational.
+    public var isSelectableDrive: Bool {
+        if case .drive = kind { return true }
+        return false
+    }
+
+    /// Drives and their partitions start expanded; macOS's own support containers (system,
+    /// recovery) start collapsed, as Disk Utility hides them by default.
+    public var startsExpanded: Bool {
+        guard case .partition(let partition, _, _) = kind else { return true }
+        return !DeviceTreeLabel.supportContainers.contains(partition.displayName)
+    }
+
+    static func tree(for devices: [BlockDevice]) -> [DeviceTreeNode] {
+        devices.map { device in
+            DeviceTreeNode(kind: .drive(device),
+                           children: partitionNodes(device.partitions, drive: device.displayName, container: nil))
+        }
+    }
+
+    private static func partitionNodes(_ partitions: [DevicePartition], drive: String, container: String?) -> [DeviceTreeNode] {
+        partitions.map { partition in
+            DeviceTreeNode(kind: .partition(partition, drive: drive, container: container),
+                           children: partitionNodes(partition.children, drive: drive, container: partition.displayName))
+        }
+    }
+}
 
 /// Drives the Device Picker (`DeviceListView`): consumes `DeviceWatcher.watch()`'s live device
 /// stream and exposes the current `[BlockDevice]`, any watcher-level error state, and the user's
@@ -27,6 +79,10 @@ public final class DeviceListViewModel {
     /// every launch, before the first emission (which, in practice, always includes at least the
     /// boot volume) has had a chance to arrive.
     public private(set) var hasReceivedDevices = false
+
+    /// The device set as a tree (Disk Utility style): each drive with its partitions, APFS
+    /// containers and volumes beneath it. Selection still targets drives only.
+    public var tree: [DeviceTreeNode] { DeviceTreeNode.tree(for: devices) }
 
     /// The watcher delivered a snapshot with no devices at all. Since the startup disk always
     /// enumerates, this is an anomaly the view reports as such, distinct from loading or error.
@@ -93,5 +149,30 @@ public final class DeviceListViewModel {
         if let selectedDeviceID, !currentDevices.contains(where: { $0.id == selectedDeviceID && !$0.isBootVolume }) {
             self.selectedDeviceID = nil
         }
+    }
+
+    /// VoiceOver label for a partition row: "Partition Photos, exFAT, 63.8 gigabytes, on SanDisk
+    /// Ultra USB"; a volume inside an APFS container says so ("Volume Data, APFS, in APFS
+    /// container, on ...") and has no size of its own.
+    nonisolated public static func accessibilityLabel(for partition: DevicePartition, drive: String,
+                                                      container: String?) -> String {
+        var parts = ["\(container == nil ? "Partition" : "Volume") \(partition.displayName)", partition.formatName]
+        if let size = partition.sizeBytes { parts.append(spokenSize(size)) }
+        if let container { parts.append("in \(container)") }
+        parts.append("on \(drive)")
+        return parts.joined(separator: ", ")
+    }
+
+    /// A byte count in words, for VoiceOver ("63.8 gigabytes", not "63.8 GB").
+    nonisolated public static func spokenSize(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        let text = formatter.string(fromByteCount: bytes)
+        let units = [" KB": " kilobytes", " MB": " megabytes", " GB": " gigabytes", " TB": " terabytes", " PB": " petabytes"]
+        for (abbreviation, word) in units where text.hasSuffix(abbreviation) {
+            let number = String(text.dropLast(abbreviation.count))
+            return number + (number == "1" ? String(word.dropLast()) : word)
+        }
+        return text
     }
 }

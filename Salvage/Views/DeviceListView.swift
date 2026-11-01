@@ -30,13 +30,16 @@ private func sizeText(for device: BlockDevice) -> String {
     deviceSizeFormatter.string(fromByteCount: device.sizeBytes)
 }
 
-/// The Device Picker (FR-1) -- the entry point to every recovery session. One row per whole-disk
-/// `BlockDevice`; the boot volume is always shown, grayed, with its one-line reason, never
+/// The Device Picker (FR-1) -- the entry point to every recovery session. One selectable row per
+/// whole-disk `BlockDevice`, with its partitions and volumes nested beneath it (informational); the boot volume is always shown, grayed, with its one-line reason, never
 /// omitted; internal and external devices render together in a single unified list, never split
 /// into sections. Clicking an eligible row validates selection and starts a scan through the composition root. See `DESIGN.md`'s `device-row` component and `EXPERIENCE.md`'s
 /// Device row / State Patterns for the full behavioral spec this view implements.
 struct DeviceListView: View {
     @State private var viewModel = DeviceListViewModel()
+    /// Tree nodes the user expanded or collapsed away from their default
+    /// (`DeviceTreeNode.startsExpanded`).
+    @State private var toggledNodeIDs: Set<String> = []
     var isScanning = false
     var activeDeviceID: BlockDevice.ID?
     var onSelect: (BlockDevice) -> Void = { _ in }
@@ -82,21 +85,43 @@ struct DeviceListView: View {
         }
     }
 
+    /// The Disk Utility-style tree: each drive is a top-level row, its partitions, APFS
+    /// containers and volumes indented beneath it, expanded by default. Only drive rows are
+    /// selectable (and selecting one starts a scan, as before); partition rows are information.
+    /// Recursive `DisclosureGroup`s rather than `OutlineGroup`/`List(children:)`, which open
+    /// collapsed with no way to start expanded.
     private var deviceList: some View {
         List(selection: selectionBinding) {
-            ForEach(viewModel.devices) { device in
-                DeviceRow(device: device, inUse: isScanning && activeDeviceID == device.id)
-                    .tag(device.id)
-                    .disabled(device.isBootVolume || isScanning)
-                    // Re-applied explicitly after `.disabled(...)` (rather than relying solely on
-                    // `DeviceRow`'s own internal accessibility) so the boot-volume reason reaches
-                    // VoiceOver even if a disabled row's announcement behavior turns out to be
-                    // inconsistent -- not confirmed either way, no VoiceOver testing was done.
-                    .accessibilityLabel(device.displayName)
-                    .accessibilityValue(accessibilityValue(for: device))
+            ForEach(viewModel.tree) { node in
+                if case .drive(let device) = node.kind {
+                    if node.children.isEmpty {
+                        driveRow(device)
+                    } else {
+                        DisclosureGroup(isExpanded: expansion(of: node, toggled: $toggledNodeIDs)) {
+                            ForEach(node.children) { child in
+                                PartitionTreeRows(node: child, toggled: $toggledNodeIDs)
+                            }
+                        } label: {
+                            driveRow(device)
+                        }
+                    }
+                }
             }
         }
         .listStyle(.inset)
+    }
+
+    private func driveRow(_ device: BlockDevice) -> some View {
+        DeviceRow(device: device, inUse: isScanning && activeDeviceID == device.id)
+            .tag(device.id)
+            .disabled(device.isBootVolume || isScanning)
+            .selectionDisabled(device.isBootVolume || isScanning)
+            // Re-applied explicitly after `.disabled(...)` (rather than relying solely on
+            // `DeviceRow`'s own internal accessibility) so the boot-volume reason reaches
+            // VoiceOver even if a disabled row's announcement behavior turns out to be
+            // inconsistent -- not confirmed either way, no VoiceOver testing was done.
+            .accessibilityLabel(device.displayName)
+            .accessibilityValue(accessibilityValue(for: device))
     }
 
     /// The glyph alone never conveys the FileVault state (EXPERIENCE.md): "Locked" is spoken too.
@@ -121,6 +146,7 @@ struct DeviceListView: View {
                     viewModel.clearSelection()
                     return
                 }
+                // Only drive rows are scan targets: a partition's id is never in `devices`.
                 guard let device = viewModel.devices.first(where: { $0.id == newID }) else { return }
                 guard !isScanning else { return }
                 viewModel.selectDevice(device)
@@ -182,6 +208,73 @@ private struct DeviceRow: View {
         .background(Color(nsColor: .controlBackgroundColor))
         .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         .opacity(device.isBootVolume ? 0.6 : 1.0)
+    }
+}
+
+/// A node's expansion: its default (`startsExpanded`), flipped if the user toggled it.
+private func expansion(of node: DeviceTreeNode, toggled: Binding<Set<String>>) -> Binding<Bool> {
+    Binding(
+        get: { node.startsExpanded != toggled.wrappedValue.contains(node.id) },
+        set: { expanded in
+            if expanded == node.startsExpanded { toggled.wrappedValue.remove(node.id) } else { toggled.wrappedValue.insert(node.id) }
+        }
+    )
+}
+
+/// A partition, APFS container or volume row, with its own children beneath it (expanded by
+/// default, see `DeviceTreeNode.startsExpanded`). Never selectable: secondary text, no selection tag that matches a drive.
+private struct PartitionTreeRows: View {
+    let node: DeviceTreeNode
+    @Binding var toggled: Set<String>
+
+    var body: some View {
+        if node.children.isEmpty {
+            row
+        } else {
+            DisclosureGroup(isExpanded: expansion(of: node, toggled: $toggled)) {
+                ForEach(node.children) { child in
+                    PartitionTreeRows(node: child, toggled: $toggled)
+                }
+            } label: {
+                row
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var row: some View {
+        if case .partition(let partition, let drive, let container) = node.kind {
+            PartitionRow(partition: partition)
+                .selectionDisabled()
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(DeviceListViewModel.accessibilityLabel(for: partition, drive: drive,
+                                                                           container: container))
+        }
+    }
+}
+
+/// One partition/volume row: name, format and size, in secondary text.
+private struct PartitionRow: View {
+    let partition: DevicePartition
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(partition.displayName)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 8)
+            Text(detail)
+                .monospacedDigit()
+                .foregroundStyle(.tertiary)
+        }
+        .font(.subheadline)
+        .foregroundStyle(.secondary)
+        .padding(.vertical, 2)
+    }
+
+    private var detail: String {
+        guard let size = partition.sizeBytes else { return partition.formatName }
+        return "\(partition.formatName) · \(deviceSizeFormatter.string(fromByteCount: size))"
     }
 }
 
