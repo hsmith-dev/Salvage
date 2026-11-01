@@ -157,14 +157,17 @@ struct ScanNoticeTests {
         #expect(outcome.notices == [.signaturesSkipped(["broken.json"])])
     }
 
-    @Test func resumedScanSaysCarvingWasPartial() async throws {
+    @Test func resumedScanThatFinishesItsCarveBackfillHasNoNotice() async throws {
+        // The bytes before the checkpoint are carved after the sweep, so nothing is missing.
+        // (`ScanPauseTests` covers the notice for a backfill that was cancelled.)
         let image = fatImage()
         let first = await run(image)
         #expect(first.notices.isEmpty)
         let checkpoint = try #require(first.checkpoints.first)
         let resumed = await run(ScanSession(reader: ImageReader(data: image)), resumingFrom: checkpoint)
         #expect(resumed.events.last == .completed)
-        #expect(resumed.notices == [.resumedCarvingPartial])
+        #expect(resumed.notices.isEmpty)
+        #expect(resumed.checkpoints.contains { $0.carveBackfillOffset != nil })
     }
 
     // MARK: Text

@@ -144,8 +144,9 @@ The wording comes from `SalvageCore/Sources/SalvageCore/Entities/ScanNotice.swif
 - Part of the drive couldn't be read, so some areas were skipped.
 - Salvage stopped reconstructing files after its limit (250,000), so some aren't listed.
 - Some file-type definitions couldn't be loaded, so those types weren't reconstructed.
-- A resumed scan didn't list reconstructed files from the part it had already scanned. Start the
-  scan over to include them.
+- A resumed scan was stopped before it finished reconstructing files from the part it had already
+  scanned. (When a resumed scan runs to the end, it goes back over that part, so this only appears
+  if it was cancelled first.) Start the scan over to include them.
 - A volume's metadata couldn't be read, so some of its files may be missing. The rest of the drive
   was still scanned.
 - Damaged files or folders were skipped rather than listed with the wrong contents.

@@ -14,7 +14,7 @@ public enum ScanNotice: Sendable, Equatable {
     case carvingLimitReached(count: Int)
     /// Signature files that failed to load, so their file types weren't reconstructed.
     case signaturesSkipped([String])
-    /// A resumed scan carved only the bytes after its checkpoint.
+    /// A resumed scan was stopped before its carve-only pass over the pre-checkpoint bytes finished.
     case resumedCarvingPartial
     /// A mapped volume whose metadata couldn't be read; the rest of the device was still scanned.
     case volumeSkipped(formatName: String, offset: Int64, reason: String)
@@ -37,7 +37,7 @@ public enum ScanNotice: Sendable, Equatable {
         case .signaturesSkipped(let files):
             return "Some file-type definitions couldn't be loaded (\(files.joined(separator: ", "))), so files of those types weren't reconstructed."
         case .resumedCarvingPartial:
-            return "This scan continued from where it was interrupted. Reconstructed files from the part scanned before aren't listed; start the scan over to include them."
+            return "This scan continued from where it was interrupted and was stopped before it finished reconstructing files from the part scanned earlier, so some of those aren't listed. Start the scan over to include them."
         case .volumeSkipped(let name, let offset, let reason):
             return "Salvage couldn't read the \(name) volume that starts \(Self.bytes(offset)) into this drive, so some of its files may be missing. \(reason) The rest of the drive was still scanned."
         case .damagedItemsSkipped(let count, let examples):

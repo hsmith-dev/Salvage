@@ -472,7 +472,7 @@ struct ScanPauseResumeTests {
         #expect(store.load(for: device) == nil)
         #expect(!FileManager.default.fileExists(atPath: path.path))
 
-        let point = #"{"version":2,"deviceSizeBytes":1048576,"totalBytes":1048576,"extents":[{"offset":0,"length":1048576}],"sweepVolumeIndex":0,"sweepOffset":262144,"bytesScanned":262144}"#
+        let point = #"{"version":3,"deviceSizeBytes":1048576,"totalBytes":1048576,"extents":[{"offset":0,"length":1048576}],"sweepVolumeIndex":0,"sweepOffset":262144,"bytesScanned":262144}"#
         func record(format: Int = 2, identity: Int = 7, boot: String = "boot-A", checkpoint: String = point) -> String {
             #"{"formatVersion":\#(format),"mediaIdentity":\#(identity),"deviceSizeBytes":1048576,"bootSessionUUID":"\#(boot)","savedAt":1000000,"checkpoint":\#(checkpoint)}"#
         }
@@ -483,7 +483,7 @@ struct ScanPauseResumeTests {
         try write(record(identity: 8))
         #expect(store.load(for: device) == nil)
 
-        try write(record(checkpoint: point.replacingOccurrences(of: #""version":2"#, with: #""version":1"#)))
+        try write(record(checkpoint: point.replacingOccurrences(of: #""version":3"#, with: #""version":2"#)))
         #expect(store.load(for: device) == nil)
 
         try write(record(checkpoint: point.replacingOccurrences(of: #""offset":0,"length":1048576"#, with: #""offset":0,"length":4096"#)))
