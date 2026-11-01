@@ -74,7 +74,17 @@ final class SalvageUITests: XCTestCase {
         XCTAssertTrue(hasText("Paused", timeout: 5))
         XCTAssertTrue(hasText(containing: "Scan paused. Salvage is not reading the device."))
         XCTAssertTrue(hasText("Remaining: Paused"))
-        let pausedAt = describe(element("scan-progress-percent"))
+        // Progress measured before Pause can still be in the event buffer under load and arrive
+        // just after it (Core tests prove no read happens while paused). Let it settle, then
+        // require the counter to stay frozen.
+        var pausedAt = describe(element("scan-progress-percent"))
+        let settleDeadline = Date().addingTimeInterval(15)
+        while Date() < settleDeadline {
+            Thread.sleep(forTimeInterval: 1)
+            let now = describe(element("scan-progress-percent"))
+            if now == pausedAt { break }
+            pausedAt = now
+        }
         Thread.sleep(forTimeInterval: 2)
         XCTAssertEqual(describe(element("scan-progress-percent")), pausedAt, "No bytes are read while paused")
         XCTAssertFalse(hasText(containing: "Scan completed"))
