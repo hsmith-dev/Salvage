@@ -74,18 +74,37 @@ func diskUtilInfoPlist(for bsdName: String) -> [String: Any]? {
 }
 
 /// Runs a metadata subprocess with a hard deadline and decodes its stdout as a dictionary plist.
-/// stderr goes to the null device so it can never fill an undrained pipe and wedge the child;
-/// stdout is drained concurrently so a large plist cannot either. Timeout, launch failure,
-/// non-zero exit or undecodable output all return `nil`, which every caller treats as a failed
-/// protection check (fail closed: the device is refused).
+/// Timeout, launch failure, non-zero exit or undecodable output all return `nil`, which every
+/// caller treats as a failed protection check (fail closed: the device is refused).
 func plistFromProcess(executable: URL, arguments: [String], timeout: TimeInterval = 10) -> [String: Any]? {
+    guard let output = runBoundedProcess(executable: executable, arguments: arguments, timeout: timeout),
+          output.status == 0 else { return nil }
+    return (try? PropertyListSerialization.propertyList(from: output.standardOutput, options: [], format: nil)) as? [String: Any]
+}
+
+/// What a bounded subprocess produced.
+struct BoundedProcessOutput: Sendable, Equatable {
+    let status: Int32
+    let standardOutput: Data
+    let standardError: Data
+}
+
+/// Runs a subprocess with a hard deadline. Both stdout and stderr are drained concurrently, so
+/// neither a large plist nor a chatty tool can fill an undrained pipe and wedge the child. When
+/// `input` is given its bytes are written to the child's stdin and the pipe is closed (Story 2.4:
+/// a passphrase goes to `diskutil -stdinpassphrase` this way, never as an argument); the bytes are
+/// read in place and never copied into a `Data`, so the caller's `zero()` erases the only copy.
+/// Launch failure or timeout returns `nil` (the child is terminated, then killed).
+func runBoundedProcess(executable: URL, arguments: [String], input: SensitiveBytes? = nil,
+                       timeout: TimeInterval = 10) -> BoundedProcessOutput? {
     let process = Process()
     process.executableURL = executable
     process.arguments = arguments
-    let outputPipe = Pipe()
+    let outputPipe = Pipe(), errorPipe = Pipe()
     process.standardOutput = outputPipe
-    process.standardError = FileHandle.nullDevice
-    process.standardInput = FileHandle.nullDevice
+    process.standardError = errorPipe
+    let inputPipe = input == nil ? nil : Pipe()
+    process.standardInput = inputPipe ?? FileHandle.nullDevice
     let exited = DispatchSemaphore(value: 0)
     process.terminationHandler = { _ in exited.signal() }
     do {
@@ -93,22 +112,47 @@ func plistFromProcess(executable: URL, arguments: [String], timeout: TimeInterva
     } catch {
         return nil
     }
-    let output = ProcessOutput()
-    let drained = DispatchSemaphore(value: 0)
-    let reader = outputPipe.fileHandleForReading
+    let output = ProcessOutput(), errors = ProcessOutput()
+    let finished = DispatchSemaphore(value: 0)
+    var workers = 2
+    let outputReader = outputPipe.fileHandleForReading, errorReader = errorPipe.fileHandleForReading
     DispatchQueue.global(qos: .userInitiated).async {
-        output.store(reader.readDataToEndOfFile())
-        drained.signal()
+        output.store(outputReader.readDataToEndOfFile())
+        finished.signal()
+    }
+    DispatchQueue.global(qos: .userInitiated).async {
+        errors.store(errorReader.readDataToEndOfFile())
+        finished.signal()
+    }
+    if let inputPipe, let input {
+        workers += 1
+        let writer = inputPipe.fileHandleForWriting
+        DispatchQueue.global(qos: .userInitiated).async {
+            // The child may exit before reading (a usage error): a failed write must not SIGPIPE us.
+            _ = fcntl(writer.fileDescriptor, F_SETNOSIGPIPE, 1)
+            input.withUnsafeBytes { bytes in
+                var written = 0
+                while written < bytes.count {
+                    let result = write(writer.fileDescriptor, bytes.baseAddress! + written, bytes.count - written)
+                    if result < 0 { if errno == EINTR { continue } else { break } }
+                    written += result
+                }
+            }
+            try? writer.close()
+            finished.signal()
+        }
     }
     guard exited.wait(timeout: .now() + timeout) == .success else {
         process.terminate()
         if exited.wait(timeout: .now() + 1) == .timedOut { kill(process.processIdentifier, SIGKILL) }
         return nil
     }
-    // The child has exited, so its write end is closed; bound the drain anyway in case a
-    // grandchild inherited the pipe.
-    guard drained.wait(timeout: .now() + 2) == .success, process.terminationStatus == 0 else { return nil }
-    return (try? PropertyListSerialization.propertyList(from: output.data, options: [], format: nil)) as? [String: Any]
+    // The child has exited, so its pipe ends are closed; bound the drain anyway in case a
+    // grandchild inherited them.
+    for _ in 0..<workers {
+        guard finished.wait(timeout: .now() + 2) == .success else { return nil }
+    }
+    return BoundedProcessOutput(status: process.terminationStatus, standardOutput: output.data, standardError: errors.data)
 }
 
 private final class ProcessOutput: @unchecked Sendable {
@@ -116,6 +160,41 @@ private final class ProcessOutput: @unchecked Sendable {
     private var stored = Data()
     func store(_ data: Data) { lock.withLock { stored = data } }
     var data: Data { lock.withLock { stored } }
+}
+
+/// A byte buffer that is erased on demand and on deinit, for a credential that must exist in
+/// memory only transiently (Architecture AD-3). It is never copied into a `Data` or `String` by
+/// this module; callers read it in place through `withUnsafeBytes`. `memset_s` cannot be
+/// optimized away, unlike a plain assignment of zeros.
+public final class SensitiveBytes: @unchecked Sendable {
+    private let lock = NSLock()
+    private var bytes: [UInt8]
+    private var zeroed = false
+
+    public init(_ bytes: [UInt8]) { self.bytes = bytes }
+    /// The UTF-8 bytes of `text`. The `String` itself stays wherever the caller keeps it; this only
+    /// guarantees the copy handed to a subprocess is erased.
+    public convenience init(utf8 text: String) { self.init(Array(text.utf8)) }
+
+    deinit { zero() }
+
+    public var count: Int { lock.withLock { bytes.count } }
+    public var isZeroed: Bool { lock.withLock { zeroed } }
+
+    func withUnsafeBytes<T>(_ body: (UnsafeRawBufferPointer) throws -> T) rethrows -> T {
+        try lock.withLock { try bytes.withUnsafeBytes(body) }
+    }
+
+    /// Overwrites every byte with zero. Idempotent.
+    public func zero() {
+        lock.withLock {
+            bytes.withUnsafeMutableBytes { buffer in
+                guard let base = buffer.baseAddress, buffer.count > 0 else { return }
+                _ = memset_s(base, buffer.count, 0, buffer.count)
+            }
+            zeroed = true
+        }
+    }
 }
 
 /// Resolves the physical whole disk(s) backing `bsdName`, combining the two functions above.

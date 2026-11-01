@@ -45,14 +45,23 @@ public protocol DeviceWatching: Sendable {
 /// `BlockDevice` values instead of printing to stdout, and additionally filtering to whole disks
 /// only (`BlockDevice` models whole disks, never partitions/volumes, per this story's Boundaries).
 public final class DeviceWatcher: DeviceWatching, Sendable {
+    /// Story 2.4: annotates the devices whose APFS container holds only locked (FileVault)
+    /// volumes with that volume (`BlockDevice.requiringUnlock`), so the Device Picker can show
+    /// "Locked" and offer the unlock sheet before any scan. Read-only metadata query.
+    typealias LockStateResolver = @Sendable ([BlockDevice]) async -> [BlockDevice]
+
     private let bootDiskResolver: @Sendable () async throws -> Set<String>
+    private let lockStateResolver: LockStateResolver
 
     public init() {
         bootDiskResolver = Self.resolveProtectedDisks
+        lockStateResolver = Self.annotateLockedDevices
     }
 
-    init(bootDiskResolver: @escaping @Sendable () async throws -> Set<String>) {
+    init(bootDiskResolver: @escaping @Sendable () async throws -> Set<String>,
+         lockStateResolver: @escaping LockStateResolver = { $0 }) {
         self.bootDiskResolver = bootDiskResolver
+        self.lockStateResolver = lockStateResolver
     }
 
     /// Starts watching. Throws `DeviceWatcherError.sessionRegistrationFailed` if a `DASession`
@@ -69,8 +78,10 @@ public final class DeviceWatcher: DeviceWatching, Sendable {
             throw DeviceWatcherError.sessionRegistrationFailed
         }
 
+        let lockStateResolver = lockStateResolver
         return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
-            let registration = DiskWatchRegistration(session: session, continuation: continuation, bootDisks: bootDisks)
+            let registration = DiskWatchRegistration(session: session, continuation: continuation, bootDisks: bootDisks,
+                                                     lockStateResolver: lockStateResolver)
             registration.start()
             continuation.onTermination = { _ in
                 registration.stop()
@@ -89,6 +100,25 @@ public final class DeviceWatcher: DeviceWatching, Sendable {
         return disks
     }
 
+    /// `diskutil apfs list -plist`, off the UI actor. A failed listing changes nothing: no device
+    /// is marked locked, none is claimed unlocked.
+    #if compiler(>=6.2)
+    @concurrent
+    #endif
+    nonisolated private static func annotateLockedDevices(_ devices: [BlockDevice]) async -> [BlockDevice] {
+        guard let containers = liveAPFSContainers() else { return devices }
+        return annotateLocked(devices, containers: containers)
+    }
+}
+
+/// Pure: marks each non-boot device whose containers hold only locked volumes with the first such
+/// volume. Everything else is returned unchanged.
+func annotateLocked(_ devices: [BlockDevice], containers: [APFSListedContainer]) -> [BlockDevice] {
+    devices.map { device in
+        guard !device.isBootVolume, device.encryptedVolumeUUID == nil,
+              let locked = lockedVolume(onWholeDisk: device.bsdName, containers: containers) else { return device }
+        return device.requiringUnlock(volumeUUID: locked.uuid, volumeName: locked.name)
+    }
 }
 
 // MARK: - Live registration
@@ -116,12 +146,18 @@ private final class DiskWatchRegistration: @unchecked Sendable {
     private let session: DASession
     private let continuation: AsyncStream<[BlockDevice]>.Continuation
     private let bootDisks: Set<String>
+    private let lockStateResolver: DeviceWatcher.LockStateResolver
     private var isActive = false
+    /// Counts emissions, so a lock-state annotation that finishes after the device set changed
+    /// again is dropped instead of overwriting the newer set.
+    private var generation = 0
 
-    init(session: DASession, continuation: AsyncStream<[BlockDevice]>.Continuation, bootDisks: Set<String>) {
+    init(session: DASession, continuation: AsyncStream<[BlockDevice]>.Continuation, bootDisks: Set<String>,
+         lockStateResolver: @escaping DeviceWatcher.LockStateResolver) {
         self.bootDisks = bootDisks
         self.session = session
         self.continuation = continuation
+        self.lockStateResolver = lockStateResolver
     }
 
     func start() {
@@ -160,7 +196,24 @@ private final class DiskWatchRegistration: @unchecked Sendable {
 
     private func emitCurrentDevices() {
         guard isActive else { return }
-        continuation.yield(Self.enumerateDevices(session: session, bootDisks: bootDisks))
+        generation += 1
+        let current = generation
+        let devices = Self.enumerateDevices(session: session, bootDisks: bootDisks)
+        continuation.yield(devices)
+        // Story 2.4: the lock state needs a subprocess, so the plain set goes out at once and the
+        // annotated full set follows (same contract: a full current set) only if anything is locked.
+        guard devices.contains(where: { !$0.isBootVolume }) else { return }
+        let resolver = lockStateResolver
+        Task.detached { [weak self] in
+            let annotated = await resolver(devices)
+            guard annotated != devices else { return }
+            await MainActor.run { self?.applyLockStates(annotated, generation: current) }
+        }
+    }
+
+    @MainActor private func applyLockStates(_ devices: [BlockDevice], generation: Int) {
+        guard isActive, generation == self.generation else { return }
+        continuation.yield(devices)
     }
 
     /// Enumerates every currently-attached whole disk via DiskArbitration (metadata only -- no
