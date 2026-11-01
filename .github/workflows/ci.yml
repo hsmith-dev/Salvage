@@ -22,11 +22,12 @@ jobs:
       # Pin the Xcode/toolchain version explicitly rather than relying on macos-latest's
       # ever-changing default Xcode, so the build toolchain can't silently drift when GitHub
       # rotates the runner image. Bump this version deliberately when the project's actual
-      # minimum Xcode requirement changes.
+      # minimum Xcode requirement changes. 26.6 is the newest Xcode on the hosted macOS image
+      # (16.0 is no longer installed, which failed every run); local development uses 27.x.
       - name: Select Xcode version
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: '16.0'
+          xcode-version: '26.6'
 
       - name: Show toolchain versions
         run: |

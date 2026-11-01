@@ -21,6 +21,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Same pinned toolchain as CI, so a release is built with the Xcode CI tested.
+      - name: Select Xcode version
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.6'
+
       # Fail fast, before any build/sign/notarize work, if a required secret is absent. Per
       # spec-1-1's Resolved Decisions, these four secret names are the wired contract:
       #   DEVELOPER_ID_APPLICATION_CERT_P12 -- base64-encoded Developer ID Application .p12
