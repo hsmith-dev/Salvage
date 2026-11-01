@@ -44,6 +44,10 @@ enum HFSPlus {
         return decoded.replacingOccurrences(of: "/", with: ":").precomposedStringWithCanonicalMapping
     }
 
+    /// The name HFS+ gives an item removed while still open, as it waits in the private data
+    /// folder for its last reference to close (xnu's MAKE_DELETED_NAME, "temp<CNID>").
+    static func deletedName(_ cnid: UInt32) -> String { "temp\(cnid)" }
+
     /// The number in an indirect-node file name ("iNode123"), or nil for any other name.
     static func indirectNodeNumber(_ units: [UInt16]) -> UInt32? {
         let prefix = Array("iNode".utf16)

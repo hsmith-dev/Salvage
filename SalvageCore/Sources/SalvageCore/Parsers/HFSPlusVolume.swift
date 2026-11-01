@@ -490,8 +490,20 @@ actor HFSPlusVolume {
 
     /// Keeps the latest stale copy of a folder that is not live. Copies with the same date that
     /// disagree on name or parent make the folder unresolvable for paths.
+    ///
+    /// A copy filed in the private data folder is skipped: when a folder is removed while still
+    /// open (as `rm -r` and `FileManager.removeItem` leave it), HFS+ first moves it there as
+    /// "temp<CNID>" until its last reference closes. The journal or a freed node may keep that
+    /// interim copy. It is not where the folder lived, and since it carries the same date as the
+    /// real copy, it would otherwise make the folder ambiguous and drop every file inside it.
     func recordStaleFolder(_ folder: HFSPlusCatalogFolder, entry: HFSPlusFolderEntry) {
         guard folders[folder.folderID] == nil else { return }
+        if let privateID = privateDataFolderID {
+            guard entry.parent != privateID else { return }
+        } else if entry.name == HFSPlus.deletedName(folder.folderID) {
+            // Slack seen before the private folder's record: recognise the interim name instead.
+            return
+        }
         guard var existing = staleFolders[folder.folderID] else {
             if staleFolders.count < limits.maxStaleFolders {
                 staleFolders[folder.folderID] = HFSPlusStaleFolder(entry: entry, modified: folder.modified)

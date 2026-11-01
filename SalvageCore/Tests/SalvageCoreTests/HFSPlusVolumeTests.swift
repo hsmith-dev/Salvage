@@ -1044,6 +1044,41 @@ struct HFSPlusVolumeTests {
         #expect((await runHFS(renamed(first: 100, second: 100, secondName: "old"))).files.map(\.path) == ["/live.txt", "/old/inside.bin"])
     }
 
+    /// The shape behind the flaky real-image test: `rm -r doomed` moves the still-open folder into
+    /// the private data folder as "temp<CNID>" before it is freed, and a journal flush in between
+    /// keeps that copy, with the same date as the original one.
+    @Test func aRemovedFolderParkedInThePrivateDataFolderKeepsItsOriginalPath() async throws {
+        func parked(tempDate: UInt64, privateFolderIsLive: Bool = true) -> (HFSImage, Data) {
+            var image = HFSImage()
+            let inside = Data(image.fill([91]).prefix(2000))
+            let privateName = HFSImage.key(2, [0, 0, 0, 0] + Array("HFS+ Private Data".utf16))
+            image.catalog([liveRecords(&image) + (privateFolderIsLive ? [privateName + HFSImage.folder(18)] : [])])
+            // Older freed leaf: the folder where it was, with its file.
+            image.writeNode(tree: HFSImage.catalogBlock, 3, HFSImage.leafNode([
+                HFSImage.key(2, "doomed") + HFSImage.folder(40, contentModDate: 50, attributeModDate: 100),
+                staleRecord(id: 41, name: "inside.bin", parent: 40, size: 2000, extents: [(91, 1)]),
+            ]))
+            // Interim copy: parked under the private data folder (CNID 18) as temp40.
+            image.writeNode(tree: HFSImage.catalogBlock, 4, HFSImage.leafNode([
+                HFSImage.key(18, "temp40") + HFSImage.folder(40, contentModDate: 50, attributeModDate: tempDate),
+                staleRecord(id: 41, name: "inside.bin", parent: 40, size: 2000, extents: [(91, 1)]),
+            ]))
+            return (image, inside)
+        }
+        // Same date (the usual case, one-second resolution): not ambiguous, the real path wins.
+        let (tie, inside) = parked(tempDate: 100)
+        let tieBytes = tie.image
+        let result = await runHFS(ImageReader(data: tieBytes))
+        #expect(result.error == nil)
+        #expect(result.files.map(\.path) == ["/live.txt", "/doomed/inside.bin"])
+        #expect(try await readBack(result.files.last, from: tieBytes) == inside)
+        // A later interim copy must not move the file under the hidden private folder.
+        #expect((await runHFS(parked(tempDate: 200).0)).files.map(\.path) == ["/live.txt", "/doomed/inside.bin"])
+        // Before the private folder is known, the interim name alone gives the copy away.
+        #expect((await runHFS(parked(tempDate: 100, privateFolderIsLive: false).0)).files.map(\.path)
+            == ["/live.txt", "/doomed/inside.bin"])
+    }
+
     // MARK: Memory bounds
 
     @Test func hugeTotalNodesDoesNotAllocateProportionally() async {
@@ -1301,6 +1336,11 @@ struct HFSPlusRealImageTests {
             try FileManager.default.removeItem(at: root.appendingPathComponent("zz_last.bin"))
             try FileManager.default.removeItem(at: root.appendingPathComponent("docs/gone.bin"))
             try FileManager.default.removeItem(at: root.appendingPathComponent("doomed"))
+            // Removing the still-open folder parks it in the private data folder as "temp<CNID>"
+            // first. Without a flush here, whether the journal keeps that copy depends on timing
+            // (it made this test flaky under load); with one, it always does, so the test always
+            // covers that shape.
+            sync()
         }
         let result = await runHFS(ImageReader(data: image))
         #expect(result.error == nil)
