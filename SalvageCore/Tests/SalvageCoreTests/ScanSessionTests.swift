@@ -524,9 +524,13 @@ struct PendingFormatDetectionTests {
         #expect(await scan(volume) == [.error(.unsupportedFilesystem)])
     }
     @Test func hfsPlusAndHfsxAreRecognised() async {
+        // Both signatures route to the HFS+ parser, which rejects this signature-only stub's
+        // empty volume header as damaged rather than unsupported.
         for signature: [UInt8] in [[0x48, 0x2B], [0x48, 0x58]] {
             let image = disk { $0[1024] = signature[0]; $0[1025] = signature[1] }
-            #expect(await scan(image) == [.error(.unsupportedFilesystem)])
+            let events = await scan(image)
+            #expect(events.contains { if case .error(.malformed) = $0 { true } else { false } })
+            #expect(!events.contains(.error(.unsupportedFilesystem)) && !events.contains(.completed))
         }
     }
     @Test func pendingFormatPartitionsAreSkippedNotFailed() async {
