@@ -5,6 +5,9 @@ public struct ScanSession: Sendable, Identifiable {
     private let reader: any BlockReader
     private let now: @Sendable () -> Duration
     private let progressInterval: Duration
+    /// The carver's signatures and limits. Tests inject small ones to reach the `ScanNotice` producers.
+    var signatureLibrary: SignatureLibrary = .bundled
+    var carverLimits: SignatureCarver.Limits = .default
     public init(reader: any BlockReader) {
         self.reader = reader
         let start = ContinuousClock.now
@@ -23,17 +26,22 @@ public struct ScanSession: Sendable, Identifiable {
     /// `resumingFrom` re-runs metadata traversal (rebuilding discoveries) but skips sweep bytes the
     /// checkpoint already covered, counting them as scanned. A checkpoint that does not fit this
     /// device's volumes is ignored and the scan starts from zero.
+    /// `notices` receives what the scan could not do (`ScanNotice`), beside the closed `ScanEvent`
+    /// stream (AD-11); a notice never duplicates an `.error`. It is finished when the scan ends.
     public func run(events: AsyncStream<ScanEvent>.Continuation, pauseGate: ScanPauseGate? = nil,
                     checkpoints: AsyncStream<ScanCheckpoint>.Continuation? = nil,
+                    notices: AsyncStream<ScanNotice>.Continuation? = nil,
                     resumingFrom checkpoint: ScanCheckpoint? = nil, device: BlockDevice? = nil) async {
         let emit: @Sendable (ScanEvent) async throws -> Void = { try await events.send($0) }
         // Byte ranges owned by files found through metadata; the carver skips them.
         let claimed = ClaimedRuns()
-        let carver: any Carver = SignatureCarver(emit: { try await emit(.found($0)) })
+        let carver: any Carver = SignatureCarver(emit: { try await emit(.found($0)) },
+                                                 library: signatureLibrary, limits: carverLimits)
         do {
             try Task.checkCancellation()
             let discovery = try await VolumeDiscovery(reader: reader).discover()
             let extents = discovery.extents
+            for notice in Self.discoveryNotices(discovery, deviceBytes: reader.sizeBytes) { notices?.yield(notice) }
             var total: Int64 = 0
             for extent in extents { total = try checkedAdd(total, extent.length) }
             let fingerprint = extents.map { ScanCheckpoint.Extent(offset: $0.offset, length: $0.length) }
@@ -46,6 +54,7 @@ public struct ScanSession: Sendable, Identifiable {
                     if covered > 0 { await measured.cover(extent.offset..<(extent.offset + covered)) }
                 }
             }
+            if let start, start.volume > 0 || start.offset > 0 { notices?.yield(.resumedCarvingPartial) }
             try await emit(.progress(bytesScanned: await measured.measured, totalBytes: total))
             // Per lost extent: whether its own parser finished, and whether the device failed to read
             // inside it (then nothing more is read there).
@@ -62,6 +71,13 @@ public struct ScanSession: Sendable, Identifiable {
                     // every other volume is unaffected. Mapped volumes keep failing closed.
                     parserFailed.insert(index)
                     if case .io = error { unreadable.insert(index) }
+                } catch let error as ScanError where !extent.isLost && error.isMetadataFailure && extents.count > 1 {
+                    // A mapped volume whose metadata can't be read is skipped, not fatal, when the device
+                    // has other volumes: its files found so far stay, the other volumes are still parsed,
+                    // and its bytes are still swept for the carver. I/O errors and cancellation still end
+                    // the scan, and a device whose only volume fails still reports the error.
+                    notices?.yield(.volumeSkipped(formatName: extent.formatName ?? extent.format.displayName,
+                                                  offset: extent.offset, reason: error.description))
                 }
                 // Lost partitions (FR-9) are announced once their parser has finished, so the name can
                 // say whether it got through: " (damaged)" when it stopped part-way.
@@ -75,6 +91,7 @@ public struct ScanSession: Sendable, Identifiable {
             // Finish a bounded, read-only pass over supported volumes. Progress measures unique
             // source bytes actually read, including metadata; unsupported partitions are skipped.
             // The carver sees every swept chunk (a resumed scan carves only the remaining bytes).
+            if !signatureLibrary.skipped.isEmpty { notices?.yield(.signaturesSkipped(signatureLibrary.skipped.map(\.file))) }
             try await carver.begin(claimed: await claimed.runs, deviceSizeBytes: reader.sizeBytes)
             for (index, extent) in extents.enumerated() {
                 guard index >= (start?.volume ?? 0) else { continue }
@@ -103,6 +120,7 @@ public struct ScanSession: Sendable, Identifiable {
                 }
             }
             try await carver.finish()
+            if await carver.hitFileLimit { notices?.yield(.carvingLimitReached(count: carverLimits.maxCarvedFiles)) }
             try Task.checkCancellation()
             try await emit(.completed)
         } catch is CancellationError {
@@ -111,7 +129,27 @@ public struct ScanSession: Sendable, Identifiable {
             if !Task.isCancelled { try? await emit(.error((error as? ScanError) ?? .io(error.localizedDescription))) }
         }
         checkpoints?.finish()
+        notices?.finish()
         events.finish()
+    }
+
+    /// What discovery says it could not do: an ignored partition table, a lost-partition search
+    /// that stopped early, unreadable probes it skipped.
+    static func discoveryNotices(_ discovery: VolumeDiscovery.Result, deviceBytes: Int64) -> [ScanNotice] {
+        var result: [ScanNotice] = []
+        // `VolumeDiscovery` reports the ignored table as one warning sentence around its reason.
+        let prefix = "The partition table is damaged and was ignored ("
+        let suffix = ") The whole device was searched for filesystem signatures instead."
+        for warning in discovery.warnings where warning.hasPrefix(prefix) {
+            var reason = String(warning.dropFirst(prefix.count))
+            if reason.hasSuffix(suffix) { reason = String(reason.dropLast(suffix.count)) }
+            result.append(.partitionTableIgnored(reason: reason))
+        }
+        if discovery.probesTruncated, let searched = discovery.searchedBytes {
+            result.append(.lostPartitionSearchLimited(searchedBytes: searched, deviceBytes: deviceBytes))
+        }
+        if discovery.failedProbes > 0 { result.append(.unreadableAreasSkipped(count: discovery.failedProbes)) }
+        return result
     }
 
     /// Appended to a lost partition's format name when its parser stopped part-way.

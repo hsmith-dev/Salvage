@@ -8,6 +8,8 @@ struct ScanRun: Sendable {
     let device: BlockDevice
     let pauseGate: ScanPauseGate
     let checkpoints: AsyncStream<ScanCheckpoint>.Continuation
+    /// Where the scan reports what it could not do (`ScanNotice`); the view model finishes it.
+    let notices: AsyncStream<ScanNotice>.Continuation
     let resumeFrom: ScanCheckpoint?
     /// Hands the still-open source reader to the view model when the scan ends, for preview and recovery.
     let keepSource: @Sendable (SourceSession) async -> Void
@@ -33,6 +35,8 @@ final class ScanViewModel {
     private(set) var lostPartitions: [LostPartitionCandidate] = []
     /// Encrypted volumes the scan could not read; each needs a password or recovery key (FR-6).
     private(set) var unlockRequests: [BlockDevice] = []
+    /// What this scan could not do, in arrival order (reset per scan); shown under "About this scan".
+    private(set) var notices: [ScanNotice] = []
     private(set) var bytesScanned: Int64 = 0
     private(set) var totalBytes: Int64 = 0
     private(set) var startedAt: Date?
@@ -127,6 +131,7 @@ final class ScanViewModel {
     private func reset(for device: BlockDevice) {
         self.device = device; files = []; seenFiles = []; bytesScanned = 0; totalBytes = 0
         lostPartitions = []; unlockRequests = []
+        notices = []
         startedAt = nil; scanningStartedAt = nil; endedAt = nil; baselineBytes = 0
         pausedAt = nil; pausedTotal = 0; latestCheckpoint = nil; lastCheckpointSave = nil
         pendingCheckpoint = nil; resumedFromCheckpoint = false; canRetryFromCheckpoint = false
@@ -160,7 +165,10 @@ final class ScanViewModel {
             await previous?.close()
             let (stream, continuation) = AsyncStream<ScanEvent>.makeStream(bufferingPolicy: .bufferingOldest(64))
             let (checkpointStream, checkpoints) = AsyncStream<ScanCheckpoint>.makeStream(bufferingPolicy: .bufferingNewest(1))
-            let run = ScanRun(device: device, pauseGate: gate, checkpoints: checkpoints, resumeFrom: checkpoint,
+            let (noticeStream, notices) = AsyncStream<ScanNotice>.makeStream()
+            let run = ScanRun(device: device, pauseGate: gate, checkpoints: checkpoints,
+                              notices: notices,
+                              resumeFrom: checkpoint,
                               keepSource: { session in await self.adopt(session) })
             var completed = false
             await withTaskGroup(of: Void.self) { group in
@@ -169,10 +177,14 @@ final class ScanViewModel {
                     catch is CancellationError { }
                     catch { if !Task.isCancelled { try? await continuation.send(.error((error as? ScanError) ?? .io(error.localizedDescription))) } }
                     checkpoints.finish()
+                    notices.finish()
                     continuation.finish()
                 }
                 group.addTask {
                     for await point in checkpointStream { await self.record(point) }
+                }
+                group.addTask {
+                    for await notice in noticeStream { await self.receive(notice) }
                 }
                 for await event in stream {
                     switch event {
@@ -226,6 +238,13 @@ final class ScanViewModel {
             task = nil
         }
     }
+
+    private func receive(_ notice: ScanNotice) {
+        guard isActive, !notices.contains(notice) else { return }
+        notices.append(notice)
+    }
+    /// The "About this scan" lines, one per notice, in plain language.
+    var noticeLines: [String] { notices.map(\.text) }
 
     private func record(_ checkpoint: ScanCheckpoint) {
         guard isActive else { return }
