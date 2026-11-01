@@ -3,8 +3,11 @@
   "id": "mp3",
   "extension": "mp3",
   "category": "audio",
-  "header": "FFFB90",
-  "alternateHeaders": ["FFFB92", "FFFB94", "FFFBA0", "FFFBA2", "FFFBB0", "FFFBB2", "FFFBC0", "FFFBC2", "FFFBD0", "FFFBD2", "FFFBE0", "FFFBE2", "FFFBE4"],
+  "header": "FFFB",
+  "alternateHeaders": ["FFFA", "FFF3", "FFF2", "FFE3", "FFE2"],
+  "validate": "mpegFrames",
+  "cutsOthers": false,
+  "embeds": ["mp3"],
   "maxBytes": 67108864,
-  "notes": "Untagged MPEG-1 Layer III: frame sync plus the common CBR bitrate/sample-rate bytes (128-320 kbps at 44.1/48 kHz). Three fixed bytes keep sector-aligned false positives rare."
+  "notes": "Untagged MPEG-1/2/2.5 Layer III. The mpegFrames check parses the frame header (version, layer, bitrate, sample rate, padding) and requires a second valid, consistent frame header exactly one frame later. A frame sync is a weak header: it never ends a carve that still has an end rule to find."
 }

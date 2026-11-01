@@ -5,7 +5,27 @@
   "category": "archives",
   "header": "504B0304",
   "footer": "504B0506",
-  "footerSizeField": { "offset": 20, "width": 2, "endian": "little", "adjust": 22 },
+  "footerSizeField": {
+    "offset": 20,
+    "width": 2,
+    "endian": "little",
+    "adjust": 22
+  },
   "maxBytes": 4294967296,
-  "notes": "Also covers docx/xlsx/pptx and other ZIP containers; they are carved with the .zip extension."
+  "notes": "Also covers docx/xlsx/pptx and other ZIP containers; they are carved with the .zip extension. An end-of-central-directory record only ends the file when its central directory offset + size equals its own offset from the file start, so a nested ZIP's EOCD does not end the outer archive. ZIP64 archives (0xFFFFFFFF fields) never validate and are partial.",
+  "footerOffsetCheck": [
+    {
+      "offset": 12,
+      "width": 4,
+      "endian": "little"
+    },
+    {
+      "offset": 16,
+      "width": 4,
+      "endian": "little"
+    }
+  ],
+  "embeds": [
+    "zip"
+  ]
 }

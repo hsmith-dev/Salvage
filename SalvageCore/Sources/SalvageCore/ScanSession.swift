@@ -81,6 +81,7 @@ public struct ScanSession: Sendable, Identifiable {
                 // Every lost extent is swept for the carver, including one whose parser failed or
                 // stopped on damaged metadata; only one the device couldn't read is left alone.
                 if unreadable.contains(index) { continue }
+                try await carver.beginExtent(offset: extent.offset, length: extent.length)
                 var offset: Int64 = index == start?.volume ? start?.offset ?? 0 : 0
                 while offset < extent.length {
                     try Task.checkCancellation()

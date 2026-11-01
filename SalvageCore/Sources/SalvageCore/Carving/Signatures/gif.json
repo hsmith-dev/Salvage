@@ -5,6 +5,7 @@
   "category": "pictures",
   "header": "474946383961",
   "alternateHeaders": ["474946383761"],
-  "footer": "003B",
-  "maxBytes": 33554432
+  "structure": "gif",
+  "maxBytes": 33554432,
+  "notes": "GIF87a/89a. The engine's gif walker follows the logical screen descriptor, color tables, extension and image blocks with their sub-blocks, and ends at the 3B trailer at a block boundary (a byte-pattern footer would match 00 3B inside LZW data)."
 }

@@ -4,6 +4,7 @@
   "extension": "mp3",
   "category": "audio",
   "header": "4944330???",
+  "embeds": ["mp3"],
   "maxBytes": 67108864,
-  "notes": "ID3v2 tag (versions 2.x-4.x). MP3 has no footer and no total-size field, so the carve runs to the next file header or maxBytes and is reported as partial."
+  "notes": "ID3v2 tag (versions 2.x-4.x). MP3 has no footer and no total-size field, so the carve runs to the next file header or maxBytes and is reported as partial. Frame syncs inside it are its own audio, not new files."
 }

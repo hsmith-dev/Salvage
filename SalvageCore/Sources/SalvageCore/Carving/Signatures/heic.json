@@ -5,16 +5,32 @@
   "category": "pictures",
   "headerOffset": 4,
   "header": "6674797068656963",
-  "alternateHeaders": ["667479706D696631", "6674797068656978", "6674797068657663", "667479706865696D", "667479706D736631"],
+  "alternateHeaders": [
+    "667479706D696631",
+    "6674797068656978",
+    "6674797068657663",
+    "667479706865696D",
+    "667479706D736631"
+  ],
   "segments": {
     "start": 0,
-    "size": { "offset": 0, "width": 4, "endian": "big" },
+    "size": {
+      "offset": 0,
+      "width": 4,
+      "endian": "big"
+    },
     "minimum": 8,
     "typeOffset": 4,
     "typeLength": 4,
     "typePrintable": true,
-    "largeSize": { "ifValue": 1, "offset": 8, "width": 8 }
+    "largeSize": {
+      "ifValue": 1,
+      "offset": 8,
+      "width": 8
+    },
+    "zeroSizeToEnd": true
   },
   "maxBytes": 268435456,
-  "notes": "ISO-BMFF: ftyp brands heic, mif1, heix, hevc, heim, msf1. The box walk ends at the first byte sequence that is not a box."
+  "notes": "ISO-BMFF: ftyp brands heic, mif1, heix, hevc, heim, msf1. The box walk ends at the first byte sequence that is not a box.",
+  "trustedMaxBytes": 67108864
 }
