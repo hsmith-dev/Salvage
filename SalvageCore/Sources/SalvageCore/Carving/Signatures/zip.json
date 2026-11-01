@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "id": "zip",
+  "extension": "zip",
+  "category": "archives",
+  "header": "504B0304",
+  "footer": "504B0506",
+  "footerSizeField": { "offset": 20, "width": 2, "endian": "little", "adjust": 22 },
+  "maxBytes": 4294967296,
+  "notes": "Also covers docx/xlsx/pptx and other ZIP containers; they are carved with the .zip extension."
+}

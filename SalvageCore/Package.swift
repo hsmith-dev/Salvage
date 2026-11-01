@@ -21,6 +21,8 @@ let package = Package(
     targets: [
         .target(
             name: "SalvageCore",
+            // AD-6: carving signatures are data, shipped as a copied resource directory.
+            resources: [.copy("Carving/Signatures")],
             swiftSettings: [
                 .swiftLanguageMode(.v6)
             ]

@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "id": "pdf",
+  "extension": "pdf",
+  "category": "documents",
+  "header": "25504446",
+  "footer": "2525454F46",
+  "footerMode": "last",
+  "maxBytes": 268435456,
+  "notes": "Incrementally updated PDFs carry several %%EOF markers; the file ends at the last one seen before the next header, a claimed run or maxBytes."
+}

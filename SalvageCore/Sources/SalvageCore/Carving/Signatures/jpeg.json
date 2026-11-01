@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "jpeg",
+  "extension": "jpg",
+  "category": "pictures",
+  "header": "FFD8FF",
+  "segments": {
+    "start": 2,
+    "size": { "offset": 2, "width": 2, "endian": "big", "adjust": 2 },
+    "minimum": 4,
+    "typeOffset": 0,
+    "typeLength": 1,
+    "typeMatch": "FF",
+    "stopAt": ["FFDA"]
+  },
+  "footer": "FFD9",
+  "maxBytes": 134217728,
+  "notes": "Marker segments are walked up to start-of-scan, so an EXIF thumbnail's own FFD9 cannot end the file early; the footer search begins at the scan data."
+}

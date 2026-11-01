@@ -14,6 +14,9 @@ final class ResultsViewModel {
         let confidence: RecoveryConfidence?
         let isSystemFile: Bool
         let searchKey: String
+        /// True for a file rebuilt from raw bytes by signature carving (Story 3.2): it has a
+        /// generated name and no original folder or date, and is listed under "Reconstructed".
+        let isReconstructed: Bool
         var id: UUID { file.id }
         var name: String { file.name }
         var path: String { file.path }
@@ -21,6 +24,8 @@ final class ResultsViewModel {
         /// Non-optional so the browser's Table can sort by it; files without a date sort first.
         var modifiedSortKey: Date { file.modified ?? .distantPast }
         var isRecoverable: Bool { confidence != nil }
+        /// The producer knows the content is cut short; shown as `partialTag`, never as complete.
+        var isPartial: Bool { file.isPartial }
 
         init(_ file: RecoveredFile) {
             self.file = file
@@ -28,6 +33,7 @@ final class ResultsViewModel {
             confidence = file.recoveryConfidence
             isSystemFile = ResultsViewModel.isSystemFile(file)
             searchKey = (file.name + "\n" + file.path).lowercased()
+            isReconstructed = file.recoveryMethod == .carved
         }
     }
 
@@ -35,7 +41,20 @@ final class ResultsViewModel {
         let category: FileCategory
         var count: Int
         var totalBytes: Int64
+        /// How many of `count` are reconstructed (carved) files; shown as "(n reconstructed)".
+        var reconstructedCount = 0
         var id: FileCategory { category }
+    }
+
+    /// Text-only tag for a partial carve (EXPERIENCE.md: never presented as indistinguishable
+    /// from a complete file).
+    nonisolated static let partialTag = "Partial — may be incomplete"
+    /// Section titles the browser groups rows under when a listing has reconstructed files.
+    nonisolated static let filesystemSectionTitle = "From the filesystem"
+    nonisolated static let reconstructedSectionTitle = "Reconstructed"
+    /// "(3 reconstructed)" for a tile caption, or nil when the bucket has none.
+    nonisolated static func reconstructedCaption(_ count: Int) -> String? {
+        count > 0 ? "(\(count.formatted()) reconstructed)" : nil
     }
 
     enum SortField: Sendable, Equatable { case name, path, size, modified }
@@ -66,6 +85,8 @@ final class ResultsViewModel {
         var unrecoverableCount: Int
         /// Recoverable files per lost partition (FR-9), keyed by the partition's device offset.
         var lostPartitionFileCounts: [Int64: Int] = [:]
+        /// Recoverable files that were reconstructed by carving; included in the totals above.
+        var reconstructedCount = 0
     }
 
     /// What the dashboard says when there is nothing to show in the type tiles.
@@ -105,6 +126,10 @@ final class ResultsViewModel {
     /// Recoverable and unrecoverable counts within `visibleRows`, for the browser title.
     private(set) var visibleRecoverableCount = 0
     private(set) var visibleUnrecoverableCount = 0
+    /// Reconstructed rows within `visibleRows`; they are always its last rows, so the browser
+    /// shows `visibleRows[..<(count - visibleReconstructedCount)]` under "From the filesystem"
+    /// and the rest under "Reconstructed".
+    private(set) var visibleReconstructedCount = 0
     /// The File Browser's category filter; nil shows every category.
     var category: FileCategory?
     var searchText = ""
@@ -159,7 +184,7 @@ final class ResultsViewModel {
         if let cached = aggregateCache[includingSystemFiles] { return cached }
         aggregateComputations += 1
         var byCategory = Dictionary(uniqueKeysWithValues: FileCategory.allCases.map { ($0, Bucket(category: $0, count: 0, totalBytes: 0)) })
-        var recoverable = 0, unrecoverable = 0
+        var recoverable = 0, unrecoverable = 0, reconstructed = 0
         var bytes: Int64 = 0
         var lostCounts = Dictionary(uniqueKeysWithValues: lostPartitions.map { ($0.offset, 0) })
         for row in rows where includingSystemFiles || !row.isSystemFile {
@@ -170,9 +195,14 @@ final class ResultsViewModel {
             byCategory[row.category]?.count += 1
             byCategory[row.category]?.totalBytes += size
             if !lostCounts.isEmpty { lostCounts[row.file.sourceMetadata.volumeOffset]? += 1 }
+            if row.isReconstructed {
+                reconstructed += 1
+                byCategory[row.category]?.reconstructedCount += 1
+            }
         }
         let result = Aggregates(buckets: FileCategory.allCases.compactMap { byCategory[$0] }, recoverableCount: recoverable,
-                                recoverableBytes: bytes, unrecoverableCount: unrecoverable, lostPartitionFileCounts: lostCounts)
+                                recoverableBytes: bytes, unrecoverableCount: unrecoverable,
+                                lostPartitionFileCounts: lostCounts, reconstructedCount: reconstructed)
         aggregateCache[includingSystemFiles] = result
         return result
     }
@@ -182,6 +212,7 @@ final class ResultsViewModel {
     var recoverableCount: Int { current.recoverableCount }
     var recoverableBytes: Int64 { current.recoverableBytes }
     var unrecoverableCount: Int { current.unrecoverableCount }
+    var reconstructedCount: Int { current.reconstructedCount }
     /// Equal to the difference between the two cached aggregates, so it costs no extra scan.
     var hiddenSystemFileCount: Int {
         guard !showSystemFiles else { return 0 }
@@ -233,6 +264,7 @@ final class ResultsViewModel {
         let rows: [Row]
         let ids: Set<UUID>
         let recoverable: Int
+        var reconstructed = 0
     }
 
     /// Recomputes `visibleRows` for the current query away from the main actor. Every call
@@ -254,7 +286,8 @@ final class ResultsViewModel {
         let task = Task.detached(priority: .userInitiated) { () throws -> Applied in
             let result = try await apply(query, rows)
             try Task.checkCancellation()
-            return Applied(rows: result, ids: Set(result.lazy.map(\.id)), recoverable: result.lazy.filter(\.isRecoverable).count)
+            return Applied(rows: result, ids: Set(result.lazy.map(\.id)), recoverable: result.lazy.filter(\.isRecoverable).count,
+                           reconstructed: result.lazy.filter(\.isReconstructed).count)
         }
         inFlight = task
         let applied = try? await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
@@ -264,6 +297,7 @@ final class ResultsViewModel {
         visibleIDs = applied.ids
         visibleRecoverableCount = applied.recoverable
         visibleUnrecoverableCount = applied.rows.count - applied.recoverable
+        visibleReconstructedCount = applied.reconstructed
         appliedQuery = query
         // A selected row the filter now hides can't stay selected (or previewed).
         if !selection.isSubset(of: visibleIDs) { selection.formIntersection(visibleIDs) }
@@ -306,6 +340,12 @@ final class ResultsViewModel {
         case .path: try result.sort { try ordered($0.path, $1.path, $0, $1) }
         case .size: try result.sort { try ordered($0.sizeBytes, $1.sizeBytes, $0, $1) }
         case .modified: try result.sort { try ordered($0.modifiedSortKey, $1.modifiedSortKey, $0, $1) }
+        }
+        // Reconstructed files form their own section after the filesystem's files (Story 3.2);
+        // each group keeps the sort order above.
+        if result.contains(where: \.isReconstructed) {
+            try Task.checkCancellation()
+            result = result.filter { !$0.isReconstructed } + result.filter(\.isReconstructed)
         }
         return result
     }

@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "id": "gzip",
+  "extension": "gz",
+  "category": "archives",
+  "header": "1F8B08",
+  "maxBytes": 1073741824
+}

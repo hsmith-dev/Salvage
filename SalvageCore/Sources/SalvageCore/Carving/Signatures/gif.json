@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "id": "gif",
+  "extension": "gif",
+  "category": "pictures",
+  "header": "474946383961",
+  "alternateHeaders": ["474946383761"],
+  "footer": "003B",
+  "maxBytes": 33554432
+}

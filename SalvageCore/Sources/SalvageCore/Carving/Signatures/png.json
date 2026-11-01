@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "id": "png",
+  "extension": "png",
+  "category": "pictures",
+  "header": "89504E470D0A1A0A",
+  "footer": "49454E44AE426082",
+  "maxBytes": 67108864
+}

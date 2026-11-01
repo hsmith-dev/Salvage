@@ -114,7 +114,7 @@ struct ResultsDashboardView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Image(systemName: Self.symbol(for: bucket.category)).font(.title2).foregroundStyle(.secondary)
                 Text(bucket.category.displayName).font(.headline)
-                Text("\(filesText(bucket.count)) · \(bytes(bucket.totalBytes))").font(.caption).foregroundStyle(.secondary)
+                Text(["\(filesText(bucket.count)) · \(bytes(bucket.totalBytes))", ResultsViewModel.reconstructedCaption(bucket.reconstructedCount)].compactMap { $0 }.joined(separator: " ")).font(.caption).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(16)

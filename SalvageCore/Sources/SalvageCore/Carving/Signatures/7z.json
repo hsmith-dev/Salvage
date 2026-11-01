@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "7z",
+  "extension": "7z",
+  "category": "archives",
+  "header": "377ABCAF271C",
+  "sizeField": [
+    { "offset": 12, "width": 8, "endian": "little", "adjust": 32 },
+    { "offset": 20, "width": 8, "endian": "little" }
+  ],
+  "maxBytes": 17179869184,
+  "notes": "Size = 32-byte signature header + NextHeaderOffset + NextHeaderSize."
+}
