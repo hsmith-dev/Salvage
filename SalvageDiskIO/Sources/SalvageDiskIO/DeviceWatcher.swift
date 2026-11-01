@@ -36,8 +36,9 @@ public protocol DeviceWatching: Sendable {
 /// codebase (Architecture AD-1, CI-enforced by AD-9; `scripts/check-core-boundary.sh`). Nothing
 /// outside `SalvageDiskIO` is permitted to import DiskArbitration.
 ///
-/// Registers `DARegisterDiskAppearedCallback`/`DARegisterDiskDisappearedCallback` on a
-/// `DASession` scheduled on the app's main run loop (DiskArbitration callbacks require a run
+/// Registers `DARegisterDiskAppearedCallback`/`DARegisterDiskDisappearedCallback` (and, for
+/// Story 2.4's lock state, `DARegisterDiskDescriptionChangedCallback`) on a `DASession`
+/// scheduled on the app's main run loop (DiskArbitration callbacks require a run
 /// loop or dispatch queue to actually fire), and converts every currently-attached whole disk
 /// into a `BlockDevice` using Story 1.2's ported BSD-name-parsing (`BSDDeviceNames.swift`) and
 /// boot-disk-resolution (`BootDiskSafety.swift`) logic -- the one-shot enumeration this builds on
@@ -102,12 +103,97 @@ public final class DeviceWatcher: DeviceWatching, Sendable {
 
     /// `diskutil apfs list -plist`, off the UI actor. A failed listing changes nothing: no device
     /// is marked locked, none is claimed unlocked.
-    #if compiler(>=6.2)
-    @concurrent
-    #endif
     nonisolated private static func annotateLockedDevices(_ devices: [BlockDevice]) async -> [BlockDevice] {
-        guard let containers = liveAPFSContainers() else { return devices }
+        await annotateLockedDevices(devices, listing: liveAPFSContainers)
+    }
+
+    /// The listing is a blocking subprocess (tens to hundreds of milliseconds), so it runs on a GCD
+    /// queue through the same hop `FileVaultUnlocker` uses: never on the main actor, never on a
+    /// cooperative-pool thread (where it would hold one of the few threads Swift concurrency has
+    /// for the whole wait). `listing` is injectable so a test can observe where it runs.
+    nonisolated static func annotateLockedDevices(_ devices: [BlockDevice],
+                                                  listing: @escaping @Sendable () -> [APFSListedContainer]?) async -> [BlockDevice] {
+        guard let containers = await offCooperativePool(listing) else { return devices }
         return annotateLocked(devices, containers: containers)
+    }
+}
+
+/// Publishes device sets to the watcher's stream. Each device change publishes the plain set at
+/// once (the enumeration is cheap) and then, once the lock state resolver (a subprocess) has
+/// answered, the annotated set -- but only when that differs from what was **last published**,
+/// so a volume that was locked and is now unlocked (or the reverse) always reaches the picker:
+/// comparing against the plain set instead would silently keep a stale "Locked" row.
+///
+/// Confined to the main actor (DiskArbitration delivers on the main run loop). Separated from the
+/// DiskArbitration registration so this flow has unit coverage with an injected enumeration and
+/// resolver, without a `DASession`.
+@MainActor
+final class DeviceSetPublisher {
+    typealias Enumerate = @MainActor () -> [BlockDevice]
+    typealias Publish = @MainActor ([BlockDevice]) -> Void
+
+    private let enumerate: Enumerate
+    private let resolveLockState: DeviceWatcher.LockStateResolver
+    private let publish: Publish
+    private var isActive = true
+    /// Counts device changes, so an annotation that finishes after the device set changed again
+    /// is dropped instead of overwriting the newer set.
+    private(set) var generation = 0
+    /// The plain (unannotated) set as last enumerated.
+    private var devices: [BlockDevice] = []
+    private var lastPublished: [BlockDevice]?
+    /// One resolver run at a time: a change that arrives while one is in flight queues a single
+    /// re-run on the then-current set instead of spawning a subprocess per DiskArbitration event.
+    private var annotationInFlight = false
+    private var annotationQueued = false
+
+    init(enumerate: @escaping Enumerate, lockStateResolver: @escaping DeviceWatcher.LockStateResolver,
+         publish: @escaping Publish) {
+        self.enumerate = enumerate
+        self.resolveLockState = lockStateResolver
+        self.publish = publish
+    }
+
+    /// A disk appeared, disappeared, or changed its description (mounted, unmounted, locked,
+    /// unlocked). Re-enumerates; publishes the plain set at once if the set of disks changed; then
+    /// re-resolves the lock state and publishes the result if it differs from what is showing.
+    func deviceSetChanged() {
+        guard isActive else { return }
+        generation += 1
+        let current = enumerate()
+        if current != devices || lastPublished == nil {
+            devices = current
+            send(current)
+        }
+        scheduleAnnotation()
+    }
+
+    func stop() { isActive = false }
+
+    private func scheduleAnnotation() {
+        guard devices.contains(where: { !$0.isBootVolume }) else { return }
+        guard !annotationInFlight else { annotationQueued = true; return }
+        annotationInFlight = true
+        annotationQueued = false
+        let resolver = resolveLockState, snapshot = devices, started = generation
+        Task { [weak self] in
+            let annotated = await resolver(snapshot)
+            self?.annotationFinished(annotated, generation: started)
+        }
+    }
+
+    private func annotationFinished(_ annotated: [BlockDevice], generation started: Int) {
+        annotationInFlight = false
+        guard isActive else { return }
+        if started == generation { send(annotated) }
+        // A change arrived while the resolver ran: its answer is for an older set, so run once more.
+        if annotationQueued { scheduleAnnotation() }
+    }
+
+    private func send(_ set: [BlockDevice]) {
+        guard set != lastPublished else { return }
+        lastPublished = set
+        publish(set)
     }
 }
 
@@ -136,6 +222,13 @@ private let diskDisappearedTrampoline: DADiskDisappearedCallback = { _, context 
     DiskWatchRegistration.handleChange(context: context)
 }
 
+/// Story 2.4: a disk's description changed -- a volume was mounted or unmounted, which is also
+/// what locking and unlocking a FileVault volume do -- so the picker's "Locked" state is
+/// re-resolved instead of staying as it was when the disk appeared.
+private let diskDescriptionChangedTrampoline: DADiskDescriptionChangedCallback = { _, _, context in
+    DiskWatchRegistration.handleChange(context: context)
+}
+
 /// Holds the live DiskArbitration registration state for one `DeviceWatcher.watch()` call. A
 /// class, not a struct, because its identity is handed to the C callbacks above as an
 /// `UnsafeMutableRawPointer` context.
@@ -145,22 +238,20 @@ private let diskDisappearedTrampoline: DADiskDisappearedCallback = { _, context 
 private final class DiskWatchRegistration: @unchecked Sendable {
     private let session: DASession
     private let continuation: AsyncStream<[BlockDevice]>.Continuation
-    private let bootDisks: Set<String>
-    private let lockStateResolver: DeviceWatcher.LockStateResolver
+    private let publisher: DeviceSetPublisher
     private var isActive = false
-    /// Counts emissions, so a lock-state annotation that finishes after the device set changed
-    /// again is dropped instead of overwriting the newer set.
-    private var generation = 0
 
+    @MainActor
     init(session: DASession, continuation: AsyncStream<[BlockDevice]>.Continuation, bootDisks: Set<String>,
          lockStateResolver: @escaping DeviceWatcher.LockStateResolver) {
-        self.bootDisks = bootDisks
         self.session = session
         self.continuation = continuation
-        self.lockStateResolver = lockStateResolver
+        publisher = DeviceSetPublisher(enumerate: { Self.enumerateDevices(session: session, bootDisks: bootDisks) },
+                                       lockStateResolver: lockStateResolver,
+                                       publish: { continuation.yield($0) })
     }
 
-    func start() {
+    @MainActor func start() {
         guard !isActive else { return }
         isActive = true
 
@@ -169,8 +260,10 @@ private final class DiskWatchRegistration: @unchecked Sendable {
         let context = Unmanaged.passUnretained(self).toOpaque()
         DARegisterDiskAppearedCallback(session, nil, diskAppearedTrampoline, context)
         DARegisterDiskDisappearedCallback(session, nil, diskDisappearedTrampoline, context)
+        // No match or watch filter: any description change on any disk re-resolves lock state.
+        DARegisterDiskDescriptionChangedCallback(session, nil, nil, diskDescriptionChangedTrampoline, context)
 
-        emitCurrentDevices()
+        publisher.deviceSetChanged()
     }
 
     func stop() {
@@ -178,42 +271,29 @@ private final class DiskWatchRegistration: @unchecked Sendable {
         // arbitrary thread -- hop onto the main queue so every mutation here still honors this
         // type's "main-thread only" invariant (see the doc comment on this class).
         DispatchQueue.main.async { [self] in
-            guard self.isActive else { return }
-            self.isActive = false
-            let context = Unmanaged.passUnretained(self).toOpaque()
-            DAUnregisterCallback(self.session, unsafeBitCast(diskAppearedTrampoline, to: UnsafeMutableRawPointer.self), context)
-            DAUnregisterCallback(self.session, unsafeBitCast(diskDisappearedTrampoline, to: UnsafeMutableRawPointer.self), context)
-            DASessionUnscheduleFromRunLoop(self.session, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
-            self.continuation.finish()
+            MainActor.assumeIsolated {
+                guard self.isActive else { return }
+                self.isActive = false
+                self.publisher.stop()
+                let context = Unmanaged.passUnretained(self).toOpaque()
+                DAUnregisterCallback(self.session, unsafeBitCast(diskAppearedTrampoline, to: UnsafeMutableRawPointer.self), context)
+                DAUnregisterCallback(self.session, unsafeBitCast(diskDisappearedTrampoline, to: UnsafeMutableRawPointer.self), context)
+                DAUnregisterCallback(self.session, unsafeBitCast(diskDescriptionChangedTrampoline, to: UnsafeMutableRawPointer.self), context)
+                DASessionUnscheduleFromRunLoop(self.session, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+                self.continuation.finish()
+            }
         }
     }
 
+    /// DiskArbitration delivers on the main run loop (where the session is scheduled), so this is
+    /// on the main thread; `assumeIsolated` makes that the compiler's premise too.
     fileprivate static func handleChange(context: UnsafeMutableRawPointer?) {
         guard let context else { return }
         let registration = Unmanaged<DiskWatchRegistration>.fromOpaque(context).takeUnretainedValue()
-        registration.emitCurrentDevices()
-    }
-
-    private func emitCurrentDevices() {
-        guard isActive else { return }
-        generation += 1
-        let current = generation
-        let devices = Self.enumerateDevices(session: session, bootDisks: bootDisks)
-        continuation.yield(devices)
-        // Story 2.4: the lock state needs a subprocess, so the plain set goes out at once and the
-        // annotated full set follows (same contract: a full current set) only if anything is locked.
-        guard devices.contains(where: { !$0.isBootVolume }) else { return }
-        let resolver = lockStateResolver
-        Task.detached { [weak self] in
-            let annotated = await resolver(devices)
-            guard annotated != devices else { return }
-            await MainActor.run { self?.applyLockStates(annotated, generation: current) }
+        MainActor.assumeIsolated {
+            guard registration.isActive else { return }
+            registration.publisher.deviceSetChanged()
         }
-    }
-
-    @MainActor private func applyLockStates(_ devices: [BlockDevice], generation: Int) {
-        guard isActive, generation == self.generation else { return }
-        continuation.yield(devices)
     }
 
     /// Enumerates every currently-attached whole disk via DiskArbitration (metadata only -- no

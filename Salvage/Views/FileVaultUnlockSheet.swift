@@ -5,7 +5,10 @@ import SwiftUI
 /// The FileVault unlock sheet (FR-6): native sheet, secure field, password / recovery key
 /// toggle, and the explicit wrong-password vs tool-failure distinction EXPERIENCE.md requires.
 /// Composition follows `mockups/filevault-unlock-sheet.html`. The sheet is left only through its
-/// own buttons (Escape is Cancel), so a request is always resolved exactly once.
+/// own buttons (Escape is Cancel), so a request is always resolved exactly once. Presented only
+/// while `FileVaultUnlockFeature.canReadUnlockedVolumes` is on (the model never raises a request
+/// otherwise). The secure field writes into `UnlockViewModel.secret`, which `submit()` moves into
+/// erasable bytes and clears at once; see that type for what can't be zeroed.
 struct FileVaultUnlockSheet: View {
     @Bindable var model: UnlockViewModel
     /// Called with the device whose scan was waiting on this sheet.
