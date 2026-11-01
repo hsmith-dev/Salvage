@@ -92,3 +92,53 @@ Five independent work items, one agent each. Each section lists the files that a
 - `./scripts/check-core-boundary.sh && ./scripts/check-no-network.sh && ./scripts/check-xcodeproj-sync.sh`
 - `xcodebuild -project Salvage.xcodeproj -scheme Salvage -configuration Debug -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO -only-testing:SalvageTests test`
 - `xcodebuild -project Salvage.xcodeproj -scheme Salvage -configuration Release -destination 'platform=macOS' CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO build`
+
+## Implementation Notes — E
+
+**Files:**
+- `README.md`, rewritten. It covers what Salvage is, the trust promises, supported formats, the
+  build-from-source quickstart, the project layout, links, and a "Not yet verified" section.
+- New `docs/USER-GUIDE.md`, `docs/PRIVACY.md`, `docs/CONTRIBUTING-SIGNATURES.md` and
+  `docs/ARCHITECTURE.md`.
+
+**Method:**
+- Every UI string quoted in the docs was copied from the Swift sources on `main` at `6e13fef`:
+  `Salvage/Views/*`, `UnlockViewModel.Copy`, `PrivilegedHelperApproval`, `ScanNotice.text`,
+  `ScanError.description`, `RecoveryCoordinator` and `TrustPanelCopy`.
+- The supported formats come from `VolumeFormat`, `VolumeDiscovery` and the 19 bundled signature
+  JSON files.
+- The signature schema comes from `SignatureLibrary.swift`'s decoder.
+- The network facts come from `UpdateChecker.swift` and `check-no-network.sh`.
+- The written-data facts come from `ScanCheckpointStore` and `RecoveryCoordinator`.
+
+**Marked as unverified** (README "Not yet verified", plus a banner at the top of the user guide):
+- the signed privileged helper end to end on real USB drives and SD cards, including the TCC
+  question from AD-13;
+- hands-on and VoiceOver testing of the UI.
+
+**Code/doc mismatches found** (documented in `docs/ARCHITECTURE.md`, code not changed):
+1. **AD-3 in the spine puts FileVault unlock in SalvageDiskIO.** The app actually unlocks and
+   decrypts in SalvageCore (`APFSCrypto` / `EncryptedVolumeUnlock`).
+   `SalvageDiskIO/FileVaultUnlocker.swift`, the Story 2.4 `diskutil apfs unlockVolume` path, is
+   still in the package but unused by the app. It looks like dead code worth removing.
+2. **AD-11 says the scan pauses on `.unlockRequired`.** The code skips the locked volume, offers
+   the sheet after the scan, and re-scans.
+3. **The planning `ARCHITECTURE.md` says the app "prompts for Full Disk Access".** There is no
+   such prompt. FDA appears only in the `ScanError.permissionDenied` text, and whether FDA is ever
+   needed alongside the helper is still unverified.
+4. **The old README's planning-doc link list named only AD-1 to AD-12.** The spine now has AD-13.
+
+**Depends on parallel items A and B.** The docs describe `main` before batch 5. When A and B
+merge, update these places:
+- **A (bifragment JPEG):**
+  - the USER-GUIDE "Fragmented files" limitation;
+  - the CONTRIBUTING-SIGNATURES "Every carved file is one contiguous run" line.
+  A reassembled JPEG has two runs and stays Low.
+- **B (resume backfill):** the USER-GUIDE "About this scan" bullet for
+  `.resumedCarvingPartial`. After B, it appears only if the backfill is cancelled.
+- **C (UI tests):** if it lands with a passing run, soften the "hands-on UI testing" caveat.
+  Automated XCUITests aren't the same as a hands-on pass.
+
+**Not verified by this item:** whether a GitHub release exists. No local tags exist, so the
+README and the guide say to build from source if none is listed. No code or tests were run for
+this docs-only change.
