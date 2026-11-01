@@ -95,6 +95,37 @@ struct ScanViewModelTests {
         while model.isActive { await Task.yield() }
         #expect(model.state == .completed)
     }
+    /// spec-tech-authopen: the explanation shows while macOS's password dialog is up; a cancelled
+    /// dialog fails with its own error, which Try Again (a fresh start) clears.
+    @Test func administratorPasswordExplanationAndTryAgain() async {
+        let attempts = AttemptProbe()
+        let gate = AsyncStream<Void>.makeStream()
+        let observed = AttemptProbe()
+        let model = ScanViewModel { run, events in
+            let attempt = await attempts.next()
+            await run.willAskForAdministratorPassword()
+            if attempt == 1 {
+                _ = await observed.next()
+                for await _ in gate.stream { break }
+                throw ScanError.administratorPasswordNeeded
+            }
+            try await events.send(.progress(bytesScanned: 10, totalBytes: 1024))
+            try await events.send(.completed)
+        }
+        #expect(!model.isAwaitingAdministratorPassword)
+        model.start(device)
+        while await observed.count == 0 { await Task.yield() }
+        #expect(model.state == .preparing)
+        #expect(model.isAwaitingAdministratorPassword)
+        gate.continuation.yield()
+        while model.isActive { await Task.yield() }
+        #expect(model.state == .failed(.administratorPasswordNeeded))
+        #expect(!model.isAwaitingAdministratorPassword)
+        model.start(device)
+        while model.isActive { await Task.yield() }
+        #expect(model.state == .completed)
+        #expect(!model.isAwaitingAdministratorPassword)
+    }
     @Test func noticesAreCollectedInOrderAndResetPerScan() async {
         let attempts = AttemptProbe()
         let model = ScanViewModel { run, events in

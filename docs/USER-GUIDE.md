@@ -3,8 +3,8 @@
 This guide follows the app from opening it to getting your files back. Text in **bold** or in
 quotes is what the app shows, taken from the Swift views in `Salvage/Views/`.
 
-> **Pre-release note.** Nobody has yet tested the app's screens by hand, and nobody has yet run the
-> signed privileged helper on a real USB drive. The behavior described here comes from the code
+> **Pre-release note.** Nobody has yet tested the app's screens by hand, scanned a real USB drive
+> through the administrator-password dialog, or run the signed privileged helper on one. The behavior described here comes from the code
 > and its automated tests. See [Not yet verified](../README.md#not-yet-verified).
 
 ## Before you start
@@ -22,42 +22,59 @@ quotes is what the app shows, taken from the Swift views in `Salvage/Views/`.
 2. Unzip it and move **Salvage** to your Applications folder. Release builds are signed with
    Developer ID and notarized by Apple.
 
-If no release is published yet, see [Build from source](../README.md#build-from-source). An unsigned
-build can scan only disk images you attach yourself.
+If no release is published yet, see [Build from source](../README.md#build-from-source). A build you
+make yourself reads drives the same way, after asking for your administrator password.
 
 Salvage needs macOS 14 or later.
 
-## One-time approval for reading drives
+## Your administrator password for reading drives
 
-USB drives and memory cards can only be read with extra permission, so Salvage includes a small
-read-only helper. The first time you scan one, the scan stops and Salvage shows:
+USB drives, memory cards and external hard drives can only be read with an administrator's
+permission. You never need Terminal for this. When you scan one, Salvage first shows:
 
-> To read USB drives and memory cards, Salvage needs your one-time permission. Open System
-> Settings, go to General, then Login Items (called Login Items & Extensions on newer macOS), and
-> turn on Salvage under "Allow in the Background". Then retry the scan. Salvage only ever reads
-> the drive; it never changes it.
+> macOS will ask for an administrator password so Salvage can read this drive. Salvage only reads
+> it — it never writes to it.
+
+Then macOS shows its own password dialog. Enter the name and password of an administrator account
+on this Mac. Salvage never sees the password: macOS's built-in `authopen` tool checks it, opens
+the whole drive **read-only**, and hands only that read-only connection to Salvage. Salvage then
+checks again that the connection is read-only and is the drive you picked before it reads
+anything. It asks for the password for each scan, and again when you reconnect a saved scan's
+drive.
+
+If you click **Cancel** (or leave the dialog unanswered for three minutes), the scan stops and
+Salvage shows:
+
+> Salvage needs your administrator password to read this drive. Scanning is read-only.
+
+Click **Try Again** to be asked again.
+
+Your startup drive is refused before any password is asked for, as before.
+
+### Skip the password next time (optional, release builds only)
+
+A signed release of Salvage also includes a small read-only helper. Under **Try Again** it offers
+**Skip the password next time**. Click it, then:
 
 1. Click **Open System Settings**. It opens Login Items.
 2. Turn on **Salvage** under **Allow in the Background**.
-3. Return to Salvage and click **Retry scan**.
 
-The helper does one thing. It opens the selected whole drive read-only and hands it to Salvage.
-It never writes, mounts or unmounts anything, never touches the network, and keeps no log. It
-refuses your startup drive. When it has had no work for 60 seconds it exits, and macOS starts it
-again when it is next needed (`SalvageHelper/main.swift`).
+After that, Salvage reads drives without asking for your password. The helper does one thing. It
+opens the selected whole drive read-only and hands it to Salvage. It never writes, mounts or
+unmounts anything, never touches the network, and keeps no log. It refuses your startup drive.
+When it has had no work for 60 seconds it exits, and macOS starts it again when it is next needed
+(`SalvageHelper/main.swift`). Builds you make yourself don't offer it; they always use the
+password dialog.
 
 Other messages you may see:
 
-- "This copy of Salvage can't read USB drives or memory cards because its read-only disk access
-  part is missing or isn't signed. Install Salvage from its official release. Disk images you own
-  can still be scanned." This usually means an unsigned build.
 - "Salvage's read-only disk access didn't respond. Retry the scan. If it keeps failing, restart
-  your Mac and try again."
+  your Mac and try again." (helper only; Salvage falls back to the password dialog when it can)
 - "Allow Salvage in System Settings → Privacy & Security → Full Disk Access, then retry the scan.
-  You may need to reopen Salvage." This appears when macOS denies the read. Whether Full Disk
-  Access is ever needed alongside the helper hasn't been tested on real hardware yet.
+  You may need to reopen Salvage." This appears when macOS denies a read after the drive was
+  opened. Whether Full Disk Access is ever needed hasn't been tested on real hardware yet.
 
-Disk images you attach yourself are opened directly, without the helper.
+Disk images you attach yourself are opened directly, without a password.
 
 ## Choose a drive
 

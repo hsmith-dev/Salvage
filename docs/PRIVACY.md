@@ -14,10 +14,15 @@ Salvage collects no usage data, analytics or crash reports, and there is no acco
   node (`/dev/rdiskN`) read-only (`SalvageDiskIO/Sources/SalvageDiskIO/RawBlockReader.swift`). The
   descriptor is checked to be open `O_RDONLY` and to be the expected device. A writable descriptor
   is closed and the scan is refused.
-- Physical drives are opened by the privileged helper (`SalvageHelper/main.swift`), which hands
-  the read-only descriptor back. The helper reads no drive bytes itself. Disk images you attached
-  yourself are opened directly by the app.
-- The startup disk, and anything built on it, is refused by both the app and the helper. If
+- Physical drives are opened read-only by macOS's own `/usr/libexec/authopen`, after you enter an
+  administrator password in macOS's dialog (`SalvageDiskIO/Sources/SalvageDiskIO/AuthopenClient.swift`).
+  Salvage never sees or stores that password. authopen is asked only for read-only access
+  (`-o 0`, which is `O_RDONLY`) and hands the descriptor back over a local socket; it reads no
+  drive bytes itself. In a signed release you can instead approve the optional privileged helper
+  (`SalvageHelper/main.swift`) once, which does the same without a password. Disk images you
+  attached yourself are opened directly by the app.
+- The startup disk, and anything built on it, is refused by both the app and the helper, before
+  any password is asked for. If
   Salvage can't work out which disk is the startup disk, it refuses the scan.
 - All parsing happens in the app, in memory. A preview is decoded in memory and never written to
   disk.
@@ -41,8 +46,9 @@ Salvage doesn't read your other drives' contents, your files, or anything else o
 
 ## What Salvage writes
 
-**Nothing, ever, to the drive it scans.** It is opened read-only, and the helper only ever opens
-drives read-only.
+**Nothing, ever, to the drive it scans.** It is opened read-only, whether directly, through
+authopen's read-only right, or by the helper, which only ever opens drives read-only. Whichever
+path opened it, the app checks the descriptor is read-only before reading.
 
 **Recovered files**, only when you click **Recover**, and only into a new folder inside the
 destination you choose (`Salvage/ViewModels/RecoveryCoordinator.swift`):
@@ -73,7 +79,10 @@ fails to load, `SalvageCore` writes the definition's file name and the reason to
 **System changes you'll notice:**
 
 - The scanned drive stays unmounted after the scan. Disconnect it and plug it back in to use it.
-- Approving the helper adds Salvage under **Allow in the Background** in System Settings → General
+- macOS's administrator-password dialog appears when you scan a physical drive (unless you
+  approved the helper). macOS may record the authorization in its own system log, as it does for
+  any administrator prompt.
+- Approving the optional helper adds Salvage under **Allow in the Background** in System Settings → General
   → Login Items. Turn it off there, or delete the app to remove the registration.
 
 ## The single network request

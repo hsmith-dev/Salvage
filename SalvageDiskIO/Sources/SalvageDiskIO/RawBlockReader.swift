@@ -49,8 +49,15 @@ public actor RawBlockReader: BlockReader {
         self.logicalBlockSize = identity.blockSize; self.reservations = reservations; self.operations = operations
     }
 
-    public static func prepare(device: BlockDevice) async throws -> RawBlockReader {
-        try await prepare(device: device, operations: NativeRawDeviceOperations(), reservations: .shared)
+    /// Opens `device` read-only for scanning. A physical drive (`root:operator 0640`) is opened
+    /// through the enabled privileged helper, or else through macOS's administrator-password
+    /// dialog (`authopen`); `onAdministratorPasswordPrompt` runs just before that dialog is
+    /// requested, after every safety check, so the app can explain it first.
+    public static func prepare(device: BlockDevice,
+                               onAdministratorPasswordPrompt: @escaping @Sendable () async -> Void = {}) async throws -> RawBlockReader {
+        try await prepare(device: device,
+                          operations: NativeRawDeviceOperations(elevated: .live(onPasswordPrompt: onAdministratorPasswordPrompt)),
+                          reservations: .shared)
     }
 
     static func prepare(device: BlockDevice, operations: any RawDeviceOperations,
@@ -162,20 +169,55 @@ public actor RawBlockReader: BlockReader {
 /// Outcome of the unprivileged `open(2)` attempt.
 enum DirectOpenResult: Sendable, Equatable { case opened(Int32), failed(errno: Int32) }
 
+/// The privileged ways to open a physical drive, in AD-13 order, injectable for tests.
+struct ElevatedOpeners: Sendable {
+    /// The SMAppService helper (no prompt once approved).
+    var helper: any PrivilegedOpening
+    var helperStatus: @Sendable () async -> HelperRegistrationStatus
+    /// macOS's administrator-password dialog (`/usr/libexec/authopen`).
+    var password: any PrivilegedOpening
+    /// Runs just before `password` is asked, so the app can explain the dialog first.
+    var willAskForPassword: @Sendable () async -> Void
+
+    static func live(onPasswordPrompt: @escaping @Sendable () async -> Void) -> ElevatedOpeners {
+        let helper = PrivilegedOpenClient.live
+        return ElevatedOpeners(helper: helper, helperStatus: { await helper.control.status() },
+                               password: AuthopenClient.live, willAskForPassword: onPasswordPrompt)
+    }
+}
+
 /// AD-13 fallback: open the raw node directly first, which is all a user-owned device (an
 /// attached disk image, a test fixture) needs. Only EACCES/EPERM -- the `root:operator 0640`
-/// ownership of physical drives -- goes to the privileged helper. Either way the descriptor is
-/// then checked with `validateRawDescriptor`, so a helper fd is never trusted blindly.
+/// ownership of physical drives -- goes further: to the privileged helper when it is enabled,
+/// otherwise (or when the enabled helper turns out to be unavailable, never after one of its
+/// safety refusals) to the administrator-password dialog. Every caller has already refused the
+/// startup disk, unmounted the drive and re-checked its identity. Either way the descriptor is
+/// then checked with `validateRawDescriptor`, so a privileged fd is never trusted blindly.
 func openRawDevice(_ name: String, expected: RawDeviceIdentity, directOpen: (String) -> DirectOpenResult,
-                   helper: any PrivilegedOpening) async throws -> Int32 {
+                   elevated: ElevatedOpeners) async throws -> Int32 {
     guard isWholeDiskBSDName(name) else { throw ScanError.unsafeTarget(RawBlockReader.notWholeDriveReason) }
     let descriptor: Int32
     switch directOpen("/dev/r\(name)") {
     case .opened(let fd):
         descriptor = fd
     case .failed(let code) where code == EACCES || code == EPERM:
-        descriptor = try await helper.openWholeDiskReadOnly(
-            PrivilegedOpenRequest(bsdName: name, registryID: expected.registryID, deviceNumber: expected.deviceNumber))
+        let request = PrivilegedOpenRequest(bsdName: name, registryID: expected.registryID, deviceNumber: expected.deviceNumber)
+        var opened: Int32?
+        if await elevated.helperStatus() == .enabled {
+            do {
+                opened = try await elevated.helper.openWholeDiskReadOnly(request)
+            } catch let error as ScanError where PrivilegedHelperApproval.isUnavailability(error) {
+                // Not a refusal: the helper couldn't be reached. The password path still works.
+            }
+        }
+        if let opened {
+            descriptor = opened
+        } else {
+            try Task.checkCancellation()
+            await elevated.willAskForPassword()
+            try Task.checkCancellation()
+            descriptor = try await elevated.password.openWholeDiskReadOnly(request)
+        }
     case .failed(let code):
         throw ScanError.io(String(cString: strerror(code)))
     }
@@ -201,8 +243,8 @@ func validateRawDescriptor(_ descriptor: Int32, expected: RawDeviceIdentity) thr
 }
 
 private actor NativeRawDeviceOperations: RawDeviceOperations {
-    private let helper: any PrivilegedOpening
-    init(helper: any PrivilegedOpening = PrivilegedOpenClient.live) { self.helper = helper }
+    private let elevated: ElevatedOpeners
+    init(elevated: ElevatedOpeners) { self.elevated = elevated }
 
     func protectedDisks() async throws -> Set<String> {
         guard case .success(let disks) = resolveBootDisks(), !disks.isEmpty else {
@@ -255,14 +297,15 @@ private actor NativeRawDeviceOperations: RawDeviceOperations {
     }
     func openReadOnly(_ name: String, expected: RawDeviceIdentity) async throws -> Int32 {
         // No suspension between final identity validation and the direct open on this actor.
-        // The helper path does suspend; the helper re-checks registry ID, device number, boot
-        // refusal and mount state itself, and `prepare` re-validates identity after the open.
+        // The privileged paths do suspend: the helper re-checks registry ID, device number, boot
+        // refusal and mount state itself; for both it and the password path the descriptor's
+        // device number is checked, and `prepare` re-validates identity after the open.
         guard try await identity(name) == expected else { throw ScanError.deviceChanged }
         try ensureUnmounted(name, sources: ownedMountSources(), ancestorWholeDisks: registryAncestorWholeDisks(ofMediaNamed:))
         return try await openRawDevice(name, expected: expected, directOpen: { path in
             let fd = Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
             return fd >= 0 ? .opened(fd) : .failed(errno: errno)
-        }, helper: helper)
+        }, elevated: elevated)
     }
     func closeDescriptor(_ descriptor: Int32) async { Darwin.close(descriptor) }
 }

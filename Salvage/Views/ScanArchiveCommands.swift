@@ -116,15 +116,26 @@ extension FocusedValues {
 
 /// Opens a reconnected device for a saved scan, read-only, exactly as a scan does.
 enum ScanArchiveSource {
-    @Sendable static func open(_ device: BlockDevice) async throws -> SourceSession {
+    @Sendable static func open(_ device: BlockDevice,
+                               onAdministratorPasswordPrompt: @escaping @Sendable () async -> Void = {}) async throws -> SourceSession {
         #if DEBUG
         if let fixture = UITestFixture.active {
             let reader = InMemoryArchiveReader(data: fixture.image)
             return SourceSession(device: device, reader: reader, close: {})
         }
         #endif
-        let reader = try await RawBlockReader.prepare(device: device)
+        let reader = try await RawBlockReader.prepare(device: device, onAdministratorPasswordPrompt: onAdministratorPasswordPrompt)
         return SourceSession(device: device, reader: reader, close: { await reader.close() })
+    }
+}
+
+/// Carries the banner's "asking for the password" update across to the main actor.
+private struct PasswordPrompt: Sendable {
+    let update: @MainActor () -> Void
+    func show() async {
+        await MainActor.run(body: update)
+        // Let the explanation render before the dialog takes focus.
+        try? await Task.sleep(for: ScanViewModel.passwordExplanationLead)
     }
 }
 
@@ -151,13 +162,16 @@ struct SavedScanBanner: View {
     let scan: ScanViewModel
     @State private var candidate: BlockDevice?
     @State private var openFailed = false
+    /// spec-tech-authopen: macOS's password dialog is up, or was cancelled.
+    @State private var password: PasswordStep?
+    enum PasswordStep: Equatable { case asking, declined }
 
     var body: some View {
         if let reopened = scan.reopened, let device = scan.device {
             VStack(alignment: .leading, spacing: 6) {
                 if reopened.status != .connected {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text(Self.message(reopened.status, device: device.displayName, openFailed: openFailed))
+                        Text(Self.message(reopened.status, device: device.displayName, openFailed: openFailed, password: password))
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .accessibilityIdentifier("reconnect-message")
                         if reopened.status == .checking { ProgressView().controlSize(.small) }
@@ -167,6 +181,11 @@ struct SavedScanBanner: View {
                                 .accessibilityIdentifier("reconnect-source")
                         }
                     }
+                }
+                if password != nil, reopened.status != .connected {
+                    Text(AdministratorPasswordExplanation.explanation)
+                        .font(.subheadline).foregroundStyle(.inkSecondary)
+                        .accessibilityIdentifier("reconnect-password-explanation")
                 }
                 if reopened.hasEncryptedFiles {
                     Text("Files on encrypted volumes need the password again. Scan \(device.displayName) again and unlock it to preview or recover them.")
@@ -180,11 +199,15 @@ struct SavedScanBanner: View {
         }
     }
 
-    static func message(_ status: ScanViewModel.ReopenedScan.Status, device: String, openFailed: Bool) -> String {
+    static func message(_ status: ScanViewModel.ReopenedScan.Status, device: String, openFailed: Bool,
+                        password: PasswordStep? = nil) -> String {
         switch status {
+        case .waiting where password == .declined:
+            "Salvage needs your administrator password to read \(device). Click Reconnect to try again."
         case .waiting, .connected:
             openFailed ? "Salvage couldn't open \(device). Check that it's connected, then try again."
                        : "Reconnect \(device) to preview or recover these files."
+        case .checking where password == .asking: "Waiting for your administrator password\u{2026}"
         case .checking: "Checking that this is the same \(device)…"
         case .changed: "\(device) has changed since this scan was saved, so Salvage won't read from it. Scan it again to preview or recover files."
         case .unverifiable: "This scan stopped before Salvage mapped \(device), so it can't be reconnected. Scan the drive again to preview or recover files."
@@ -193,7 +216,15 @@ struct SavedScanBanner: View {
 
     private func reconnect(_ device: BlockDevice) {
         openFailed = false
-        Task { openFailed = await scan.reconnect(device, open: ScanArchiveSource.open) == .unavailable }
+        password = nil
+        let asking = PasswordPrompt { password = .asking }
+        Task {
+            let result = await scan.reconnect(device, open: { candidate in
+                try await ScanArchiveSource.open(candidate, onAdministratorPasswordPrompt: { await asking.show() })
+            })
+            openFailed = result == .unavailable
+            password = result == .needsAdministratorPassword ? .declined : nil
+        }
     }
 
     private func watch(for device: BlockDevice) async {

@@ -118,10 +118,14 @@ recovered, and the exit code is 4.
   in the device tree and opened with `RawBlockReader.prepare`, as the app does. The tool
   **unmounts the drive's volumes** first (the drive stays connected and is never written). They
   stay unmounted afterwards, as with the app; `diskutil mountDisk diskN` mounts them again.
-  Reading a physical drive as a normal user needs the privileged read-only helper. The helper
-  only accepts the signed Salvage app, so the command-line tool can read user-owned devices
-  (attached disk images) but not USB drives or memory cards. For those, use the app, or make an
-  image of the drive with the app or with `dd` and scan the image.
+  A physical drive (USB drive, memory card, external disk) is opened the same way as in the app:
+  if the direct read-only open is refused, macOS's administrator-password dialog appears (from
+  `/usr/libexec/authopen`, which opens the drive read-only and hands it back). It is a window
+  even when you run the tool in Terminal; there is no password prompt in the terminal, and you
+  don't need `sudo`. Cancelling it exits with the message "Salvage needs your administrator
+  password to read this drive. Scanning is read-only." Run the command again to be asked again.
+  The privileged helper is used instead only if it is enabled for a signed Salvage app on this
+  Mac. User-owned devices (attached disk images) open without a password.
 - **An image file**: any other argument, such as `./disk4` for a file with that name. Raw images
   (`.img`, `.dd`, `.cdr`, read-write `.dmg`) are read directly. A trailing UDIF block is
   skipped when it describes raw data. A compressed or encoded image (UDZO, sparse) is refused

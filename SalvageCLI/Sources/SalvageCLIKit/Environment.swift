@@ -41,8 +41,9 @@ struct CLIEnvironment: Sendable {
     /// "Locked" annotation arrive (it needs a `diskutil` listing).
     var listDevices: @Sendable (_ waitForLockState: Bool) async throws -> [BlockDevice]
     /// Opens a whole drive read-only. Live: `RawBlockReader.prepare`, which refuses the startup
-    /// disk, unmounts the drive's volumes, opens it O_RDONLY (falling back to the privileged
-    /// helper only on a permission error) and validates the descriptor.
+    /// disk, unmounts the drive's volumes, opens it O_RDONLY (on a permission error: the
+    /// privileged helper if enabled, else macOS's administrator-password dialog via authopen,
+    /// which appears as a window even from Terminal) and validates the descriptor.
     var openDevice: @Sendable (BlockDevice) async throws -> OpenedSource
     var openImage: @Sendable (String) throws -> OpenedSource
     var deviceDestination: @Sendable (URL, BlockDevice) -> DestinationAssessment
