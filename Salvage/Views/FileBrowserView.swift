@@ -19,6 +19,7 @@ struct FileBrowserView: View {
     @State private var sortOrder: [KeyPathComparator<ResultsViewModel.Row>]
     @State private var showsPreview = true
     @State private var recovery: RecoveryRequest?
+    @State private var detailsFile: RecoveredFile?
     @FocusState private var tableFocused: Bool
 
     init(model: ResultsViewModel, source: SourceSession?, onBack: @escaping () -> Void) {
@@ -42,6 +43,7 @@ struct FileBrowserView: View {
         .task(id: model.query) { await model.refresh(debounceSearch: true) }
         .onChange(of: sortOrder) { _, order in model.sort = Self.sort(from: order) }
         .sheet(item: $recovery) { request in recoverySheet(request) }
+        .sheet(item: $detailsFile) { file in FileDetailsSheet(details: FileDetails(file: file, device: source?.device)) { detailsFile = nil } }
         .background { keyboardShortcuts }
     }
 
@@ -52,6 +54,10 @@ struct FileBrowserView: View {
             Spacer()
             Toggle("Show system files", isOn: $model.showSystemFiles).toggleStyle(.checkbox)
             Button(showsPreview ? "Hide Preview" : "Show Preview") { showsPreview.toggle() }
+            Button("Show Details") { detailsFile = model.focusedRow?.file }
+                .keyboardShortcut("i", modifiers: .command)
+                .disabled(model.focusedRow == nil)
+                .accessibilityIdentifier("show-details-button")
             selectionMenu
             if let summary = model.selectionSummary {
                 Text(summary)
