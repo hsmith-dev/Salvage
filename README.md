@@ -106,6 +106,7 @@ with a SHA-256 checksum. If no release is listed there yet, build from source.
 - [User guide](docs/USER-GUIDE.md): install, scan, browse, preview, recover, FileVault, lost
   partitions, limitations.
 - [Privacy](docs/PRIVACY.md): exactly what Salvage reads, writes and sends.
+- [Command-line tool](docs/CLI.md): `salvage list`, `scan` and `recover`, with the same safety rules as the app.
 - [Contributing a file signature](docs/CONTRIBUTING-SIGNATURES.md): the JSON signature format
   and how to test a new one.
 - [Architecture overview](docs/ARCHITECTURE.md): the modules and their rules, with links to the

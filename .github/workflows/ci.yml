@@ -97,6 +97,12 @@ jobs:
       - name: Run SalvageDiskIO tests
         run: swift test --package-path SalvageDiskIO
 
+      # spec-tech-batch-6 §C: the `salvage` command-line tool (docs/CLI.md). Builds the
+      # executable and runs its tests, which scan and recover temp exFAT images made with hdiutil
+      # (SALVAGE_REQUIRE_HDIUTIL above: they fail rather than skip); drives are always fakes.
+      - name: Build and test the salvage CLI (swift test)
+        run: swift test --package-path SalvageCLI
+
       # Disposable spike tooling (Story 1.2's FDA/raw-device-access harness, see
       # scripts/spike-raw-device-access/), but it's still real code with safety-critical
       # boot-disk-detection logic -- build and test it like every other package in the repo

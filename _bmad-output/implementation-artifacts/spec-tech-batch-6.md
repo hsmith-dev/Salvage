@@ -168,3 +168,59 @@ The self-test packages an unsigned Debug build in dry-run mode. It then mounts t
 - The DMG bytes are not reproducible: `hdiutil` embeds timestamps, so the checksum changes from build to build (two runs gave different sums). Only the volume name and contents are deterministic, which is what the spec asks for.
 - The release no longer publishes the `.zip` and `.sha256`. It publishes the DMG and `SHA256SUMS` instead.
 - `test-package-release.sh` is not in ci.yml: §E doesn't own ci.yml, and A and C each own one step there. Suggested step: `./scripts/test-package-release.sh "$RUNNER_TEMP/DerivedData/Build/Products/Debug/Salvage.app"`, after the "Verify the helper is embedded" step. README doesn't link RELEASING.md (README isn't §E's).
+
+## Implementation Notes — C
+
+**What was built.** `salvage` is a SwiftPM executable package at `SalvageCLI/`. It depends on `SalvageCore` and `SalvageDiskIO` by path and contains three targets:
+- `SalvageCLIKit`: everything testable;
+- `salvage`: a thin `main.swift`, where Ctrl-C cancels the command;
+- `SalvageCLITests`.
+
+It has `list [--json]`, `scan <diskN|image> [--json] [--deleted-only] [--format …] [--limit n] [--quiet]`, `recover <source> --to <folder> (--all | --path <glob>… | --partition <offset>…) [--include-reconstructed] [--json] [--quiet]`, and `--version`/`--help`. It is documented in `docs/CLI.md`, with one README line linking to it. Exit codes are 0 done, 1 failed, 2 usage, 3 refused for safety, 4 finished with problems, 5 nothing matched, and 130 interrupted. A test checks that the doc lists each one.
+
+**Safety rules, and where each one is enforced:**
+- **Read-only source.**
+  - Devices go only through `RawBlockReader.prepare`, so they get the same checks as the app: the whole-disk name check, the identity checks, unmounting, an `O_RDONLY` open with the helper fallback, and validation of the descriptor.
+  - Image files go through `ImageFileReader`. It opens with `O_RDONLY`, checks the access mode after the open, accepts only a regular file, and reads with `pread`. A device node, or a link to one, given as a "path" is refused (exit 3), so `/dev/rdisk0` can't bypass the device checks.
+  - Compressed or encoded UDIF images (koly trailer with an XML block map) are refused rather than misread.
+- **Startup-disk refusal.** The CLI checks `isBootVolume` from the device tree and refuses before anything is opened. `RawBlockReader.prepare` refuses it again. A partition (`disk4s1`) or a synthesized container is refused with the whole-drive name to use.
+- **Destination on the source.**
+  - **For a device:** `DestinationSafety.live`.
+  - **For an image file:** the new `SalvageDiskIO/Sources/SalvageDiskIO/ImageFileDestinationSafety.swift`. This is the one new public DiskIO API, and it is strictly needed: the live physical-store, backing and `wholeDiskBSDName` resolvers are internal. The source is the image file, so a destination counts as on the source when its volume is backed by that file, directly or through nested images. The file is compared by `(st_dev, st_ino)`. Anything undetermined is refused. A folder on the volume that *stores* the image is allowed, matching how the app treats an attached image (its `sourceDeviceSet` doesn't follow the image to its host).
+  - **Order of checks:** checked before the source is opened (opening a drive unmounts it), then again right before writing. The engine then checks `fstatfs` coverage of the folder it actually opened.
+- **Never overwrite.** The app's engine is used unchanged. `RecoveryEngine` lives in the app target, so `SalvageCLIKit/RecoveryEngine.swift` is a **verbatim copy** of everything in `Salvage/ViewModels/RecoveryCoordinator.swift` above `// MARK: - Coordinator`. That copy includes `RecoveryPaths`, the `O_EXCL` `.partial` publish, the `O_NOFOLLOW` walks, root containment and durable sync. This duplication is documented in the file header and in `docs/CLI.md` (Maintenance, with an exact re-copy command). `engineCopyMatchesTheApp` fails on any drift. Moving the engine into a shared module would have meant editing app files outside §C.
+- **No network.** `scripts/check-no-network.sh` gained one line, `scan_dirs+=(SalvageCLI)`. `noNetworkCheckerCoversTheCLI` plants a violation under `SalvageCLI/` in a temp tree and checks that it is caught. There are no remote packages.
+
+**Decisions:**
+- **No `project.yml` target.** The CLI stays a standalone SwiftPM package: it isn't built into or embedded in the app, and `Salvage.xcodeproj` is unchanged. This avoids regenerating the project, and avoids conflicts with D and E, which also touch the app bundle and project.
+- **CI.** `ci.yml` gained one step: `swift test --package-path SalvageCLI`.
+- **Recover selection.** `--all`, `--path` and `--partition` select only recoverable files (`!isUnmapped`). Reconstructed files need `--include-reconstructed`, even when they are the only matches. The app pre-ticks the box in that case; the CLI exits 5 with a hint instead.
+- **Incomplete scans.** If a scan fails part-way, the files found so far are still recovered, as in the app's "found so far" flow, and the exit code is 4.
+- **Recovery folder name.** It is `Salvage Recovery <drive or image name> <date>`.
+- **JSON output.** It is JSON Lines with sorted keys. Besides the specified `file` and `notice` objects, `scan --json` also emits `lostPartition` objects. Notices come after the files, since the notice stream is drained when the scan ends.
+
+**Tests.** `swift test --package-path SalvageCLI` passes 28 tests in 6 suites. Drives in the tests are always injected fakes: no real device is listed or opened. The image tests build 16 MB GPT/exFAT images with `hdiutil` in a temp folder. Each image is attached only while it is populated, or for the mount-refusal test, then detached and deleted. The tests cover:
+- `scan --json`: every line parses, live and deleted files are listed, and the filters and `--limit` work;
+- `recover --all`: every file is byte-identical, including the deleted one, with no `.partial` files left over;
+- a second run gets a ` (2)` folder and leaves the first run's files untouched;
+- `--path` and `--partition` select the right files, and an empty match exits 5;
+- a destination inside the mounted source image is refused through the *live* `ImageFileDestinationSafety`, with nothing written;
+- a fake drive is checked → opened → checked again, in that order, then recovered;
+- the startup disk, and a same-device or undetermined destination, are refused with zero opens;
+- unit tests for parsing, globs, the image reader (device nodes, UDIF trailers) and the image-destination rule, plus the repo guards (engine drift, version vs `project.yml`, no-network coverage);
+- the built binary, run as a process.
+
+**Verification run (2026-11-01, on this branch):**
+- `swift test --package-path SalvageCLI`: 28 tests in 6 suites passed.
+- `swift test --package-path SalvageCore`: 406 tests in 31 suites passed.
+- `swift test --package-path SalvageDiskIO`: 168 tests in 24 suites passed.
+- `check-core-boundary.sh`, `check-no-network.sh`, `check-xcodeproj-sync.sh` and `test-check-no-network.sh` all passed.
+- `xcodebuild … -only-testing:SalvageTests test`: 177 tests in 15 suites passed.
+- `xcodebuild … -configuration Release … build`: succeeded.
+- `ci.yml` and `release.yml` parse with `yaml.safe_load`.
+
+**Not done / limits:**
+- FileVault volumes can't be unlocked from the CLI; they are reported as locked.
+- There is no pause or resume.
+- Physical USB drives and memory cards can't be read by the CLI as a normal user. The privileged helper's peer requirement only accepts the signed app, so `RawBlockReader` returns the helper's guidance error. User-owned devices and image files work.
+- The device path (`list`, `scan diskN`, `recover diskN`) was exercised only with injected fake drives, as required. It was never run against a real device: the one live manual check listed devices and then refused the startup disk before opening anything.

@@ -32,6 +32,7 @@ cd "$root" || exit 1
 
 status=0
 scan_dirs=(Salvage SalvageCore SalvageDiskIO SalvageHelper scripts)
+scan_dirs+=(SalvageCLI)  # spec-tech-batch-6 §C: the `salvage` command-line tool
 allowed_file="Salvage/Updates/UpdateChecker.swift"
 
 # Extended regular expressions, one per forbidden API. `socket(` and `connect(` are anchored on a
