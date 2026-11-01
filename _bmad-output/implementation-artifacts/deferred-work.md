@@ -50,3 +50,7 @@
   summary: Surface the carver's file-limit flag (`hitFileLimit`) and the lost-partition search-limited/table-warning results in the UI, and decide how a resumed scan treats carving of already-swept bytes.
   evidence: These are computed and unit-tested in Core, but the app shows none of them. ScanEvent is closed (AD-11), so it needs a non-event channel or an AD-11 amendment. A resumed scan carves only the bytes after the checkpoint, so files that started earlier are missed or carved as partial.
   status: resolved by spec-tech-scan-notices (ScanNotice side channel, "About this scan" dashboard section; a resumed scan now says carving covered only the remaining bytes — it still does not re-carve them).
+
+- source_spec: `spec-tech-carving-format-ends.md`
+  summary: Bifragment JPEG reassembly. Needs a baseline JPEG entropy decoder that checks the MCU count against the frame dimensions, plus a 2-D break × resume search.
+  evidence: Validating only marker syntax accepts almost any FF-free data, so it would stitch foreign bytes into "validated" files. Deliberately not shipped; fragmented JPEGs remain partial/Low. See that spec's Implementation Notes.

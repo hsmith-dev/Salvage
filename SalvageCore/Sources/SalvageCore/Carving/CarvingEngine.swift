@@ -84,6 +84,8 @@ actor SignatureCarver: Carver {
             case ending(Int64, Cut)
             /// No end rule applies: runs to a limit.
             case openEnded(Cut)
+            /// A structure walker (MP3 frames, OLE2 allocation table, gzip/DEFLATE) owns the walk.
+            case walker(any CarveWalker)
         }
         let signature: FileSignature
         let start: Int64
@@ -104,6 +106,7 @@ actor SignatureCarver: Carver {
             switch phase {
             case .walking(let next), .gif(let next, _): next
             case .ending(let end, _): end
+            case .walker(let walker): walker.cover ?? start
             case .footer, .openEnded: start
             }
         }
@@ -253,6 +256,7 @@ actor SignatureCarver: Carver {
             for carve in open {
                 switch carve.phase {
                 case .walking(let next), .footer(let next), .gif(let next, _): carryStart = min(carryStart, next)
+                case .walker(let walker): carryStart = min(carryStart, walker.retainFrom)
                 case .ending, .openEnded: break
                 }
             }
@@ -299,6 +303,8 @@ actor SignatureCarver: Carver {
             return weak || (embedded && !carve.signature.footerOffsetCheck.isEmpty)
         case .openEnded:
             return embedded && weak
+        case .walker(let walker):
+            return walker.absorbs(at: position, weak: weak, embedded: embedded, trustedMax: carve.trustedMax)
         }
     }
 
@@ -343,8 +349,13 @@ actor SignatureCarver: Carver {
             }
         } else if let segments = signature.segments {
             carve.phase = .walking(start + Int64(segments.start))
-        } else if signature.structure == .gif {
-            carve.phase = .gif(start + 6, .screen)
+        } else if let structure = signature.structure {
+            switch structure {
+            case .gif: carve.phase = .gif(start + 6, .screen)
+            case .mp3: carve.phase = .walker(MP3Walker(start: start, sectorSize: limits.sectorSize))
+            case .ole2: carve.phase = .walker(OLE2Walker(start: start, maxBytes: maxBytes))
+            case .gzip: carve.phase = .walker(GzipWalker(start: start, sectorSize: limits.sectorSize))
+            }
         } else if signature.footer != nil {
             carve.phase = .footer(start + minimumSize)
         }
@@ -425,6 +436,32 @@ actor SignatureCarver: Carver {
                 case .invalid:
                     // Not a block where one must be: the structure is broken here.
                     return Ended(carve: carve, end: next, cut: .inconsistent)
+                }
+
+            case .walker(let walker):
+                // Reaching a bound mid-walk proves nothing about where the file ends.
+                let bound = min(carve.claimLimit, carve.maxEnd)
+                func boundCut() -> Ended {
+                    Ended(carve: carve, end: bound, cut: bound == carve.claimLimit && carve.claimLimit < carve.maxEnd ? .claimed : .limit)
+                }
+                if walker.retainFrom >= bound { return boundCut() }
+                switch walker.advance(through: min(limit, bound), context) {
+                case .paused:
+                    if walker.retainFrom >= bound { return boundCut() }
+                    return nil
+                case .needBytes:
+                    return context.final ? cut(carve, at: context.end, .extentEnd) : nil
+                case .end(let end, let kind):
+                    carve.sizeDerived = walker.sizeDerived
+                    if end > carve.maxEnd {
+                        carve.phase = .ending(carve.maxEnd, .limit)
+                    } else if end > carve.claimLimit {
+                        carve.phase = .ending(carve.claimLimit, .claimed)
+                    } else {
+                        carve.phase = .ending(end, kind)
+                    }
+                case .openEnded(let kind):
+                    carve.phase = .openEnded(kind)
                 }
 
             case .footer(let from):
@@ -534,8 +571,9 @@ actor SignatureCarver: Carver {
     }
 }
 
-/// One window of bytes with its device offsets, for the synchronous matching helpers.
-private struct Window {
+/// One window of bytes with its device offsets, for the synchronous matching helpers and the
+/// structure walkers.
+struct Window {
     let buffer: UnsafeRawBufferPointer
     let start: Int64
     let end: Int64

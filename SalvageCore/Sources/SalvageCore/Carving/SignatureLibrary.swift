@@ -18,8 +18,15 @@ import Foundation
 ///    last occurrence, `footerLength` / `footerSizeField` say how many bytes the footer record
 ///    spans (a ZIP end-of-central-directory record carries its own comment length).
 /// 4. `structure` — a format walker built into the engine, for record layouts the declarative
-///    `segments` walk can't express (`"gif"`: logical screen, color tables, extension and image
-///    blocks with their sub-blocks, ended by the trailer at a block boundary).
+///    `segments` walk can't express:
+///    - `"gif"`: logical screen, color tables, extension and image blocks with their sub-blocks,
+///      ended by the trailer at a block boundary;
+///    - `"mp3"`: an optional ID3v2 tag, then consecutive MPEG audio frames of one stream, then an
+///      optional APEv2 and/or ID3v1 trailer (see `MP3Walker`);
+///    - `"ole2"`: the compound-file header, FAT (via the DIFAT) and first directory sector; the
+///      file ends after the highest allocated sector (see `OLE2Walker`);
+///    - `"gzip"`: the member header, the DEFLATE stream decoded to its final block, and the
+///      CRC-32/ISIZE trailer (see `GzipWalker`).
 /// 5. Otherwise the carve runs until `maxBytes`, the next header, a claimed run or the end of
 ///    the extent, and is reported as partial.
 ///
@@ -114,7 +121,7 @@ public struct FileSignature: Sendable, Equatable {
     }
 
     /// Engine-built walkers for formats the declarative rules can't describe.
-    public enum Structure: String, Sendable { case gif }
+    public enum Structure: String, Sendable, CaseIterable { case gif, mp3, ole2, gzip }
     /// Engine-built header checks.
     public enum Validation: String, Sendable { case mpegFrames }
 
@@ -148,7 +155,13 @@ public struct FileSignature: Sendable, Equatable {
         var reach = headerOffset + (headers.map(\.count).max() ?? 0)
         for field in sizeFields { reach = max(reach, field.reach) }
         if let segments { reach = max(reach, segments.start + segments.reach) }
-        if structure == .gif { reach = max(reach, 13) }
+        switch structure {
+        case .gif: reach = max(reach, 13)
+        case .mp3: reach = max(reach, 10)
+        case .ole2: reach = max(reach, OLE2Walker.headerBytes)
+        case .gzip: reach = max(reach, 10)
+        case nil: break
+        }
         if validation == .mpegFrames { reach = max(reach, Self.mpegFramesReach) }
         return reach
     }
@@ -328,7 +341,9 @@ extension FileSignature {
         embeds = Set(try decoder.optionalStringArray("embeds"))
         cutsOthers = try decoder.optionalBool("cutsOthers") ?? true
         if let name = try decoder.optionalString("structure") {
-            guard let structure = Structure(rawValue: name) else { throw SignatureError.invalidField("structure", "must be 'gif'") }
+            guard let structure = Structure(rawValue: name) else {
+                throw SignatureError.invalidField("structure", "must be one of \(Structure.allCases.map { "'\($0.rawValue)'" }.joined(separator: ", "))")
+            }
             self.structure = structure
         } else {
             structure = nil

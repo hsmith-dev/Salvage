@@ -4,7 +4,8 @@
   "extension": "mp3",
   "category": "audio",
   "header": "4944330???",
-  "embeds": ["mp3"],
+  "structure": "mp3",
+  "embeds": ["mp3", "jpeg", "png"],
   "maxBytes": 67108864,
-  "notes": "ID3v2 tag (versions 2.x-4.x). MP3 has no footer and no total-size field, so the carve runs to the next file header or maxBytes and is reported as partial. Frame syncs inside it are its own audio, not new files."
+  "notes": "ID3v2 tag (versions 2.x-4.x). The mp3 walker skips the tag by its syncsafe size (cover art inside it is embedded data), then follows the MPEG frames to the end of the stream and an optional APEv2/ID3v1 trailer. A tag not followed by frames runs to the next header or maxBytes and is partial."
 }
