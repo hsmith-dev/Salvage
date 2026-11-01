@@ -76,6 +76,31 @@ func registryAncestorWholeDisks(ofMediaNamed name: String) -> Set<String>? {
     return wholeDiskNames(ancestry.mediaBSDNames, excluding: wholeDiskBSDName(fromDevicePath: name) ?? name)
 }
 
+/// BSD names of every IOMedia above `entry` in the IOService plane, nearest first along each
+/// branch (for an APFS container synthesized from "disk0s2": `["disk0s2", "disk0"]`). The same
+/// walk as the startup-disk protection, so the Device Picker nests a container under exactly the
+/// physical store that protection resolves. `nil` on any registry failure.
+func registryAncestorMediaBSDNames(of entry: io_registry_entry_t) -> [String]? {
+    registryAncestry(of: entry)?.mediaBSDNames
+}
+
+/// BSD names of every IOMedia in the registry (whole disks, partitions, APFS volumes, snapshots),
+/// at most `limit`. `nil` if the registry couldn't be queried.
+func registryMediaBSDNames(limit: Int = 1024) -> [String]? {
+    var iterator: io_iterator_t = 0
+    guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOMedia"), &iterator) == KERN_SUCCESS
+    else { return nil }
+    defer { IOObjectRelease(iterator) }
+    var names: [String] = []
+    var entry = IOIteratorNext(iterator)
+    while entry != 0 {
+        defer { IOObjectRelease(entry); entry = IOIteratorNext(iterator) }
+        guard names.count < limit else { continue }
+        if let name = registryProperty(entry, "BSD Name") as? String, isDiskNodeBSDName(name) { names.append(name) }
+    }
+    return names
+}
+
 private func wholeDiskNames(_ mediaNames: [String], excluding own: String) -> Set<String>? {
     var wholes: Set<String> = []
     for ancestor in mediaNames {

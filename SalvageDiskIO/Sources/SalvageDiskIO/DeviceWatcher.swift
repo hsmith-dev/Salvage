@@ -43,8 +43,10 @@ public protocol DeviceWatching: Sendable {
 /// into a `BlockDevice` using Story 1.2's ported BSD-name-parsing (`BSDDeviceNames.swift`) and
 /// boot-disk-resolution (`BootDiskSafety.swift`) logic -- the one-shot enumeration this builds on
 /// is adapted from that story's spike (`DeviceEnumeration.swift`'s `listDevices()`), producing
-/// `BlockDevice` values instead of printing to stdout, and additionally filtering to whole disks
-/// only (`BlockDevice` models whole disks, never partitions/volumes, per this story's Boundaries).
+/// `BlockDevice` values instead of printing to stdout. Each `BlockDevice` is a whole drive (the scan
+/// target); its partitions and volumes ride along as its `partitions` tree, for display only, and
+/// a disk macOS synthesizes (an APFS container) is nested under its physical store rather than
+/// published as a device of its own (`buildDeviceTree`).
 public final class DeviceWatcher: DeviceWatching, Sendable {
     /// Story 2.4: annotates the devices whose APFS container holds only locked (FileVault)
     /// volumes with that volume (`BlockDevice.requiringUnlock`), so the Device Picker can show
@@ -330,46 +332,60 @@ final class DiskWatchRegistration: @unchecked Sendable {
         }
     }
 
-    /// Enumerates every currently-attached whole disk via DiskArbitration (metadata only -- no
-    /// Full Disk Access required for this, confirmed by Story 1.2's spike) and converts each one
-    /// to a `BlockDevice`. The `0...63` scan range and per-disk key reads are ported from the
-    /// spike's `listDevices()`; filtering to `kDADiskDescriptionMediaWholeKey` is new, since
-    /// `BlockDevice` (unlike the spike's printed listing) models whole disks only.
+    /// Enumerates every currently-attached drive via DiskArbitration (metadata only -- no Full
+    /// Disk Access required for this, confirmed by Story 1.2's spike) and builds the Device
+    /// Picker's tree from it (`buildDeviceTree`): each physical drive or disk image with its
+    /// partitions, APFS containers and volumes nested beneath it.
     fileprivate static func enumerateDevices(session: DASession, bootDisks: Set<String>) -> [BlockDevice] {
-        var devices: [BlockDevice] = []
+        buildDeviceTree(readDiskDescriptions(session: session), bootDisks: bootDisks)
+    }
+
+    /// Reads the descriptions `buildDeviceTree` needs. Whole disks are probed by name over the
+    /// `0...63` range ported from the spike's `listDevices()`; partitions and volumes are the
+    /// IOMedia the registry lists below those disks (one bounded registry query, so a partition
+    /// numbering gap -- a deleted APFS volume -- never hides the ones after it). Every read is
+    /// bounded and fails soft: a description that can't be read is recorded as unreadable, and the
+    /// builder then shows that drive with no children.
+    static func readDiskDescriptions(session: DASession) -> [RawDiskDescription] {
+        var disks: [RawDiskDescription] = []
+        var wholeNames: Set<String> = []
         for n in 0...63 {
             let name = "disk\(n)"
-            guard let disk = DADiskCreateFromBSDName(kCFAllocatorDefault, session, name) else { continue }
-            guard let descCF = DADiskCopyDescription(disk) else { continue }
-            let desc = descCF as NSDictionary
-
-            let isWhole = (desc[kDADiskDescriptionMediaWholeKey as String] as? Bool) ?? false
-            guard isWhole else { continue }
-
-            let isInternal = (desc[kDADiskDescriptionDeviceInternalKey as String] as? Bool) ?? false
-            let sizeBytes = (desc[kDADiskDescriptionMediaSizeKey as String] as? NSNumber)?.int64Value ?? 0
-            let model = ((desc[kDADiskDescriptionDeviceModelKey as String] as? String) ?? "")
-                .trimmingCharacters(in: .whitespaces)
-            let displayName = model.isEmpty ? name : model
+            guard let disk = DADiskCreateFromBSDName(kCFAllocatorDefault, session, name),
+                  let description = DADiskCopyDescription(disk) as? [String: Any] else { continue }
+            guard (description[DiskKey.whole] as? Bool) == true else { continue }
 
             let media = DADiskCopyIOMedia(disk)
-            var registryID: UInt64 = 0
             guard media != 0 else { continue }
+            var registryID: UInt64 = 0
             let identityResult = IORegistryEntryGetRegistryEntryID(media, &registryID)
+            let ancestors = registryAncestorMediaBSDNames(of: media)
             IOObjectRelease(media)
             guard identityResult == KERN_SUCCESS else { continue }
 
-            devices.append(
-                BlockDevice(
-                    bsdName: name,
-                    displayName: displayName,
-                    sizeBytes: sizeBytes,
-                    isInternal: isInternal,
-                    isBootVolume: isWithinBootDiskSet(name, bootDisks: bootDisks),
-                    mediaIdentity: registryID
-                )
-            )
+            wholeNames.insert(name)
+            disks.append(RawDiskDescription(bsdName: name, description: description, mediaIdentity: registryID,
+                                            ancestorMedia: ancestors))
         }
-        return devices
+
+        // Partitions and volumes (depth 1 only: snapshots aren't shown) of the disks found above.
+        let sliceNames = (registryMediaBSDNames() ?? []).filter { name in
+            sliceDepth(name) == 1 && wholeDiskBSDName(fromDevicePath: name).map(wholeNames.contains) == true
+        }
+        for name in Set(sliceNames).sorted() {
+            let description = DADiskCreateFromBSDName(kCFAllocatorDefault, session, name)
+                .flatMap { DADiskCopyDescription($0) as? [String: Any] }
+            disks.append(RawDiskDescription(bsdName: name, description: description))
+        }
+        return disks
     }
+
+    #if DEBUG
+    /// Debug-only acceptance hook: the live tree as text (BSD names and sizes), from a throwaway
+    /// session. Metadata only -- no raw reads, no mounts or unmounts.
+    static func debugLiveTreeDump(bootDisks: Set<String>) -> String? {
+        guard let session = DASessionCreate(kCFAllocatorDefault) else { return nil }
+        return debugDescription(ofDeviceTree: enumerateDevices(session: session, bootDisks: bootDisks))
+    }
+    #endif
 }

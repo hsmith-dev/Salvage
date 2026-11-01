@@ -5,9 +5,10 @@ import Foundation
 /// platform import anywhere in `SalvageCore`. `SalvageDiskIO` is the sole module that discovers
 /// real devices and produces `BlockDevice` values (see `DeviceWatcher`, `BootDiskSafety`).
 ///
-/// Models whole disks only, never an individual volume/partition -- matches the ERD
-/// (`ScanSession` targets a whole `BlockDevice` or a `LostPartitionCandidate`, never an arbitrary
-/// volume) and FR-1 / UJ-1 ("selects the external SSD from the device list").
+/// The scan target is always the whole disk, never an individual volume/partition -- matches the
+/// ERD (`ScanSession` targets a whole `BlockDevice` or a `LostPartitionCandidate`, never an
+/// arbitrary volume) and FR-1 / UJ-1 ("selects the external SSD from the device list"). The
+/// disk's partitions and volumes ride along in `partitions` for display only.
 public struct BlockDevice: Identifiable, Equatable, Sendable {
     /// The whole-disk BSD device name, e.g. `"disk6"` (no leading `/dev/`, no partition suffix).
     /// Stable and unique among currently-attached devices, so it doubles as `id`.
@@ -39,6 +40,11 @@ public struct BlockDevice: Identifiable, Equatable, Sendable {
     public let encryptedVolumeUUID: String?
     public let encryptedVolumeName: String?
 
+    /// The disk's partition tree (partitions, any APFS container on them, and its volumes), shown
+    /// beneath the drive in the Device Picker. Informational only: never a scan target. Empty when
+    /// the tree is unknown or couldn't be read.
+    public let partitions: [DevicePartition]
+
     public init(
         bsdName: String,
         displayName: String,
@@ -47,7 +53,8 @@ public struct BlockDevice: Identifiable, Equatable, Sendable {
         isBootVolume: Bool,
         mediaIdentity: UInt64? = nil,
         encryptedVolumeUUID: String? = nil,
-        encryptedVolumeName: String? = nil
+        encryptedVolumeName: String? = nil,
+        partitions: [DevicePartition] = []
     ) {
         self.bsdName = bsdName
         self.mediaIdentity = mediaIdentity
@@ -57,13 +64,14 @@ public struct BlockDevice: Identifiable, Equatable, Sendable {
         self.isBootVolume = isBootVolume
         self.encryptedVolumeUUID = encryptedVolumeUUID
         self.encryptedVolumeName = encryptedVolumeName
+        self.partitions = partitions
     }
 
     /// The same device, annotated with the encrypted volume that blocked part of its scan.
     public func requiringUnlock(volumeUUID: String, volumeName: String?) -> BlockDevice {
         BlockDevice(bsdName: bsdName, displayName: displayName, sizeBytes: sizeBytes, isInternal: isInternal,
                     isBootVolume: isBootVolume, mediaIdentity: mediaIdentity,
-                    encryptedVolumeUUID: volumeUUID, encryptedVolumeName: volumeName)
+                    encryptedVolumeUUID: volumeUUID, encryptedVolumeName: volumeName, partitions: partitions)
     }
 
     public var id: String { bsdName }
