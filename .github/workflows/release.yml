@@ -124,6 +124,16 @@ jobs:
           printf '%s\n' "$helper_info" | grep -q 'flags=.*runtime' || { echo "::error::SalvageHelper lacks hardened runtime"; exit 1; }
           printf '%s\n' "$helper_info" | grep -q '^Timestamp=' || { echo "::error::SalvageHelper lacks a secure timestamp"; exit 1; }
 
+      # Story 1.12 / AD-13: launchd only spawns the helper if it matches the bundled plist's
+      # SpawnConstraint, which the build pins to DEVELOPMENT_TEAM. Fail closed unless the app's
+      # signing Team ID (codesign -dv -> TeamIdentifier) is the requested team, the nested helper
+      # is signed by that same team, and the plist's SpawnConstraint team-identifier equals it.
+      # Logic in scripts/check-helper-signing-team.sh, covered by its self-test in ci.yml.
+      - name: Verify helper SpawnConstraint team matches the signing team
+        env:
+          DEVELOPMENT_TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
+        run: ./scripts/check-helper-signing-team.sh "$APP_PATH" "$DEVELOPMENT_TEAM"
+
       - name: Notarize app bundle
         env:
           NOTARIZATION_API_KEY: ${{ secrets.NOTARIZATION_API_KEY }}

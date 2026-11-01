@@ -81,7 +81,8 @@ public final class DeviceWatcher: DeviceWatching, Sendable {
 
         let lockStateResolver = lockStateResolver
         return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
-            let registration = DiskWatchRegistration(session: session, continuation: continuation, bootDisks: bootDisks,
+            let registration = DiskWatchRegistration(registrar: .live(session: session), continuation: continuation,
+                                                     enumerate: { DiskWatchRegistration.enumerateDevices(session: session, bootDisks: bootDisks) },
                                                      lockStateResolver: lockStateResolver)
             registration.start()
             continuation.onTermination = { _ in
@@ -229,24 +230,58 @@ private let diskDescriptionChangedTrampoline: DADiskDescriptionChangedCallback =
     DiskWatchRegistration.handleChange(context: context)
 }
 
+/// The DiskArbitration calls `DiskWatchRegistration` makes, bound to one session. Injected so a
+/// test can drive start/stop without a real `DASession` and check that every callback is
+/// unregistered with the exact callback/context pair it was registered with (DiskArbitration
+/// identifies a registration by that pair; a mismatch silently leaves the callback live).
+/// Callbacks are passed as the raw function pointer `DAUnregisterCallback` takes.
+struct DiskArbitrationRegistrar {
+    var schedule: () -> Void
+    var unschedule: () -> Void
+    var registerDiskAppeared: (DADiskAppearedCallback, UnsafeMutableRawPointer) -> Void
+    var registerDiskDisappeared: (DADiskDisappearedCallback, UnsafeMutableRawPointer) -> Void
+    var registerDiskDescriptionChanged: (DADiskDescriptionChangedCallback, UnsafeMutableRawPointer) -> Void
+    var unregister: (_ callback: UnsafeMutableRawPointer, _ context: UnsafeMutableRawPointer) -> Void
+
+    static func live(session: DASession) -> Self {
+        Self(
+            schedule: { DASessionScheduleWithRunLoop(session, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue) },
+            unschedule: { DASessionUnscheduleFromRunLoop(session, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue) },
+            registerDiskAppeared: { DARegisterDiskAppearedCallback(session, nil, $0, $1) },
+            registerDiskDisappeared: { DARegisterDiskDisappearedCallback(session, nil, $0, $1) },
+            // No match or watch filter: any description change on any disk re-resolves lock state.
+            registerDiskDescriptionChanged: { DARegisterDiskDescriptionChangedCallback(session, nil, nil, $0, $1) },
+            unregister: { DAUnregisterCallback(session, $0, $1) }
+        )
+    }
+}
+
 /// Holds the live DiskArbitration registration state for one `DeviceWatcher.watch()` call. A
 /// class, not a struct, because its identity is handed to the C callbacks above as an
 /// `UnsafeMutableRawPointer` context.
 ///
 /// Mutable state is confined to the main run loop: watch() starts on MainActor, callbacks
 /// run there, and stop() retains the registration until cleanup on that same run loop.
-private final class DiskWatchRegistration: @unchecked Sendable {
-    private let session: DASession
+final class DiskWatchRegistration: @unchecked Sendable {
+    private let registrar: DiskArbitrationRegistrar
     private let continuation: AsyncStream<[BlockDevice]>.Continuation
     private let publisher: DeviceSetPublisher
     private var isActive = false
 
+    /// The trampolines `start()` registers, as raw pointers, in registration order.
+    static var callbackPointers: [UnsafeMutableRawPointer] {
+        [unsafeBitCast(diskAppearedTrampoline, to: UnsafeMutableRawPointer.self),
+         unsafeBitCast(diskDisappearedTrampoline, to: UnsafeMutableRawPointer.self),
+         unsafeBitCast(diskDescriptionChangedTrampoline, to: UnsafeMutableRawPointer.self)]
+    }
+
     @MainActor
-    init(session: DASession, continuation: AsyncStream<[BlockDevice]>.Continuation, bootDisks: Set<String>,
+    init(registrar: DiskArbitrationRegistrar, continuation: AsyncStream<[BlockDevice]>.Continuation,
+         enumerate: @escaping DeviceSetPublisher.Enumerate,
          lockStateResolver: @escaping DeviceWatcher.LockStateResolver) {
-        self.session = session
+        self.registrar = registrar
         self.continuation = continuation
-        publisher = DeviceSetPublisher(enumerate: { Self.enumerateDevices(session: session, bootDisks: bootDisks) },
+        publisher = DeviceSetPublisher(enumerate: enumerate,
                                        lockStateResolver: lockStateResolver,
                                        publish: { continuation.yield($0) })
     }
@@ -255,13 +290,12 @@ private final class DiskWatchRegistration: @unchecked Sendable {
         guard !isActive else { return }
         isActive = true
 
-        DASessionScheduleWithRunLoop(session, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+        registrar.schedule()
 
         let context = Unmanaged.passUnretained(self).toOpaque()
-        DARegisterDiskAppearedCallback(session, nil, diskAppearedTrampoline, context)
-        DARegisterDiskDisappearedCallback(session, nil, diskDisappearedTrampoline, context)
-        // No match or watch filter: any description change on any disk re-resolves lock state.
-        DARegisterDiskDescriptionChangedCallback(session, nil, nil, diskDescriptionChangedTrampoline, context)
+        registrar.registerDiskAppeared(diskAppearedTrampoline, context)
+        registrar.registerDiskDisappeared(diskDisappearedTrampoline, context)
+        registrar.registerDiskDescriptionChanged(diskDescriptionChangedTrampoline, context)
 
         publisher.deviceSetChanged()
     }
@@ -276,10 +310,10 @@ private final class DiskWatchRegistration: @unchecked Sendable {
                 self.isActive = false
                 self.publisher.stop()
                 let context = Unmanaged.passUnretained(self).toOpaque()
-                DAUnregisterCallback(self.session, unsafeBitCast(diskAppearedTrampoline, to: UnsafeMutableRawPointer.self), context)
-                DAUnregisterCallback(self.session, unsafeBitCast(diskDisappearedTrampoline, to: UnsafeMutableRawPointer.self), context)
-                DAUnregisterCallback(self.session, unsafeBitCast(diskDescriptionChangedTrampoline, to: UnsafeMutableRawPointer.self), context)
-                DASessionUnscheduleFromRunLoop(self.session, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+                for callback in Self.callbackPointers {
+                    self.registrar.unregister(callback, context)
+                }
+                self.registrar.unschedule()
                 self.continuation.finish()
             }
         }
@@ -287,7 +321,7 @@ private final class DiskWatchRegistration: @unchecked Sendable {
 
     /// DiskArbitration delivers on the main run loop (where the session is scheduled), so this is
     /// on the main thread; `assumeIsolated` makes that the compiler's premise too.
-    fileprivate static func handleChange(context: UnsafeMutableRawPointer?) {
+    static func handleChange(context: UnsafeMutableRawPointer?) {
         guard let context else { return }
         let registration = Unmanaged<DiskWatchRegistration>.fromOpaque(context).takeUnretainedValue()
         MainActor.assumeIsolated {

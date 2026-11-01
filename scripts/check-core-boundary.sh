@@ -66,8 +66,15 @@ echo "== [3/3] SalvageCore's dependency graph must not leak a non-portable platf
 # frameworks. A direct source-tree grep (steps 1-2) alone would miss a third-party SwiftPM
 # dependency silently reintroducing one of these transitively.
 forbidden_pattern='AppKit|SwiftUI|IOKit|DiskArbitration'
-if [ -f SalvageCore/Package.swift ]; then
-    deps_output="$(swift package --package-path SalvageCore show-dependencies --format text 2>&1)"
+# Step 3 resolves this package's graph. Overridable only so scripts/test-check-core-boundary.sh can
+# point it at a temporary copy of SalvageCore with a planted dependency; CI never sets it.
+core_package="${SALVAGE_CORE_PACKAGE_PATH:-SalvageCore}"
+# A dependency "requires" a forbidden framework when any of its sources imports or links it:
+# Swift `import X` (attribute-prefixed too), C/ObjC `#import <X/...>`, `#include <X/...>` or
+# `@import X`, a module map's `link framework "X"`, or a manifest's `.linkedFramework("X")`.
+dep_import_pattern="${import_prefix}(${forbidden_pattern})\\b|^[[:space:]]*#[[:space:]]*(import|include)[[:space:]]*<(${forbidden_pattern})/|^[[:space:]]*@import[[:space:]]+(${forbidden_pattern})\\b|link[[:space:]]+framework[[:space:]]+\"(${forbidden_pattern})\"|linkedFramework\\([[:space:]]*\"(${forbidden_pattern})\""
+if [ -f "$core_package/Package.swift" ]; then
+    deps_output="$(swift package --package-path "$core_package" show-dependencies --format text 2>&1)"
     deps_status=$?
     echo "$deps_output"
     if [ "$deps_status" -ne 0 ]; then
@@ -80,11 +87,48 @@ if [ -f SalvageCore/Package.swift ]; then
             echo "$leaked_deps"
             status=1
         else
-            echo "OK: SalvageCore's dependency graph contains no forbidden platform frameworks"
+            echo "OK: SalvageCore's dependency graph names no forbidden platform frameworks"
+        fi
+
+        # Names alone prove nothing: a dependency called "Harmless" can still import AppKit. Walk
+        # every package in the resolved graph (each one's checkout or local path) and scan its
+        # sources for a forbidden import or link.
+        json_output="$(swift package --package-path "$core_package" show-dependencies --format json 2>/dev/null)"
+        json_status=$?
+        root_path="$(cd "$core_package" && pwd -P)"
+        dep_paths="$(printf '%s\n' "$json_output" | sed -n 's/^[[:space:]]*"path"[[:space:]]*:[[:space:]]*"\(.*\)",\{0,1\}[[:space:]]*$/\1/p' | sed 's#\\/#/#g' | sort -u)"
+        if [ "$json_status" -ne 0 ] || [ -z "$dep_paths" ]; then
+            echo "VIOLATION: could not list the package paths in SalvageCore's dependency graph"
+            status=1
+        else
+            dep_violations=""
+            dep_count=0
+            while IFS= read -r dep_path; do
+                [ -n "$dep_path" ] || continue
+                resolved="$(cd "$dep_path" 2>/dev/null && pwd -P)"
+                if [ -z "$resolved" ]; then
+                    dep_violations+="unreadable dependency checkout: $dep_path"$'\n'
+                    continue
+                fi
+                [ "$resolved" = "$root_path" ] && continue
+                dep_count=$((dep_count + 1))
+                found="$(grep -rnE --exclude-dir=.build --exclude-dir=.git --exclude-dir=.swiftpm \
+                    --include='*.swift' --include='*.h' --include='*.m' --include='*.mm' --include='*.c' \
+                    --include='*.cc' --include='*.cpp' --include='*.modulemap' \
+                    "$dep_import_pattern" "$resolved" 2>/dev/null)"
+                [ -n "$found" ] && dep_violations+="$found"$'\n'
+            done <<< "$dep_paths"
+            if [ -n "$dep_violations" ]; then
+                echo "VIOLATION: a package in SalvageCore's dependency graph requires a forbidden platform framework:"
+                printf '%s' "$dep_violations"
+                status=1
+            else
+                echo "OK: none of SalvageCore's $dep_count dependency package(s) imports or links a forbidden platform framework"
+            fi
         fi
     fi
 else
-    echo "VIOLATION: SalvageCore/Package.swift not found -- cannot resolve dependency graph"
+    echo "VIOLATION: $core_package/Package.swift not found -- cannot resolve dependency graph"
     status=1
 fi
 
