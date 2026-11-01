@@ -35,7 +35,7 @@ project_key: NOKEY
 tracking_system: file-system
 story_location: _bmad-output/implementation-artifacts
 development_status:
-  epic-1: in-progress
+  epic-1: review
   1-1-project-foundation-trustworthy-module-scaffold: review
   1-2-full-disk-access-raw-device-access-spike: review
   1-3-select-and-list-scan-target-devices: review
@@ -65,7 +65,7 @@ development_status:
   3-4-recover-files-from-a-lost-partition: review
   epic-3-retrospective: optional
 
-  epic-4: in-progress
+  epic-4: review
   4-1-scan-and-recover-deleted-files-from-an-ntfs-drive: review
   4-2-scan-and-recover-deleted-files-from-an-ext2-3-4-drive: review
   epic-4-retrospective: optional
