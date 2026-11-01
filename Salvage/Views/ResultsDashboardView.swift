@@ -101,6 +101,8 @@ struct ResultsDashboardView: View {
                                   alignment: .leading, spacing: 16) {
                             ForEach(totals.buckets) { bucket in tile(bucket) }
                         }
+                        .accessibilityElement(children: .contain)
+                        .accessibilityLabel("By type")
                         Text("\(filesText(totals.recoverableCount)) · \(bytes(totals.recoverableBytes)) in total")
                             .font(.subheadline).foregroundStyle(.secondary)
                         Button("Browse all files") { onOpen(nil) }

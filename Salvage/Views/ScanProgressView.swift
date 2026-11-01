@@ -17,6 +17,9 @@ struct ScanProgressView: View {
             } else if model.totalBytes > 0 {
                 ProgressView(value: Double(model.bytesScanned), total: Double(model.totalBytes))
                     .accessibilityLabel("Source bytes scanned")
+                    // EXPERIENCE.md: the scan's state is spoken with its progress, not only shown in the title.
+                    .accessibilityValue("\(model.state == .paused ? "Paused" : "Scanning"), \(percent(model.bytesScanned, of: model.totalBytes)) percent")
+                    .accessibilityIdentifier("scan-progress")
                 Text("\(Int(Double(model.bytesScanned) / Double(model.totalBytes) * 100))% of supported volume bytes read")
                     .font(.subheadline).foregroundStyle(.secondary)
                     .accessibilityIdentifier("scan-progress-percent")
@@ -52,8 +55,16 @@ struct ScanProgressView: View {
                     }
                     Spacer()
                     Text(ByteCountFormatter.string(fromByteCount: file.sizeBytes, countStyle: .file)).foregroundStyle(.secondary)
-                }.accessibilityElement(children: .combine)
+                }
+                // One read-only line per file: its path, volume and size (combining the children
+                // kept only the size, as the selectable path text isn't merged).
+                .accessibilityElement(children: .ignore)
+                .accessibilityAddTraits(.isStaticText)
+                .accessibilityLabel([file.path, volumeLabels[file.sourceMetadata.volumeOffset],
+                                     ByteCountFormatter.string(fromByteCount: file.sizeBytes, countStyle: .file)]
+                    .compactMap { $0 }.joined(separator: ", "))
             }
+            .accessibilityLabel("Files indexed so far")
             if model.state == .paused {
                 Text("Scan paused. Salvage is not reading the device. Resume continues from the same point.")
                     .font(.subheadline).foregroundStyle(.secondary)

@@ -123,6 +123,7 @@ struct DeviceListView: View {
             diskImagesSection
         }
         .listStyle(.inset)
+        .accessibilityLabel("Devices")
     }
 
     /// The context-menu action for a partition row, or nil when it offers none.
@@ -346,6 +347,8 @@ private struct PartitionTreeRows: View {
                     if let action = recoverAction(partition) { Button("Recover all files…", action: action) }
                 }
                 .accessibilityElement(children: .ignore)
+                // Information, not a control: without a trait the merged element has no role.
+                .accessibilityAddTraits(.isStaticText)
                 .accessibilityLabel(DeviceListViewModel.accessibilityLabel(for: partition, drive: drive,
                                                                            container: container))
         }

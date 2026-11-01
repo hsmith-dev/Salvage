@@ -330,3 +330,46 @@ Scan depth check, 200 inputs per format: about half complete with files found an
 **Findings.** None. No trap or hang appeared in `Parsers/**`, carving or `ScanSession` in 2.2 million total iterations, so no parser fix or regression test was needed, and there are no carving or `ScanSession` crashes to report. The parsers' existing checked arithmetic (`checkedAdd`/`checkedMultiply`/`signed`, bounded `Data.number`) and work budgets held.
 
 **Limits.** Coverage is mutation-based from a small seed set. It does not exercise APFS FileVault unlocking (no credentials are passed), resumed scans (`resumingFrom`), or recovery reads after the scan (`FileContentReader`). Real-image seeds differ between runs (UUIDs, timestamps), so a finding from a real seed is reproduced from its saved `input.img`, not from the seed number alone. HFS+ journal and NTFS update-sequence checksums are not re-sealed.
+
+## Implementation Notes — D
+
+**Audits added** (`SalvageUITests.swift`, `testAccessibilityAudit*`, macOS 14+ `performAccessibilityAudit`): Device Picker; Scan Progress running and paused; Results Dashboard with Partitions; File Browser with preview; Recovery sheet ready and blocked; Recovery Summary; Trust Panel; FileVault sheet (empty and after a wrong password). Each screen is audited in two passes (contrast on its own, as it is the slowest). A pass that times out ("Audit failed to complete in time", seen repeatedly under load averages of 40–235) is retried once, then reported as a timeout, not as findings. A new issue fails the test with every finding listed by screen. Known issues that need a change outside §D (list below) are attached to the test result ("<screen> -- reported accessibility issues") and don't fail it. They are matched by narrow rules in `knownIssue(_:window:table:sheet:)`.
+
+**Lost partitions not audited.** The UI-test fixture image has no lost partition, so the Lost partitions card never appears. Auditing it needs a fixture with one (`Salvage/Testing/UITestFixtures.swift`), which is outside §D.
+
+**Fixed (accessibility-only):**
+- Device tree partition rows had "Unknown role": `.accessibilityAddTraits(.isStaticText)` (`DeviceListView`). The text is now exposed as a static text's value; tests match label or value.
+- Device list scroll view had no description: `.accessibilityLabel("Devices")` on the List.
+- Scan Progress file rows read only their size ("1 KB", unknown role), because `.combine` dropped the selectable path text. Now one static text: "path, volume, size". The list is labeled "Files indexed so far".
+- Scan Progress bar: identifier `scan-progress`, value "Scanning, N percent" / "Paused, N percent" (EXPERIENCE.md role and state). Pause/Resume/Cancel scan are buttons with enabled state and hints; the tests check this.
+- File table scroll view had no description: `.accessibilityLabel("Files")`.
+- Preview pane confidence line ("Recovery confidence High") had unknown role: `.isStaticText`.
+- Dashboard tile grid had no description: a container labeled "By type".
+
+**Reported, not fixed (need a non-accessibility change, or are framework-internal):**
+- Contrast: secondary/tertiary text fails or nearly fails the audit's ratio on every screen: partition rows, "Select a device to start scanning.", "5 files · 14 KB in total", "N files indexed", the scan footers, file paths in the table, the browser title, the summary's destination path, and the window title "Salvage" (seen while the window was inactive). This needs a DESIGN.md color-token change (EXPERIENCE.md's Increase Contrast fallback), not a modifier.
+- NavigationSplitView / HSplitView panes (the window root, sidebar, detail and preview columns) are unlabeled AppKit groups. A label on the content doesn't reach them (tried on the split view root).
+- Sheet host groups (Trust Panel, FileVault sheet, Recovery sheet) are unlabeled. `.accessibilityElement(children: .contain)` plus a label on each sheet's root doesn't reach them (tried on all three, reverted).
+- SwiftUI Table cell containers (checkbox, Name, Path cells) are unlabeled. A label on the cell's Text doesn't reach them (tried on Path, reverted).
+- The "Select" `Menu` in the File Browser: "Action is missing" (an AXMenuButton opens with AXShowMenu, not AXPress).
+- FileVault sheet: one AppKit "Parent/Child mismatch" with no element attached.
+
+**EXPERIENCE.md checks** (asserted in the audit tests): confidence labels announce the word ("Recovery confidence High"); the destination block banner is labeled "Destination blocked. …"; Pause/Resume/Cancel scan are enabled buttons, Pause is replaced by Resume while paused, the paused state is stated in words, and the progress bar has the progress role; partition rows read "Partition …, on <drive>".
+
+**Robustness:**
+- Every click goes through `click(_:)`. It brings Salvage to the front, gives the element a short wait to become hittable, then clicks.
+- Every keystroke goes through `typeKey`/`typeText`. These re-activate Salvage and retry once on "Failed to synthesize event"; a second failure, or Salvage not reaching the front, records "Another app holds keyboard focus (frontmost: X)".
+- The fixed sleeps in the pause test are replaced by `waitUntilStable`.
+- An interruption monitor claims every interruption without touching it. XCUITest's "Handler claimed to have handled … still interrupting" is reworded as "Another app holds keyboard focus or covers Salvage".
+- Found here: when a monitor can't make another app's system permission prompt go away, XCUITest falls back to its built-in handler and presses "Don't Allow" on it, whichever app it belongs to. It also swipes at notification-center elements.
+  - In the first runs it tried this on PrivaStudy's "would like to access files in your Documents folder" prompt. Every attempt failed: the prompt stayed open until someone outside these tests answered it.
+  - The suite now checks for an open permission prompt in `setUp` and before every click and keystroke. It fails with "Another app's permission prompt is open (…). Answer it, then rerun" and clicks nothing.
+
+**UI suite runs** (the spec's command, `-only-testing:SalvageUITests`, 14 tests):
+1. Before the prompt guard and the final rules: 8 passed, 6 failed. Failures: 4 from XCUITest's built-in handler on PrivaStudy's open permission prompt and notification-center elements (no effect on either); 1 from PrivaStudy's window covering Salvage; 1 Pause click that found no button.
+2. With the prompt guard: 11 passed, 3 failed. Failures: 1 stopped cleanly by the guard while PrivaStudy's prompt was open; 1 had Path-cell findings not yet matched by the Table-cell rule (fixed after); 1 checked the partition row without waiting (now waits).
+3. Final code: 14 passed, 0 failed. No built-in handler activity.
+
+The coordinator then asked for no further UI runs: other agents' UI tests share the desktop and steal focus. Earlier discovery runs (subsets) also saw "Timed out while enabling automation mode" twice, audits timing out under load, and PrivaStudy's window covering Salvage.
+
+**Other verification:** `check-core-boundary.sh`, `check-no-network.sh`, `check-xcodeproj-sync.sh` pass. SalvageTests: 177 tests pass. The Release build succeeds. The SwiftPM packages are untouched by §D, so they were not rerun.
