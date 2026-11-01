@@ -6,7 +6,7 @@ import SalvageDiskIO
 /// The `salvage` command-line tool (spec-tech-batch-6 §C). See docs/CLI.md.
 public enum SalvageCLI {
     /// Kept equal to the app's MARKETING_VERSION in project.yml (a test checks).
-    public static let version = "0.1.0"
+    public static let version = "1.0.0"
 
     /// Runs one command line (without the program name) and returns the exit code.
     public static func run(arguments: [String], output: CLIOutput = .standard) async -> Int32 {

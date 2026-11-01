@@ -39,12 +39,14 @@ Each promise below is enforced in code, and most are checked in CI. The in-app T
 | Lost partitions | Filesystems found in unallocated space, outside the current partition table. They are read in place, and the partition table is never modified. |
 | Reconstructed (carved) files | JPEG, PNG, GIF, HEIC, MP4, MOV, M4A, MP3, WAV, AVI, PDF, ZIP (including docx/xlsx/pptx, saved as .zip), gzip, 7z, RAR (4.x and 5), SQLite, OLE2 (Office 97–2003, saved as .doc). Defined by JSON files in `SalvageCore/Sources/SalvageCore/Carving/Signatures/`. |
 
+Salvage runs on macOS 14 Sonoma or later, on Apple silicon and Intel Macs.
+
 Devices must use 512-byte logical sectors. See the [user guide](docs/USER-GUIDE.md#limitations)
 for the full list of limitations.
 
 ## Build from source
 
-You need macOS 14 or later and Xcode 16 with Swift 6. CI pins Xcode 16.0.
+You need macOS 14 or later and Xcode 16 or later with Swift 6. CI pins Xcode 26.6.
 
 ```sh
 git clone https://github.com/hsmith-dev/Salvage.git
@@ -84,8 +86,10 @@ signed by the same team. To try the helper from source, set the same team for th
 [spec-1-12, "Manual end-to-end verification"](_bmad-output/implementation-artifacts/spec-1-12-read-physical-drives-via-a-read-only-privileged-helper.md).
 
 Signed, notarized releases come from `.github/workflows/release.yml` when a `v*.*.*` tag is
-pushed, and are published to [GitHub Releases](https://github.com/hsmith-dev/Salvage/releases)
-with a SHA-256 checksum. If no release is listed there yet, build from source.
+pushed, or from `scripts/release-local.sh` on the maintainer's Mac, and are published to
+[GitHub Releases](https://github.com/hsmith-dev/Salvage/releases) with a SHA-256 checksum. If no
+release is listed there yet, build from source. Salvage is not on the Mac App Store, and why is in
+[docs/DISTRIBUTION.md](docs/DISTRIBUTION.md).
 
 ## Project layout
 
@@ -112,7 +116,11 @@ with a SHA-256 checksum. If no release is listed there yet, build from source.
   and how to test a new one.
 - [Architecture overview](docs/ARCHITECTURE.md): the modules and their rules, with links to the
   planning documents.
-- [Releasing](docs/RELEASING.md): the signing secrets, tagging a release, and verifying a download.
+- [Releasing](docs/RELEASING.md): the signing secrets, tagging a release, releasing from your own
+  Mac, and verifying a download. The manual pre-release checks are in
+  [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md).
+- [Distribution](docs/DISTRIBUTION.md): why Salvage ships as a notarized download rather than on
+  the Mac App Store.
 
 ## Not yet verified
 

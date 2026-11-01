@@ -90,6 +90,13 @@ if [ $? -ne 0 ] && printf '%s' "$output" | grep -qF "NOTARIZATION_API_KEY is mal
 else
     failed "--release with a malformed API key" "$output"
 fi
+output="$(env -u DEVELOPMENT_TEAM -u NOTARIZATION_API_KEY "$packager" --release --notary-profile p "$fake" 9.9.9 "$work/o2" 2>&1)"
+if [ $? -ne 0 ] && printf '%s' "$output" | grep -qF "variables: DEVELOPMENT_TEAM (nothing" && [ ! -e "$work/o2" ]; then
+    pass "--release --notary-profile needs only DEVELOPMENT_TEAM"
+else
+    failed "--release --notary-profile without a team" "$output"
+fi
+expect "--notary-profile without a name" 2 "[--notary-profile NAME]" -- --dry-run "$fake" 1.0.0 "$work/o1" --notary-profile
 [ ! -e "$work/o1" ] && pass "no failed run created an output folder" || failed "outputs" "$work/o1 exists"
 
 # --- 2. Dry-run package of a real unsigned Debug build ---

@@ -35,6 +35,7 @@
 		66722FEAF35922CE34E58F2F /* FileDetailsUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC43AA2956FB8CEC04339818 /* FileDetailsUITests.swift */; };
 		680844754611EBBCB5945B3F /* TrustPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71F3E757E68865FD5D2FA447 /* TrustPanelView.swift */; };
 		6A926703E084480718248DBB /* SourceSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 033C52D0FB3387397999220A /* SourceSession.swift */; };
+		6B36BAC9E4F5198FB84D405F /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = C6E7241D5AD37F29105C795E /* PrivacyInfo.xcprivacy */; };
 		6B72BE7198AFA1AD22773D13 /* UpdateChecker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A78CB2252556649B9DABE08 /* UpdateChecker.swift */; };
 		6BEE060426D0E80E24AF664C /* ScanViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4CD440ACD4B335303928637 /* ScanViewModel.swift */; };
 		6C09923FBE34998BE106218D /* FileDetailsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD7A9D6DBF1CB9D732DF45E0 /* FileDetailsView.swift */; };
@@ -175,6 +176,7 @@
 		C27B878CAE6072F60D624337 /* RecoveryReportUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecoveryReportUITests.swift; sourceTree = "<group>"; };
 		C504F6515FC245842FF3C263 /* AppIconTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppIconTests.swift; sourceTree = "<group>"; };
 		C5742DFC4C322D2335F60B77 /* Salvage.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Salvage.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		C6E7241D5AD37F29105C795E /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		C9B50FA188E574035619F7D8 /* ReadOnlySourceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReadOnlySourceTests.swift; sourceTree = "<group>"; };
 		C9D545C7519DEC1E75E987A4 /* SalvageTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SalvageTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		CE2990E60BD4FA2AE62C9B55 /* SalvageUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SalvageUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -380,6 +382,7 @@
 			isa = PBXGroup;
 			children = (
 				8A06482A7250D39FCA2C2A1E /* Assets.xcassets */,
+				C6E7241D5AD37F29105C795E /* PrivacyInfo.xcprivacy */,
 				B1DE755CB1D6209CEB18BBAE /* SalvageApp.swift */,
 				3961469545E83B865E2B3116 /* Testing */,
 				D6BBE607680FC197B5098F97 /* Updates */,
@@ -533,6 +536,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				D7300B0F8E274A733CEC80D7 /* Assets.xcassets in Resources */,
+				6B36BAC9E4F5198FB84D405F /* PrivacyInfo.xcprivacy in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -733,13 +737,14 @@
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "Copyright © 2026 HSmithDev LLC. MIT License.";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.1.0;
+				MARKETING_VERSION = 1.0.0;
 				PRODUCT_BUNDLE_IDENTIFIER = dev.hsmith.Salvage;
 				PRODUCT_NAME = Salvage;
 				SDKROOT = macosx;
@@ -839,13 +844,14 @@
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "Copyright © 2026 HSmithDev LLC. MIT License.";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.1.0;
+				MARKETING_VERSION = 1.0.0;
 				PRODUCT_BUNDLE_IDENTIFIER = dev.hsmith.Salvage;
 				PRODUCT_NAME = Salvage;
 				SDKROOT = macosx;
@@ -863,12 +869,13 @@
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "Copyright © 2026 HSmithDev LLC. MIT License.";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.1.0;
+				MARKETING_VERSION = 1.0.0;
 				PRODUCT_BUNDLE_IDENTIFIER = dev.hsmith.Salvage.Helper;
 				PRODUCT_NAME = SalvageHelper;
 				SDKROOT = macosx;
@@ -926,12 +933,13 @@
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "Copyright © 2026 HSmithDev LLC. MIT License.";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.1.0;
+				MARKETING_VERSION = 1.0.0;
 				PRODUCT_BUNDLE_IDENTIFIER = dev.hsmith.Salvage.Helper;
 				PRODUCT_NAME = SalvageHelper;
 				SDKROOT = macosx;
