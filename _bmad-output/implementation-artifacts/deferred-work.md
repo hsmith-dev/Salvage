@@ -1,9 +1,11 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-1-project-foundation-trustworthy-module-scaffold.md`
   summary: Add automated test coverage for check-core-boundary.sh's transitive dependency-leak check (step 3), exercising a real forbidden-framework-requiring SwiftPM dependency.
   evidence: Current test-check-core-boundary.sh only exercises steps 1-2 (source-grep). Step 3's branch logic (the leaked_deps check) is only ever hit on the trivial "zero dependencies" path, so a regression there (e.g. a typo in the forbidden-framework pattern) would not be caught until a real violation occurs. Needs adding then removing a real dependency with network resolution -- not justified for a scaffold story with no real dependencies yet.
+  status: resolved by spec-tech-ci-and-test-hygiene (test-check-core-boundary.sh plants offline local SwiftPM packages -- direct, transitive and module-map -- in a temp copy of SalvageCore; step 3 now scans every package in the resolved graph for forbidden imports/links, since name matching alone could not catch them).
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-1-project-foundation-trustworthy-module-scaffold.md`
   summary: Add a CI check that the committed Salvage.xcodeproj stays in sync with project.yml (xcodegen's source of truth).
   evidence: ci.yml builds the checked-in .xcodeproj directly; nothing verifies it still matches what `xcodegen generate` would currently produce from project.yml. Real drift risk as the project grows, but the fix requires installing xcodegen in CI and diffing output -- more than a trivial addition for this foundation story.
+  status: resolved by spec-tech-ci-and-test-hygiene (scripts/check-xcodeproj-sync.sh + test-check-xcodeproj-sync.sh; CI installs xcodegen 2.46.0 from the release zip with a SHA-256 check).
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-1-project-foundation-trustworthy-module-scaffold.md`
   summary: Implement AD-12's zero-network CI enforcement (fail the build if any network-capable API appears outside the designated Check-for-Updates path).
   evidence: Architecture AD-12 documents this as a first-class requirement, and epic-1-context.md names it, but no story in Epic 1 besides 1.11 ("Verify the App's Privacy Guarantees Yourself") owns implementing it. Out of Story 1.1's committed scope (frozen Intent names only AD-1/AD-9/AD-10) -- flagged here so it isn't silently forgotten before Story 1.11 starts.
@@ -20,10 +22,12 @@
 - source_spec: `spec-1-3-select-and-list-scan-target-devices.md`
   summary: Direct tests for DiskWatchRegistration start/stop (DAUnregisterCallback context matching) and for List deselection clearing the selection.
   evidence: Verification-gap review. Both fixes are in the code but have no direct tests: `DeviceWatcherTests` never reaches `DASessionCreate`, and the SwiftUI `List` nil-selection path can't be driven from Swift Testing. Needs a DA-session seam or a UI test target.
+  status: resolved by spec-tech-ci-and-test-hygiene (injected DiskArbitrationRegistrar seam; DiskWatchRegistrationTests prove matching unregister pairs and no callback after stop; DeviceListViewModelTests covers model-level deselection. The SwiftUI List binding itself is still not driven -- that needs a UI test target).
 
 - source_spec: `spec-1-12-read-physical-drives-via-a-read-only-privileged-helper.md`
   summary: Run the signed end-to-end check of the privileged helper, and add a release.yml check that the bundled plist's SpawnConstraint team-identifier matches the app's team.
   evidence: The helper and its hardening are unit-tested only. Still unverified on a live launchd: Developer ID-only caller enforcement, that launchd accepts SpawnConstraint for an SMAppService daemon, idle exit, and whether TCC also gates a root helper's raw open of removable media (the open question in AD-13). The manual steps are in the spec's Implementation Notes. This needs a Developer ID build signed with the team and the user's approval, on the user's machine.
+  status: partially resolved by spec-tech-ci-and-test-hygiene -- release.yml now fails closed unless the helper plist's SpawnConstraint team-identifier, the nested helper's Team ID and the app's signing Team ID all match (scripts/check-helper-signing-team.sh + self-test). Still open: the signed end-to-end run on a live launchd, which needs a Developer ID build on the user's machine.
 - source_spec: `spec-1-7-1-8-browse-results-and-confidence.md`
   summary: Hands-on UI pass of scan → browse → preview → recover in the running app (keyboard shortcuts, Cmd-A precedence, pane layout).
   evidence: Every flow is unit-tested, and the app launches with 0 network sockets, but computer use wasn't available to drive the UI. The core path was validated headlessly on real macOS-created exFAT/FAT32 images: live and deleted files were recovered byte-identical.

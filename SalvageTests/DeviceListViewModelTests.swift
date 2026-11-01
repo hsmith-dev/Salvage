@@ -96,6 +96,38 @@ struct DeviceListViewModelTests {
         #expect(viewModel.selectedDeviceID == nil)
     }
 
+    /// `DeviceListView`'s List selection binding routes a nil write (clicking empty list space,
+    /// pressing Escape) to `clearSelection()`. The SwiftUI List itself can't be driven from Swift
+    /// Testing, so this covers the model half of that path: what the nil write must do.
+    @Test("Deselecting (the List writing nil) clears the selection, keeps the devices, and allows reselecting")
+    func deselectionClearsSelection() async {
+        let fake = FakeDeviceWatcher()
+        let viewModel = DeviceListViewModel(watcher: fake)
+        defer { viewModel.stopWatching() }
+        viewModel.startWatching()
+        fake.emit([Self.bootVolume, Self.externalDrive])
+        await settle()
+
+        // A nil write with nothing selected is a harmless no-op.
+        viewModel.clearSelection()
+        #expect(viewModel.selectedDeviceID == nil)
+
+        viewModel.selectDevice(Self.externalDrive)
+        #expect(viewModel.selectedDeviceID == Self.externalDrive.id)
+
+        viewModel.clearSelection()
+        #expect(viewModel.selectedDeviceID == nil)
+        #expect(viewModel.devices == [Self.bootVolume, Self.externalDrive], "deselecting never drops devices")
+
+        // The next device snapshot, still containing the drive, must not bring the selection back.
+        fake.emit([Self.bootVolume, Self.externalDrive])
+        await settle()
+        #expect(viewModel.selectedDeviceID == nil)
+
+        viewModel.selectDevice(Self.externalDrive)
+        #expect(viewModel.selectedDeviceID == Self.externalDrive.id, "the same device can be selected again")
+    }
+
     @Test("a fake watcher's watch() throwing sets watchError, not a silent empty devices list")
     func throwingWatcherSetsWatchError() async {
         let fake = FakeDeviceWatcher(failure: .sessionRegistrationFailed)

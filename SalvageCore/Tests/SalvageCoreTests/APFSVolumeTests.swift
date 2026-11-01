@@ -1153,7 +1153,40 @@ private func sync(_ url: URL) {
     _ = url
 }
 
-@Suite("APFS real hdiutil images", .enabled(if: hdiutilAvailable), .serialized)
+/// Why the APFS real-image suite below can't run here (it then skips), or nil when it can: hdiutil
+/// must exist, not be switched off with SALVAGE_SKIP_HDIUTIL, and actually create and attach an
+/// APFS image -- a runner where attaching is denied would otherwise fail every test instead of
+/// reporting one clear reason.
+private let apfsRealImageUnavailableReason: String? = {
+    guard hdiutilAvailable else {
+        return ProcessInfo.processInfo.environment["SALVAGE_SKIP_HDIUTIL"] != nil
+            ? "SALVAGE_SKIP_HDIUTIL is set" : "/usr/bin/hdiutil is not executable"
+    }
+    do {
+        let image = try ScratchImage()
+        defer { image.destroy() }
+        try image.attach()
+        return nil
+    } catch {
+        return "hdiutil could not create and attach an APFS test image: \(error)"
+    }
+}()
+
+@Suite("APFS real-image availability")
+struct APFSRealImageAvailabilityTests {
+    /// Says explicitly when the real-image suite below is skipped, and fails the run instead when
+    /// SALVAGE_REQUIRE_HDIUTIL=1 (as CI sets), so the suite can't silently skip there.
+    @Test func realImageSuiteReportsWhyItIsSkipped() {
+        guard let reason = apfsRealImageUnavailableReason else { return }
+        print("APFS real-image tests skipped: \(reason)")
+        if ProcessInfo.processInfo.environment["SALVAGE_REQUIRE_HDIUTIL"] == "1" {
+            Issue.record("SALVAGE_REQUIRE_HDIUTIL=1 but the APFS real-image tests can't run: \(reason)")
+        }
+    }
+}
+
+@Suite("APFS real hdiutil images", .enabled(if: apfsRealImageUnavailableReason == nil, "hdiutil can't create and attach APFS images here"),
+       .serialized)
 struct APFSRealImageTests {
     struct Written { let path: String; let data: Data; let modified: Date }
 

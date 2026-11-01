@@ -248,3 +248,132 @@ private final class CountSignal: @unchecked Sendable {
         }
     }
 }
+
+// MARK: - DiskWatchRegistration start/stop, without a DASession
+
+/// Records every DiskArbitration call `DiskWatchRegistration` makes through its registrar, in
+/// order, so a test can compare what was registered with what was unregistered.
+@MainActor
+private final class RecordingRegistrar {
+    struct Pair: Equatable { let callback: UnsafeMutableRawPointer; let context: UnsafeMutableRawPointer }
+    enum Call: Equatable { case schedule, unschedule, register(Pair), unregister(Pair) }
+
+    private(set) var calls: [Call] = []
+    var registered: [Pair] { calls.compactMap { if case .register(let pair) = $0 { pair } else { nil } } }
+    var unregistered: [Pair] { calls.compactMap { if case .unregister(let pair) = $0 { pair } else { nil } } }
+
+    /// `DiskWatchRegistration` calls these on the main actor only (start() is main-actor
+    /// isolated; stop() hops to the main queue first), which `assumeIsolated` also checks.
+    var registrar: DiskArbitrationRegistrar {
+        func record(_ call: Call) { MainActor.assumeIsolated { self.calls.append(call) } }
+        return DiskArbitrationRegistrar(
+            schedule: { record(.schedule) },
+            unschedule: { record(.unschedule) },
+            registerDiskAppeared: { record(.register(Pair(callback: unsafeBitCast($0, to: UnsafeMutableRawPointer.self), context: $1))) },
+            registerDiskDisappeared: { record(.register(Pair(callback: unsafeBitCast($0, to: UnsafeMutableRawPointer.self), context: $1))) },
+            registerDiskDescriptionChanged: { record(.register(Pair(callback: unsafeBitCast($0, to: UnsafeMutableRawPointer.self), context: $1))) },
+            unregister: { record(.unregister(Pair(callback: $0, context: $1))) }
+        )
+    }
+}
+
+/// Device enumeration that counts how often the registration asks for the current set.
+@MainActor
+private final class CountingEnumeration {
+    var devices: [BlockDevice]
+    private(set) var calls = 0
+    init(_ devices: [BlockDevice]) { self.devices = devices }
+    func enumerate() -> [BlockDevice] { calls += 1; return devices }
+}
+
+@Suite("DiskWatchRegistration start/stop", .timeLimit(.minutes(1)))
+@MainActor
+struct DiskWatchRegistrationTests {
+    @MainActor
+    private final class Harness {
+        let recorder = RecordingRegistrar()
+        let stream: AsyncStream<[BlockDevice]>
+        let registration: DiskWatchRegistration
+        private let source: CountingEnumeration
+        var enumerations: Int { source.calls }
+        var devices: [BlockDevice] {
+            get { source.devices }
+            set { source.devices = newValue }
+        }
+
+        init() {
+            let (stream, continuation) = AsyncStream<[BlockDevice]>.makeStream(bufferingPolicy: .unbounded)
+            let source = CountingEnumeration([boot])
+            self.stream = stream
+            self.source = source
+            registration = DiskWatchRegistration(registrar: recorder.registrar, continuation: continuation,
+                                                 enumerate: { source.enumerate() }, lockStateResolver: { $0 })
+        }
+
+        /// Everything the stream delivered, once stop() has finished it.
+        func drain() async -> [[BlockDevice]] {
+            var sets: [[BlockDevice]] = []
+            for await set in stream { sets.append(set) }
+            return sets
+        }
+    }
+
+    @Test("stop() unregisters exactly the callback/context pairs start() registered")
+    func unregisterMatchesRegister() async {
+        let harness = Harness()
+        harness.registration.start()
+        let registered = harness.recorder.registered
+        let context = Unmanaged.passUnretained(harness.registration).toOpaque()
+        #expect(registered.count == 3)
+        #expect(Set(registered.map(\.callback)).count == 3, "each event kind gets its own callback")
+        #expect(registered.allSatisfy { $0.context == context }, "the context is the registration itself")
+        #expect(harness.recorder.calls.first == .schedule, "scheduled before any callback can be registered")
+
+        harness.registration.stop()
+        _ = await harness.drain()
+
+        #expect(harness.recorder.unregistered == registered, "same pairs, same order")
+        #expect(harness.recorder.calls.last == .unschedule, "unscheduled only after every callback is unregistered")
+        #expect(harness.recorder.calls.filter { $0 == .schedule }.count == 1)
+        #expect(harness.recorder.calls.filter { $0 == .unschedule }.count == 1)
+    }
+
+    @Test("start() twice registers once, and stop() twice unregisters once")
+    func startAndStopAreIdempotent() async {
+        let harness = Harness()
+        harness.registration.start()
+        harness.registration.start()
+        #expect(harness.recorder.registered.count == 3)
+        harness.registration.stop()
+        harness.registration.stop()
+        _ = await harness.drain()
+        // Let the second stop()'s main-queue hop run too.
+        try? await Task.sleep(for: .milliseconds(20))
+        #expect(harness.recorder.unregistered.count == 3)
+        #expect(harness.recorder.calls.filter { $0 == .unschedule }.count == 1)
+    }
+
+    @Test("A DiskArbitration callback delivered after stop() publishes nothing")
+    func noCallbackFiresAfterStop() async throws {
+        let harness = Harness()
+        harness.registration.start()
+        let context = try #require(harness.recorder.registered.first?.context)
+        #expect(harness.enumerations == 1, "start() publishes the initial set")
+
+        // While active, a callback re-enumerates and publishes a changed set.
+        harness.devices = [boot, stick]
+        DiskWatchRegistration.handleChange(context: context)
+        #expect(harness.enumerations == 2)
+
+        harness.registration.stop()
+        let published = await harness.drain()
+        #expect(published == [[boot], [boot, stick]])
+
+        // A callback DiskArbitration had already queued before the unregister lands now: it must
+        // neither enumerate nor publish.
+        harness.devices = [boot]
+        DiskWatchRegistration.handleChange(context: context)
+        DiskWatchRegistration.handleChange(context: nil)
+        #expect(harness.enumerations == 2)
+    }
+}
