@@ -40,6 +40,9 @@ struct DeviceListView: View {
     /// Tree nodes the user expanded or collapsed away from their default
     /// (`DeviceTreeNode.startsExpanded`).
     @State private var toggledNodeIDs: Set<String> = []
+    /// spec-tech-batch-7 §A: disk images opened from the File menu or dropped on the list.
+    @State private var images = DiskImageLibrary.shared
+    @State private var selectedImageID: String?
     var isScanning = false
     var activeDeviceID: BlockDevice.ID?
     /// The drive whose scan has finished with results open; its partition rows offer
@@ -54,6 +57,11 @@ struct DeviceListView: View {
             .onChange(of: finishedScanDevice, initial: true) { _, device in viewModel.finishedScanDevice = device }
             .onDisappear { viewModel.stopWatching() }
             .onChange(of: isScanning) { _, active in if !active { viewModel.clearSelection() } }
+            .onChange(of: isScanning) { _, active in if !active { selectedImageID = nil } }
+            .dropDestination(for: URL.self) { urls, _ in images.open(urls); return !urls.isEmpty }
+            #if DEBUG
+            .task { images.openUITestImageIfRequested() }
+            #endif
     }
 
     @ViewBuilder
@@ -97,7 +105,7 @@ struct DeviceListView: View {
     /// collapsed with no way to start expanded.
     private var deviceList: some View {
         List(selection: selectionBinding) {
-            ForEach(viewModel.tree) { node in
+            ForEach(viewModel.tree.filter { !images.hiddenDrives.contains($0.id) }) { node in
                 if case .drive(let device) = node.kind {
                     if node.children.isEmpty {
                         driveRow(device)
@@ -112,6 +120,7 @@ struct DeviceListView: View {
                     }
                 }
             }
+            diskImagesSection
         }
         .listStyle(.inset)
     }
@@ -152,12 +161,21 @@ struct DeviceListView: View {
     /// without this case a device could never be deselected once chosen.
     private var selectionBinding: Binding<BlockDevice.ID?> {
         Binding(
-            get: { viewModel.selectedDeviceID },
+            get: { viewModel.selectedDeviceID ?? selectedImageID },
             set: { newID in
                 guard let newID else {
                     viewModel.clearSelection()
+                    selectedImageID = nil
                     return
                 }
+                if let image = images.image(withDeviceID: newID) {
+                    guard !isScanning else { return }
+                    viewModel.clearSelection()
+                    selectedImageID = image.id
+                    onSelect(image.device)
+                    return
+                }
+                selectedImageID = nil
                 // Only drive rows are scan targets: a partition's id is never in `devices`.
                 guard let device = viewModel.devices.first(where: { $0.id == newID }) else { return }
                 guard !isScanning else { return }
@@ -165,6 +183,70 @@ struct DeviceListView: View {
                 if viewModel.selectedDeviceID == device.id { onSelect(device) }
             }
         )
+    }
+}
+
+// MARK: - Disk images (spec-tech-batch-7 §A)
+
+extension DeviceListView {
+    /// Opened disk images, each scanned like a drive (and only ever read). Remove takes one off the
+    /// list; it is offered except while that image is being scanned.
+    @ViewBuilder
+    fileprivate var diskImagesSection: some View {
+        if !images.images.isEmpty || images.openError != nil {
+            Section("Disk images") {
+                ForEach(images.images) { image in
+                    let inUse = isScanning && activeDeviceID == image.id
+                    DiskImageRow(image: image, inUse: inUse)
+                        .tag(image.id)
+                        .disabled(isScanning)
+                        .selectionDisabled(isScanning)
+                        .contextMenu {
+                            Button("Remove from List") { images.remove(image.id) }
+                                .disabled(inUse)
+                        }
+                        .accessibilityLabel(image.name)
+                        .accessibilityValue(inUse ? "In use by another scan" : "Disk image, \(deviceSizeFormatter.string(fromByteCount: image.sizeBytes))")
+                        .accessibilityIdentifier("image-row-\(image.name)")
+                }
+                if let error = images.openError {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .selectionDisabled()
+                        .accessibilityIdentifier("image-open-error")
+                }
+            }
+        }
+    }
+}
+
+/// A disk image row: the file's name and size, styled like a drive row.
+private struct DiskImageRow: View {
+    let image: OpenedDiskImage
+    var inUse = false
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "doc")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(image.name)
+                    .font(.headline)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(inUse ? "In use by another scan" : deviceSizeFormatter.string(fromByteCount: image.sizeBytes))
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(12)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .help(image.url.path)
     }
 }
 

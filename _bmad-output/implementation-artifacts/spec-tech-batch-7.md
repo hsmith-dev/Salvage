@@ -137,3 +137,59 @@ Five independent items, one agent each. Each lists the files it owns. Global rul
 - The Release build succeeded.
 - No UI test was added, because the icon has no in-app UI.
 - The first SalvageCore run had one failure while a Release build was running in parallel. An isolated rerun passed, so it looks like a timing-sensitive test under load and is not related to this change, which touches no Swift package code.
+
+## Implementation Notes — A
+
+**Reading.** `SalvageDiskIO/Sources/SalvageDiskIO/ImageFileReader.swift` is the CLI's read-only reader, moved here unchanged apart from `public` (the CLI imports it from SalvageDiskIO now). The new `DiskImageSource.swift` beside it adds:
+
+- `DiskImageFile.inspect`. It classifies an image: UDIF ("koly" trailer), `.sparseimage` ("sprs") and `.sparsebundle` are attached; everything else is raw. It refuses devices, links to devices, folders and empty files.
+- `DiskImageAttacher`. It runs `hdiutil attach -readonly -nomount -noverify -noautofsck -plist`, and `detach`. Detach acts only on a disk that `hdiutil info` still lists as the same image file, so a reused disk number is never detached. If a plain detach fails, it retries once with `-force`.
+- `DiskImageDestinationSafety`. It refuses a destination on the drive holding the image file: `DestinationSafety` on the image's host whole disk, following image-on-image hosts. It also refuses one on a volume backed by the image itself (`ImageFileDestinationSafety`). Anything it can't resolve is undetermined, which callers treat as refused.
+
+**App.**
+- `Salvage/ViewModels/ImageSource.swift`: `DiskImageLibrary` holds the list, a lock-protected `DiskImageRegistry` serves lookups from off the main actor, and the scan runner lives here too. An opened image gets a stand-in `BlockDevice` named `image-<UUID>`. That name is never a BSD name, so drive code (`RawBlockReader`, `DestinationSafety`) fails closed on it and never acts on it.
+- Raw images are scanned through `ImageFileReader`.
+- A `.dmg` or sparse image is attached only when its scan starts, read through `RawBlockReader.prepare` (the node is user-owned, so no helper is needed), and detached when its `SourceSession` closes. A failed preparation also detaches. A `willTerminate` observer detaches anything still attached at quit.
+- The attached disk (and any synthesized APFS container) is hidden from the drive list while attached, because the image is already listed.
+- `Salvage/Views/OpenImageCommand.swift` adds File > Open Disk Image… (⌘O) through `NSOpenPanel`.
+- `SalvageApp.swift` gains one command line.
+- `DeviceListView.swift` has a new "Disk images" section: name, size, a Remove from List context menu, an open-error line and the drop target. It also has small hooks in the existing view: the hidden-drive filter, the image branch of the selection binding, and one `onChange` line.
+- `ContentView.swift`: the runner is selected through `DiskImageLibrary.runner(otherwise:)`. `CompositionRoot.recoveryCoordinator` also uses the image destination check for an image's results. That second change goes beyond "runner selection only", but it is the only place to wire it without touching `RecoveryCoordinator.swift` (owned by D) or `SourceSession.swift`.
+- Images have no media identity, so they are never checkpointed.
+
+**UI test fixture.** In DEBUG builds, `-SalvageUITestOpenImage <path>` writes the fixture exFAT volume to `<path>` and opens it as a raw image. This stands in for the open panel. The scan really reads that file. `UITestFixtures.swift` is not modified.
+
+**Tests.**
+- `SalvageDiskIOTests/DiskImageSourceTests` (11 tests) covers:
+  - classification;
+  - inspect refusals;
+  - read-only, byte-exact raw reads;
+  - attach plist parsing and the exact attach flags;
+  - detach refusing a reused disk;
+  - host-drive refusal (same volume, sibling partition, APFS container, image-on-image, unresolvable);
+  - the live check refusing a temp folder beside a temp image;
+  - a live UDZO `.dmg` attached, read byte for byte, detached, with `hdiutil info` then empty, nothing mounted and the file unchanged.
+- `SalvageTests/ImageSourceTests` (5 tests) covers:
+  - a raw image scan (5 fixture files, content read back, file unchanged);
+  - a `.dmg` attach, scan and detach, verifying nothing stays attached and nothing was mounted;
+  - destination refusal on the image's host volume;
+  - library dedupe and refusals;
+  - drives still routed to the drive runner.
+- `SalvageUITests/DiskImageUITests` (1 test): the menu item exists; the image is listed under Disk images with its name and "8.4 MB"; clicking it scans to "5 items found"; recovering beside the image shows the "Destination blocked" banner and writes nothing; Remove from List removes it.
+
+**Verification.**
+- `swift test` passed for SalvageCore (410 tests), SalvageDiskIO (179 tests) and SalvageCLI (28 tests).
+- `check-core-boundary`, `check-no-network` and `check-xcodeproj-sync` all passed.
+- The Debug `SalvageTests` run passed (185 tests).
+- The Release build succeeded.
+- `DiskImageUITests` passed 1 of 5 runs. The first failure was a real bug: the row's accessibility value was hidden, which is fixed. The other two failures came while other agents' UI-test runs (ScanArchiveUITests, FileDetailsUITests and a full SalvageUITests run) were driving their own Salvage instances on the same desktop:
+  - Cmd-A didn't tick the files;
+  - the context menu didn't appear;
+  - "Unable to find hit point" on a scroll view, in two runs.
+
+  These look like focus stealing, not product failures. Other agents' UI tests were running for all of these runs, and the one passing run happened between theirs. It should be rerun on a quiet desktop.
+
+**Not done or not verified.**
+- Password-protected `.dmg` files: hdiutil gets no stdin, so the attach either fails with the plain "may be damaged, or need a password" message or shows macOS's own password prompt. This is untested.
+- The ⌘O shortcut and the real open panel and drag-and-drop are not exercised by the UI test (the panel is modal and system-owned).
+- The recovery banner copy says "on the drive you're recovering from". For an image, that is the drive holding the image file. The copy belongs to `RecoverySheet` (owned by D) and is unchanged.

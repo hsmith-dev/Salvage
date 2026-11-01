@@ -281,6 +281,28 @@ The supported types are in the [README](../README.md#what-it-can-read). Office 2
 (docx/xlsx/pptx) are ZIP containers, so they are reconstructed as `.zip`. Older Office files are
 saved as `.doc`.
 
+## Scan a disk-image file
+
+You can scan a disk image file, such as a backup of a memory card or a copy of a failing drive,
+without attaching it in Terminal first.
+
+- Choose **File > Open Disk Image…** (⌘O), or drag the image file onto the list of drives.
+- The image appears under **Disk images** with its file name and size. Click it to scan it, just
+  like a drive.
+- To take it off the list, Control-click it and choose **Remove from List**.
+
+Salvage only reads the image and never changes it:
+
+- **Raw images** (`.img`, `.dd`, `.bin`, `.iso`, `.raw` and similar) are read straight from the
+  file.
+- **`.dmg` and sparse images** are opened by macOS read-only and **without being mounted**, so
+  nothing appears in the Finder. Salvage closes them again when you leave the results, start
+  another scan or quit.
+
+When you recover files from an image, choose a folder on a **different drive** from the one that
+holds the image file. A folder on the same drive is refused ("Destination blocked"), for the same
+reason as for a drive: writing there could overwrite the deleted data you are trying to get back.
+
 ## Limitations
 
 - **Your startup disk can't be scanned** while macOS is running from it. Salvage refuses it, and

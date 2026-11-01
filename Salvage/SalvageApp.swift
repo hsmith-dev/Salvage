@@ -15,7 +15,10 @@ struct SalvageApp: App {
                 .environment(updates)
                 .environment(scanActivity)
         }
-        .commands { UpdateCommands(checker: updates, activity: scanActivity) }
+        .commands {
+            UpdateCommands(checker: updates, activity: scanActivity)
+            OpenImageCommand()
+        }
 
         Window("Check for Updates", id: UpdateWindow.id) {
             UpdateWindow()
