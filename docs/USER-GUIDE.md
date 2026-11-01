@@ -78,21 +78,36 @@ Disk images you attach yourself are opened directly, without a password.
 
 ## Choose a drive
 
-The left column lists every drive. Your startup disk is included, and internal and external drives
-appear together in one list. Under each drive its partitions, APFS containers and volumes are
-nested, each with its format and size. They start expanded, and you can collapse them.
+The left column is laid out like Disk Utility's sidebar, in sections:
 
-- **Only whole drives can be selected.** Clicking a drive starts a scan of the whole drive.
-  Partition and volume rows are there for information.
-- **Your startup drive is grayed out**, with the note "Your boot drive can't be scanned while macOS
-  is running from it."
-- A drive with a FileVault-encrypted volume shows **Locked** after its size, with a lock icon.
+- **Internal** and **External**: one row per physical drive, with a drive icon, its model name, and
+  under it the capacity and what it holds (for example "320.07 GB · Whole drive · 2 partitions"). The drive's partitions are indented beneath
+  it, each with its name ("Untitled" if it has none), format and size. An APFS drive shows its
+  APFS container, with the container's volumes indented once more; click the small arrow beside a
+  container to show or hide its volumes.
+- **Disk Images**: disk images you attached yourself (in Finder or Disk Utility), shown like
+  drives, and image files you opened in Salvage (see
+  [Scan a disk-image file](#scan-a-disk-image-file)).
+- **Hidden**, at the bottom and collapsed: what Salvage doesn't scan, each with its capacity and
+  reason. Click it to open it; Salvage remembers whether it's open.
+  - Your startup disk: "Startup disk — Salvage can't scan the disk your Mac is running from". It
+    can't be selected. If your Mac has another internal drive that isn't the startup disk, it's
+    listed under Internal and can be scanned.
+  - Disk images macOS attached for its own use, such as Xcode simulator runtimes and downloaded
+    system components. Disk Utility doesn't list them either. Salvage counts an image as one of
+    these when the system, not you, attached it, or when it's mounted hidden. They're listed for
+    information only and can't be selected: scanning one would unmount it from under macOS.
+
+- **Only whole drives can be selected.** The bold row with the drive icon is the drive; clicking
+  it starts a scan of the whole drive. Partition and volume rows are there for information.
+- A drive with a FileVault-encrypted volume shows **Locked** under its name, with a lock icon.
   Selecting it opens the unlock sheet first (see [FileVault volumes](#filevault-volumes)).
 - While a scan runs, the other drives can't be selected. The drive being scanned says **In use
   by another scan**.
 
-If Salvage can't see any drives at all, it says "No drives found." and suggests quitting and
-reopening Salvage.
+If everything attached is under Hidden (often just the startup disk), the list says "Connect a
+drive or open a disk image to get started." If Salvage can't see any drives at all, it says "No
+drives found." and suggests quitting and reopening Salvage.
 
 ## Scan
 
@@ -409,7 +424,7 @@ as many times as you need.
    as the whole drive (the panel says how much), and a name ending in `.img`. Click **Image**.
 3. The sheet shows the bytes copied, the speed, the time remaining and how many areas couldn't be
    read so far. Copying a large drive takes hours. It runs at the drive's own speed.
-4. When it finishes, click **Open Image**. The image appears under **Disk images**. Click it to
+4. When it finishes, click **Open Image**. The image appears under **Disk Images**. Click it to
    scan it, as described in [Scan a disk-image file](#scan-a-disk-image-file).
 
 Salvage only reads the drive. It never writes to the drive. It opens the drive the same way as for
@@ -459,7 +474,7 @@ You can scan a disk image file, such as a backup of a memory card or a copy of a
 without attaching it in Terminal first.
 
 - Choose **File > Open Disk Image…** (⌘O), or drag the image file onto the list of drives.
-- The image appears under **Disk images** with its file name and size. Click it to scan it, just
+- The image appears under **Disk Images** with its file name and size. Click it to scan it, just
   like a drive.
 - To take it off the list, Control-click it and choose **Remove from List**.
 

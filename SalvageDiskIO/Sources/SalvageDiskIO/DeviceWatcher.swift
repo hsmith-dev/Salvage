@@ -339,7 +339,8 @@ final class DiskWatchRegistration: @unchecked Sendable {
     fileprivate static func enumerateDevices(session: DASession, bootDisks: Set<String>) -> [BlockDevice] {
         let descriptions = readDiskDescriptions(session: session)
         // spec-tech-batch-7 §B: each drive's replug-stable identity, for reconnecting saved scans.
-        return StableDiskIdentity.annotate(buildDeviceTree(descriptions, bootDisks: bootDisks),
+        return StableDiskIdentity.annotate(buildDeviceTree(descriptions, bootDisks: bootDisks,
+                                                           noBrowseVolumes: noBrowseMountedBSDNames()),
                                            descriptions: descriptions, session: session)
     }
 
@@ -363,12 +364,15 @@ final class DiskWatchRegistration: @unchecked Sendable {
             var registryID: UInt64 = 0
             let identityResult = IORegistryEntryGetRegistryEntryID(media, &registryID)
             let ancestors = registryAncestorMediaBSDNames(of: media)
+            // Who attached a disk image, and from which file (the "Hidden" rule, `buildDeviceTree`).
+            let image = DiskImageDevice.isDiskImage(description) ? ioDiskImageProperties(media) : (ownerUID: nil, path: nil)
             IOObjectRelease(media)
             guard identityResult == KERN_SUCCESS else { continue }
 
             wholeNames.insert(name)
             disks.append(RawDiskDescription(bsdName: name, description: description, mediaIdentity: registryID,
-                                            ancestorMedia: ancestors))
+                                            ancestorMedia: ancestors, imageOwnerUID: image.ownerUID,
+                                            imagePath: image.path))
         }
 
         // Partitions and volumes (depth 1 only: snapshots aren't shown) of the disks found above.

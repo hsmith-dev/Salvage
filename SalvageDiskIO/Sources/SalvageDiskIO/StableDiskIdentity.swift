@@ -50,11 +50,7 @@ enum StableDiskIdentity {
                                     volumes: volumes(of: device.bsdName, whole: description, descriptions: descriptions),
                                     sizeBytes: device.sizeBytes, model: description[DiskKey.deviceModel] as? String,
                                     serial: registry.serial)
-            return BlockDevice(bsdName: device.bsdName, displayName: device.displayName, sizeBytes: device.sizeBytes,
-                               isInternal: device.isInternal, isBootVolume: device.isBootVolume,
-                               mediaIdentity: device.mediaIdentity, encryptedVolumeUUID: device.encryptedVolumeUUID,
-                               encryptedVolumeName: device.encryptedVolumeName, partitions: device.partitions,
-                               stableIdentity: identity)
+            return device.withStableIdentity(identity)
         }
     }
 

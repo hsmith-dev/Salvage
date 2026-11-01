@@ -1,7 +1,7 @@
 ---
 name: Salvage
 status: final
-updated: 2026-10-31
+updated: 2026-11-01
 description: Open-source macOS data recovery utility. Calm, honest, system-native — a trustworthy tool, not a sales pitch.
 colors:
   surface-base:
@@ -159,7 +159,9 @@ Minimal. macOS system materials (vibrancy, translucency) handle the sidebar/wind
 
 ## Components
 
-- **Device row** — boot volume (when unsupported) is grayed rather than omitted, always with its reason stated. A locked device carries "Locked" in its accessible label, not the lock glyph alone.
+- **Device sidebar** — sectioned like Disk Utility: "Internal", "External", "Disk Images" (images the user attached or opened), then a collapsed "Hidden" group at the bottom. Section titles are the system list headers; no color distinguishes sections.
+- **Device row** — the scan target: drive icon, the device name alone in `headline` (middle-truncated, one line), then a `subheadline` `ink-secondary` subtitle led by the capacity ("320.07 GB · Whole drive · 2 partitions"). Its partitions sit beneath as plain `subheadline` rows indented to the name, with format and size in `ink-tertiary`; an APFS container's volumes indent one step further. A locked device carries "Locked" in its accessible label, not the lock glyph alone.
+- **Hidden row** — what Salvage doesn't scan (the startup disk, disk images macOS attached for itself): smaller, flat (no partition tree), `ink-secondary` name with "capacity · reason" in `caption` `ink-tertiary`. Never omitted, never selectable, no actions; the reason is stated on screen and in its accessible value.
 - **Type-bucket tile** — icon stays single-weight and `ink-secondary` for every category; a colored icon per category would compete with the no-color-coding discipline used for confidence.
 - **Lost Partitions card** — same surface family as the type-bucket tile, but its own dedicated position in the dashboard, never inside the type-bucket grid. The distinction is positional and structural (its own section, not a seventh tile), not a color treatment.
 - **Confidence label** — see frontmatter: size, weight, and tone together, never a chromatic color. The triple redundancy exists so the High/Medium/Low gradation is perceivable even for a low-vision user who can't distinguish the tonal steps alone.

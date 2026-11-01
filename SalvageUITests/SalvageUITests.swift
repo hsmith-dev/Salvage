@@ -72,10 +72,12 @@ final class SalvageUITests: XCTestCase {
     // MARK: (1) Device tree
 
     func testDeviceTreeShowsDisabledBootDriveAndFixtureDriveStartsScan() {
-        launch("standard")
+        launch("standard", hiddenOpen: true)
+        // The startup disk is listed under the "Hidden" group (opened for this test), not omitted.
+        XCTAssertTrue(element("hidden-group").waitForExistence(timeout: 10), "The Hidden group is listed")
         let boot = element(bootDriveID)
-        XCTAssertTrue(boot.waitForExistence(timeout: 10), "The boot drive is listed")
-        XCTAssertTrue((boot.value as? String ?? "").contains("Your boot drive can't be scanned"),
+        XCTAssertTrue(boot.waitForExistence(timeout: 10), "The boot drive is listed under Hidden")
+        XCTAssertTrue((boot.value as? String ?? "").contains("Salvage can't scan the disk your Mac is running from"),
                       "The boot drive states why it can't be scanned")
         XCTAssertTrue(boot.label.hasPrefix("Fixture Macintosh HD"), boot.label)
         let fixture = element(fixtureDriveID)
@@ -287,10 +289,9 @@ final class SalvageUITests: XCTestCase {
                                   "Partition FIXTURE, exFAT")).firstMatch
         XCTAssertTrue(partition.waitForExistence(timeout: 5))
         XCTAssertTrue(describe(partition).hasSuffix(", on Salvage Fixture Drive"), describe(partition))
-        let bootPartition = app.descendants(matching: .any)
-            .matching(NSPredicate(format: "label BEGINSWITH %@ OR value BEGINSWITH %@", "Partition Macintosh HD, APFS",
-                                  "Partition Macintosh HD, APFS")).firstMatch
-        XCTAssertTrue(describe(bootPartition).hasSuffix(", on Fixture Macintosh HD"), describe(bootPartition))
+        // The startup disk sits in the collapsed "Hidden" group, which says how many it holds.
+        XCTAssertTrue(describe(element("hidden-group")).contains("Hidden, 1 device"), describe(element("hidden-group")))
+        XCTAssertFalse(element(bootDriveID).exists, "Hidden starts collapsed")
         try audit("Device Picker")
         assertNoAuditFindings()
     }
@@ -413,11 +414,14 @@ final class SalvageUITests: XCTestCase {
 
     // MARK: Helpers
 
-    private func launch(_ fixture: String) {
+    /// `hiddenOpen`: start with the sidebar's "Hidden" group open (its remembered state is a user
+    /// default, so the argument domain overrides it; closed otherwise, whatever was remembered).
+    private func launch(_ fixture: String, hiddenOpen: Bool = false) {
         app = XCUIApplication()
         app.launchArguments = ["-SalvageUITestFixture", fixture,
                                "-SalvageUITestDestination", destination.path,
                                "-SalvageUITestExpected", expected.path,
+                               "-DeviceList.hiddenExpanded", hiddenOpen ? "YES" : "NO",
                                "-ApplePersistenceIgnoreState", "YES"]
         // XCUITest's built-in interruption handlers click buttons in whatever covers Salvage,
         // including other apps' permission dialogs ("Don't Allow"). Claim every interruption here
