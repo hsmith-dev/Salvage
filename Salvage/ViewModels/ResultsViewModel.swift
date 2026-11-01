@@ -353,17 +353,23 @@ final class ResultsViewModel {
 
     /// Filters and sorts; checks for cancellation every few thousand rows and comparisons, so a
     /// superseded query stops early instead of finishing a 100k-row sort.
+    ///
+    /// Works on row indices and per-query key arrays rather than on `Row` values: a `Row` holds a
+    /// whole `RecoveredFile`, so copying rows through the filter and the sort (and reading
+    /// `name`/`path` through it in every comparison) dominated a 100k-row query. Names are
+    /// bridged to `NSString` once per query instead of once per comparison. The comparisons,
+    /// their order and the cancellation points are the same as comparing rows directly.
     nonisolated static func apply(_ query: Query, to rows: [Row]) throws -> [Row] {
         let stride = 4096
         try Task.checkCancellation()
-        var result: [Row] = []
-        for (index, row) in rows.enumerated() {
+        var picked: [Int] = []
+        for index in rows.indices {
             if index % stride == stride - 1 { try Task.checkCancellation() }
-            if (query.showSystemFiles || !row.isSystemFile)
-                && (query.category == nil || row.category == query.category)
-                && (query.volume == nil || row.file.sourceMetadata.volumeOffset == query.volume)
-                && (query.search.isEmpty || row.searchKey.contains(query.search)) {
-                result.append(row)
+            if (query.showSystemFiles || !rows[index].isSystemFile)
+                && (query.category == nil || rows[index].category == query.category)
+                && (query.volume == nil || rows[index].file.sourceMetadata.volumeOffset == query.volume)
+                && (query.search.isEmpty || searchKey(rows[index].searchKey, contains: query.search)) {
+                picked.append(index)
             }
         }
         let ascending = query.ascending
@@ -372,30 +378,65 @@ final class ResultsViewModel {
             comparisons &+= 1
             if comparisons % (stride * 4) == 0 { try Task.checkCancellation() }
         }
-        func ordered<T: Comparable>(_ a: T, _ b: T, _ tieA: Row, _ tieB: Row) throws -> Bool {
-            try tick()
-            if a != b { return ascending ? a < b : a > b }
-            return tieA.path < tieB.path
+        // Keys are indexed by position in `picked`; `order` is sorted in place of the rows.
+        let paths = picked.map { rows[$0].path }
+        var order = Array(picked.indices)
+        func ordered<T: Comparable>(_ keys: [T]) throws {
+            try order.sort { a, b in
+                try tick()
+                if keys[a] != keys[b] { return ascending ? keys[a] < keys[b] : keys[a] > keys[b] }
+                return paths[a] < paths[b]
+            }
         }
         switch query.sortField {
         case .name:
-            try result.sort { a, b in
+            let names = picked.map { rows[$0].name as NSString }
+            try order.sort { a, b in
                 try tick()
-                let c = a.name.localizedStandardCompare(b.name)
+                let c = names[a].localizedStandardCompare(names[b] as String)
                 if c != .orderedSame { return ascending ? c == .orderedAscending : c == .orderedDescending }
-                return a.path < b.path
+                return paths[a] < paths[b]
             }
-        case .path: try result.sort { try ordered($0.path, $1.path, $0, $1) }
-        case .size: try result.sort { try ordered($0.sizeBytes, $1.sizeBytes, $0, $1) }
-        case .modified: try result.sort { try ordered($0.modifiedSortKey, $1.modifiedSortKey, $0, $1) }
+        case .path: try ordered(paths)
+        case .size: try ordered(picked.map { rows[$0].sizeBytes })
+        case .modified: try ordered(picked.map { rows[$0].modifiedSortKey })
         }
         // Reconstructed files form their own section after the filesystem's files (Story 3.2);
         // each group keeps the sort order above.
-        if result.contains(where: \.isReconstructed) {
+        if order.contains(where: { rows[picked[$0]].isReconstructed }) {
             try Task.checkCancellation()
-            result = result.filter { !$0.isReconstructed } + result.filter(\.isReconstructed)
+            order = order.filter { !rows[picked[$0]].isReconstructed } + order.filter { rows[picked[$0]].isReconstructed }
         }
-        return result
+        return order.map { rows[picked[$0]] }
+    }
+
+    /// `key.contains(search)`, with a byte search when both strings are ASCII: there Foundation's
+    /// character-wise substring match is exactly a byte match (checked against Foundation over
+    /// random ASCII strings, CR/LF included), at a fraction of the cost. Anything non-ASCII, and
+    /// an empty search, goes through Foundation unchanged.
+    nonisolated static func searchKey(_ key: String, contains search: String) -> Bool {
+        var key = key, search = search
+        let fast: Bool? = key.withUTF8 { haystack in
+            search.withUTF8 { needle -> Bool? in
+                // "\r\n" is one character: a needle that starts with "\n" or ends with "\r" could
+                // split one, so it takes Foundation's path too (the browser trims both anyway).
+                guard let first = needle.first, first != 0x0a, needle.last != 0x0d,
+                      !needle.contains(where: { $0 >= 0x80 }), !haystack.contains(where: { $0 >= 0x80 }) else { return nil }
+                guard needle.count <= haystack.count else { return false }
+                var start = 0
+                let last = haystack.count - needle.count
+                while start <= last {
+                    if haystack[start] == first {
+                        var matched = 1
+                        while matched < needle.count && haystack[start + matched] == needle[matched] { matched += 1 }
+                        if matched == needle.count { return true }
+                    }
+                    start += 1
+                }
+                return false
+            }
+        }
+        return fast ?? key.contains(search)
     }
 
     /// "Pictures — 12 files, 2 can't be recovered": counts recoverable files, like the tiles,

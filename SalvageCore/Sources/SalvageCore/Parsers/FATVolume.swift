@@ -14,8 +14,8 @@ actor FATVolume {
     var clusterCount: Int64 = 0
     var root: UInt32 = 0
     var visitedDirectories: Set<UInt32> = []
-    var fatPageOffset: Int64 = -1
-    var fatPage = Data()
+    /// Recently read 64 KiB pages of the active FAT, by offset in the FAT.
+    var fatPages = PageCache(capacity: 64)
     /// Cluster -> index into `ownerList` of the file, directory or metadata that claimed it.
     var owners: [UInt32: Int] = [:]
     var ownerList: [Owner] = []
@@ -34,8 +34,8 @@ actor FATVolume {
     var activeFat: UInt8 = 0
     var bitmapClusters: [UInt32] = []
     var bitmapLength: Int64 = 0
-    var bitmapPageOffset: Int64 = -1
-    var bitmapPage = Data()
+    /// Recently read 4 KiB pages of the allocation bitmap, by volume offset.
+    var bitmapPages = PageCache(capacity: 64)
     /// Zone for timestamps recorded in local time (all FAT32 ones, exFAT ones without a valid offset).
     let localTimeZone: TimeZone
     /// FAT/bitmap lookups still allowed for deleted-entry free-cluster checks on this volume. Deleted
@@ -289,9 +289,10 @@ actor FATVolume {
         let within = byte % clusterBytes
         let page = within / 4096 * 4096
         let offset = try checkedAdd(clusterOffset(bitmapCluster), page)
-        if offset != bitmapPageOffset {
+        let bitmapPage: Data
+        if let cached = bitmapPages.page(offset) { bitmapPage = cached } else {
             bitmapPage = try await read(offset, Int(min(4096, clusterBytes - page)))
-            bitmapPageOffset = offset
+            bitmapPages.insert(bitmapPage, at: offset)
         }
         return bitmapPage[Int(within - page)] & (UInt8(1) << UInt8(index % 8)) != 0
     }
@@ -314,9 +315,10 @@ actor FATVolume {
         let position = Int64(cluster) * 4
         guard position <= fatBytes - 4 else { throw ScanError.malformed("FAT index outside table.") }
         let pageOffset = position / 65536 * 65536
-        if pageOffset != fatPageOffset {
+        let fatPage: Data
+        if let cached = fatPages.page(pageOffset) { fatPage = cached } else {
             fatPage = try await read(checkedAdd(fatOffset, pageOffset), Int(min(65536, fatBytes - pageOffset)))
-            fatPageOffset = pageOffset
+            fatPages.insert(fatPage, at: pageOffset)
         }
         return UInt32(try fatPage.number(Int(position - pageOffset), 4)) & (exfat ? 0xffffffff : 0x0fffffff)
     }
@@ -391,6 +393,13 @@ actor FATVolume {
         guard remaining == 0 else { return .unmapped }
         if sizeBytes > validBytes { result.append(DataRun(deviceOffset: nil, length: sizeBytes - validBytes)) }
         return .runs(result)
+    }
+    /// The entries' bytes back to back (`entries.reduce(Data(), +) + last`, in one allocation).
+    static func joined(_ entries: [Data], _ last: Data? = nil) -> Data {
+        var raw = Data(capacity: entries.reduce(last?.count ?? 0) { $0 + $1.count })
+        for entry in entries { raw.append(entry) }
+        if let last { raw.append(last) }
+        return raw
     }
     /// Reads one directory, emitting its live files and returning its subdirectories. Damage to a
     /// single entry (a bad entry set, an orphaned long name, an unreadable name, a damaged file
@@ -511,7 +520,7 @@ actor FATVolume {
                                 modified: Self.fatTimestamp(entry, localZone: localTimeZone),
                                 sourceMetadata: SourceMetadata(filesystem: .fat32, volumeOffset: extent.offset,
                                     recordOffset: location, allocationStart: UInt64(cluster), contiguous: false,
-                                    rawRecord: lfn.reduce(Data(), +) + entry),
+                                    rawRecord: Self.joined(lfn, entry)),
                                 content: Self.content(runs, sizeBytes: size, validBytes: size)))
                         }
                     }
@@ -532,9 +541,20 @@ actor FATVolume {
         return children
     }
     func validName(_ name: String) throws {
-        guard !name.isEmpty, !name.contains("/"), !name.contains("\0"), name != ".", name != ".." else {
+        guard !name.isEmpty, !Self.containsSlashOrNUL(name), name != ".", name != ".." else {
             throw FileDamage("Invalid filename.")
         }
+    }
+    /// `name.contains("/") || name.contains("\0")`. For an ASCII name (nearly every name) that is
+    /// exactly a byte test; anything else goes through the same Foundation search as before, which
+    /// matches whole characters (a "/" carrying a combining mark is not a "/").
+    static func containsSlashOrNUL(_ name: String) -> Bool {
+        var found = false
+        for byte in name.utf8 {
+            if byte >= 0x80 { return name.contains("/") || name.contains("\0") }
+            if byte == 0x2f || byte == 0 { found = true }
+        }
+        return found
     }
     func fatName(_ entry: Data, long: [Data]) -> String {
         var checksum: UInt8 = 0
@@ -551,10 +571,11 @@ actor FATVolume {
             $0.count == 32 && $0[11] == 0x0f && $0[12] == 0 && $0[26] == 0 && $0[27] == 0
         }) else { return nil }
         var units: [UInt16] = []
+        units.reserveCapacity(long.count * Self.lfnOffsets.count)
+        // Every slot is 32 bytes (checked above), so each little-endian unit is in range.
         for data in long.reversed() {
-            for offset in Self.lfnOffsets {
-                if let value = try? data.number(offset, 2) { units.append(UInt16(value)) }
-            }
+            let base = data.startIndex
+            for offset in Self.lfnOffsets { units.append(UInt16(data[base + offset]) | UInt16(data[base + offset + 1]) << 8) }
         }
         let end = units.firstIndex(of: 0) ?? units.count
         let paddingValid = end == units.count || units.dropFirst(end + 1).allSatisfy { $0 == 0xffff }
@@ -582,10 +603,12 @@ actor FATVolume {
         do { return try decodeExfatSet(entries) } catch ScanError.malformed(let reason) { throw FileDamage(reason) }
     }
     func decodeExfatSet(_ entries: [Data]) throws -> ExfatSet {
-        let raw = entries.reduce(Data(), +)
-        var checksum: UInt16 = 0
-        for (index, byte) in raw.enumerated() where index != 2 && index != 3 {
-            checksum = ((checksum & 1) << 15) &+ (checksum >> 1) &+ UInt16(byte)
+        var checksum: UInt16 = 0, index = 0
+        for entry in entries {
+            for byte in entry {
+                if index != 2 && index != 3 { checksum = ((checksum & 1) << 15) &+ (checksum >> 1) &+ UInt16(byte) }
+                index += 1
+            }
         }
         guard entries.count >= 2, UInt64(checksum) == (try entries[0].number(2, 2)), entries[1][0] == 0xc0,
               entries.dropFirst(2).allSatisfy({ $0[0] == 0xc1 || $0[0] & 0xe0 == 0xe0 }) else {
@@ -613,7 +636,7 @@ actor FATVolume {
     }
     /// Emits a live file or returns a subdirectory; a damaged set or file is recorded and dropped.
     func exfatEntry(_ entries: [Data], at location: Int64, path: String) async throws -> (UInt32, String, Int64?, Bool)? {
-        let raw = entries.reduce(Data(), +)
+        let raw = Self.joined(entries)
         let set: ExfatSet
         do { set = try parseExfatSet(entries) } catch let damage as FileDamage { record(unnamed(path, location), damage.reason); return nil }
         let size = set.sizeBytes, cluster = set.cluster, contiguous = set.contiguous
@@ -718,7 +741,7 @@ actor FATVolume {
             modified: Self.fatTimestamp(entry, localZone: localTimeZone), isDeleted: true,
             sourceMetadata: SourceMetadata(filesystem: .fat32, volumeOffset: extent.offset,
                 recordOffset: location, allocationStart: UInt64(cluster), contiguous: true,
-                rawRecord: used.reduce(Data(), +) + entry),
+                rawRecord: Self.joined(used, entry)),
             content: Self.content(runs, sizeBytes: size, validBytes: size))
         return DeletedCandidate(file: file, first: Int64(cluster), count: required)
     }
@@ -804,7 +827,7 @@ actor FATVolume {
             modified: set.modified, isDeleted: true,
             sourceMetadata: SourceMetadata(filesystem: .exfat, volumeOffset: extent.offset,
                 recordOffset: location, allocationStart: UInt64(set.cluster), contiguous: true,
-                rawRecord: entries.reduce(Data(), +)),
+                rawRecord: Self.joined(entries)),
             content: Self.content(runs, sizeBytes: set.sizeBytes, validBytes: set.validBytes))
         return DeletedCandidate(file: file, first: Int64(set.cluster), count: required)
     }
@@ -846,5 +869,34 @@ actor FATVolume {
         }
         let components = DateComponents(year: year, month: month, day: day, hour: hour, minute: minute, second: second)
         return calendar.date(from: components)?.addingTimeInterval(Double(centiseconds) / 100)
+    }
+}
+
+/// A bounded cache of recently read pages of one on-disk table (the FAT or the allocation
+/// bitmap), keyed by offset. The source is read-only, so a cached page is exactly what a re-read
+/// would return; caching only saves the re-reads when lookups alternate between distant pages
+/// (a directory's chain and its files' chains). The least recently used page is evicted.
+struct PageCache {
+    let capacity: Int
+    private var pages: [Int64: (data: Data, used: UInt64)] = [:]
+    private var tick: UInt64 = 0
+    private var lastOffset: Int64 = -1
+    private var lastPage = Data()
+    init(capacity: Int) { self.capacity = max(1, capacity) }
+    mutating func page(_ offset: Int64) -> Data? {
+        if offset == lastOffset { return lastPage }
+        guard let entry = pages[offset] else { return nil }
+        tick += 1
+        pages[offset] = (entry.data, tick)
+        lastOffset = offset; lastPage = entry.data
+        return entry.data
+    }
+    mutating func insert(_ data: Data, at offset: Int64) {
+        if pages[offset] == nil, pages.count >= capacity, let oldest = pages.min(by: { $0.value.used < $1.value.used })?.key {
+            pages[oldest] = nil
+        }
+        tick += 1
+        pages[offset] = (data, tick)
+        lastOffset = offset; lastPage = data
     }
 }
