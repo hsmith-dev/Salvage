@@ -11,11 +11,20 @@ colors:
   sidebar:
     note: 'System sidebar material (NSVisualEffectView, .sidebar) — standard macOS sidebar vibrancy'
   ink-primary:
-    note: 'System label color (labelColor) — automatic light/dark, automatic contrast compliance'
+    light: 'rgba(0,0,0,0.85)'
+    dark: 'rgba(255,255,255,0.85)'
+    increased-contrast: 'rgba(0,0,0,1.0) light / rgba(255,255,255,1.0) dark'
+    note: 'Matches the system label color (labelColor); 15.1:1 light / 12.3:1 dark on windowBackgroundColor'
   ink-secondary:
-    note: 'System secondary label color (secondaryLabelColor) — used for Medium/Low confidence text, metadata, captions'
+    light: 'rgba(0,0,0,0.70)'
+    dark: 'rgba(255,255,255,0.70)'
+    increased-contrast: 'rgba(0,0,0,0.80) light / rgba(255,255,255,0.82) dark'
+    note: 'Medium-confidence text, metadata, captions. Changed from secondaryLabelColor (3.95:1 light) because the accessibility audit failed it on contrast; now 8.5:1 light / 8.7:1 dark'
   ink-tertiary:
-    note: 'System tertiary label color (tertiaryLabelColor) — used for "no preview available" and other quiet placeholder states'
+    light: 'rgba(0,0,0,0.58)'
+    dark: 'rgba(255,255,255,0.55)'
+    increased-contrast: 'rgba(0,0,0,0.68) light / rgba(255,255,255,0.68) dark'
+    note: 'Low-confidence text, "no preview available" and other quiet placeholder states. Changed from tertiaryLabelColor (1.88:1 light / 2.26:1 dark) because the accessibility audit failed it on contrast; now 5.3:1 light / 5.9:1 dark'
   border-hairline:
     note: 'System separator color (separatorColor)'
   accent: '#2E6E6E'
@@ -117,7 +126,7 @@ Instead, Salvage looks like a native macOS system utility — closer in spirit t
 
 ## Colors
 
-The palette is almost entirely borrowed from the system on purpose — surfaces, text, and separators use macOS's own semantic colors (`note`-based tokens above) rather than fixed hex values, so the app respects the user's actual system appearance (light, dark, increased contrast, accent color preference) without Salvage having to reimplement any of that itself.
+The palette is almost entirely borrowed from the system on purpose — surfaces and separators use macOS's own semantic colors (`note`-based tokens above) rather than fixed hex values, so the app respects the user's actual system appearance (light, dark, increased contrast, accent color preference) without Salvage having to reimplement any of that itself. Text is the one exception: the `ink-*` tokens are black or white at fixed alphas (the system label colors' own recipe), because the system's secondary and tertiary label colors failed the accessibility audit's contrast check (spec-tech-batch-6, Implementation Notes D). They still follow light, dark and Increase Contrast, and are implemented in `Salvage/Views/DesignTokens.swift`.
 
 Two colors are genuinely Salvage's own:
 
@@ -126,7 +135,7 @@ Two colors are genuinely Salvage's own:
 
 `[ASSUMPTION — confirm]` No color is used anywhere to represent recovery confidence (High/Medium/Low). See Components and Do's and Don'ts — this is deliberate, not an oversight, and is the decision most worth a second look given it departs furthest from the reference products' visual pattern (which use colored badges/stars).
 
-**Contrast bar.** `accent` as a filled button background, and `blocking` text on `blocking-surface`, must each meet WCAG AA (4.5:1) in both light and dark mode — the literal hex values above are a starting point, verified against rendered output at implementation time, not asserted as already-confirmed. The `ink-secondary`/`ink-tertiary` system colors used for Medium/Low confidence are paired with size and weight differences (see Components → Confidence label) specifically because their contrast at small type sizes isn't guaranteed by this spine alone.
+**Contrast bar.** `accent` as a filled button background, and `blocking` text on `blocking-surface`, must each meet WCAG AA (4.5:1) in both light and dark mode — the literal hex values above are a starting point, verified against rendered output at implementation time, not asserted as already-confirmed. Every `ink-*` step meets 4.5:1 on `windowBackgroundColor` and `controlBackgroundColor` in light and dark, with and without Increase Contrast (unit-tested in `SalvageTests/DesignTokensTests.swift`); Medium/Low confidence still pair the tonal step with size and weight (see Components → Confidence label). The window title is drawn by the system titlebar, which dims it while the window is inactive; Salvage doesn't style it and doesn't override it.
 
 ## Typography
 

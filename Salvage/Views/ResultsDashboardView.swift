@@ -77,7 +77,7 @@ struct ResultsDashboardView: View {
             VStack(alignment: .leading, spacing: 24) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(scan.device?.displayName ?? "Scan results").font(.largeTitle).bold()
-                    Text(statusLine).foregroundStyle(.secondary)
+                    Text(statusLine).foregroundStyle(.inkSecondary)
                         .accessibilityIdentifier("results-status")
                 }
                 Button("Save Scan…") { ScanArchiveActions.save(scan) }.disabled(!scan.canSaveArchive).accessibilityIdentifier("save-scan")
@@ -109,7 +109,7 @@ struct ResultsDashboardView: View {
                         .accessibilityElement(children: .contain)
                         .accessibilityLabel("By type")
                         Text("\(filesText(totals.recoverableCount)) · \(bytes(totals.recoverableBytes)) in total")
-                            .font(.subheadline).foregroundStyle(.secondary)
+                            .font(.subheadline).foregroundStyle(.inkSecondary)
                         Button("Browse all files") { onOpen(nil) }
                     }
                 }
@@ -126,7 +126,7 @@ struct ResultsDashboardView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Can't be recovered").font(.headline)
                         Text("\(filesText(totals.unrecoverableCount)) were found, but Salvage couldn't locate their contents on the device. They aren't counted above.")
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.inkSecondary)
                         Button("View these files") { onOpen(nil) }
                     }
                 }
@@ -135,7 +135,7 @@ struct ResultsDashboardView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("About this scan").font(.headline)
                         ForEach(Array(scan.noticeLines.enumerated()), id: \.offset) { _, line in
-                            Text(line).foregroundStyle(.secondary).textSelection(.enabled)
+                            Text(line).foregroundStyle(.inkSecondary).textSelection(.enabled)
                         }
                     }
                     .accessibilityElement(children: .combine)
@@ -146,13 +146,13 @@ struct ResultsDashboardView: View {
                         Toggle("Show system files", isOn: $model.showSystemFiles).toggleStyle(.checkbox)
                         if model.hiddenSystemFileCount > 0 {
                             Text("\(filesText(model.hiddenSystemFileCount)) of macOS housekeeping (such as ._ and .DS_Store) hidden.")
-                                .font(.caption).foregroundStyle(.secondary)
+                                .font(.caption).foregroundStyle(.inkSecondary)
                         }
                     }
                 }
                 Text(Self.closingNote(reconstructed: totals.reconstructedCount,
                                       fromMetadata: totals.recoverableCount - totals.reconstructedCount + totals.unrecoverableCount))
-                    .font(.subheadline).foregroundStyle(.secondary)
+                    .font(.subheadline).foregroundStyle(.inkSecondary)
             }
             .padding(32)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -164,7 +164,7 @@ struct ResultsDashboardView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Image(systemName: Self.symbol(for: bucket.category)).font(.title2).foregroundStyle(.secondary)
                 Text(bucket.category.displayName).font(.headline)
-                Text(["\(filesText(bucket.count)) · \(bytes(bucket.totalBytes))", ResultsViewModel.reconstructedCaption(bucket.reconstructedCount)].compactMap { $0 }.joined(separator: " ")).font(.caption).foregroundStyle(.secondary)
+                Text(["\(filesText(bucket.count)) · \(bytes(bucket.totalBytes))", ResultsViewModel.reconstructedCaption(bucket.reconstructedCount)].compactMap { $0 }.joined(separator: " ")).font(.caption).foregroundStyle(.inkSecondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(16)

@@ -28,6 +28,7 @@
 		4E4930C119561323B128C398 /* DeviceListViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99D08CCB19B88001DA0D7837 /* DeviceListViewModel.swift */; };
 		52354930675517AFF3E449A9 /* UpdateCheckerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F798DD8A6F1B8EF9E72517BA /* UpdateCheckerTests.swift */; };
 		531815604B039A4847467A94 /* RecoveryCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99E5CBE8D9294BBA0A2BFB59 /* RecoveryCoordinator.swift */; };
+		544C93F234E2D74C9554F6D4 /* DesignTokens.swift in Sources */ = {isa = PBXBuildFile; fileRef = 40E0620FC84974EB006BA0C3 /* DesignTokens.swift */; };
 		56F27E2AF3DEA09648EA1E8A /* ScanArchiveUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F18D2D73BDA286BBD9A7201 /* ScanArchiveUITests.swift */; };
 		59D8A403E40711D298D4493F /* ScanViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D688D515CDA1F3D3D907DEB /* ScanViewModelTests.swift */; };
 		5ECDE4CDCE98C199F17C3DC5 /* FileDetails.swift in Sources */ = {isa = PBXBuildFile; fileRef = F488B001145B7FA242D79A4F /* FileDetails.swift */; };
@@ -51,6 +52,7 @@
 		8BCAD4919CAAC175B3B5163F /* SalvageCore in Frameworks */ = {isa = PBXBuildFile; productRef = 24B9B3143713F56A6DE6C2A1 /* SalvageCore */; };
 		95F307E01DE955699B4AEA7B /* SalvageDiskIO in Frameworks */ = {isa = PBXBuildFile; productRef = CCE774775C4FCB8528BDC040 /* SalvageDiskIO */; };
 		97888E8DFF91BCCC70E558AA /* ImageSourceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E871C8A5E8EA4F5ADF5B1C3E /* ImageSourceTests.swift */; };
+		998B445F79379D4A401CC7CE /* DesignTokensTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C2D2ED0C4A1ED14B5FABCB6 /* DesignTokensTests.swift */; };
 		A65D61A63AD9F48D88705E7E /* RecoveryReportUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C27B878CAE6072F60D624337 /* RecoveryReportUITests.swift */; };
 		AD9B5DC4149E1C1B09FE8D10 /* BSDDeviceNames.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CD075B0C20C5E1B3BB018F0 /* BSDDeviceNames.swift */; };
 		B7B0C2A5219E6799897814A2 /* FileBrowserView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46C282C21C963EE0A2EEB372 /* FileBrowserView.swift */; };
@@ -129,6 +131,7 @@
 		13AB8B7E7A20544CD69D8CBF /* PreviewLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewLoader.swift; sourceTree = "<group>"; };
 		16A95B3E1FAD0DD697F774E3 /* LostPartitionsCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LostPartitionsCard.swift; sourceTree = "<group>"; };
 		181533C1F6458A10898E049A /* HelperApprovalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HelperApprovalView.swift; sourceTree = "<group>"; };
+		1C2D2ED0C4A1ED14B5FABCB6 /* DesignTokensTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesignTokensTests.swift; sourceTree = "<group>"; };
 		1FC8E8A7A76780EA029855E8 /* UnlockViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnlockViewModel.swift; sourceTree = "<group>"; };
 		200C8811715FB24AA7CA8091 /* DeviceListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceListView.swift; sourceTree = "<group>"; };
 		207452AAAA5C899682CD4D98 /* PrivilegedDiskQueries.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivilegedDiskQueries.swift; sourceTree = "<group>"; };
@@ -137,6 +140,7 @@
 		3A78CB2252556649B9DABE08 /* UpdateChecker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateChecker.swift; sourceTree = "<group>"; };
 		3B552735CFF0ADC1F523CD01 /* ResultsViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResultsViewModel.swift; sourceTree = "<group>"; };
 		3F82CDD0036874C3DF40E624 /* RecoveryCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecoveryCoordinatorTests.swift; sourceTree = "<group>"; };
+		40E0620FC84974EB006BA0C3 /* DesignTokens.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesignTokens.swift; sourceTree = "<group>"; };
 		40F847D0B32D43697B452ADB /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		46C282C21C963EE0A2EEB372 /* FileBrowserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileBrowserView.swift; sourceTree = "<group>"; };
 		4819ECC045B83359DFD76CB0 /* SalvageUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SalvageUITests.swift; sourceTree = "<group>"; };
@@ -236,6 +240,7 @@
 			isa = PBXGroup;
 			children = (
 				C504F6515FC245842FF3C263 /* AppIconTests.swift */,
+				1C2D2ED0C4A1ED14B5FABCB6 /* DesignTokensTests.swift */,
 				E40E27E6E6443F51724D8027 /* DeviceListViewModelTests.swift */,
 				039ECC6AB2A66A87C8990558 /* FileDetailsTests.swift */,
 				E871C8A5E8EA4F5ADF5B1C3E /* ImageSourceTests.swift */,
@@ -293,6 +298,7 @@
 			children = (
 				9B3CBFEBAF88D26B71FD597C /* ConfidenceLabel.swift */,
 				98C64227FE351987F85FA819 /* ContentView.swift */,
+				40E0620FC84974EB006BA0C3 /* DesignTokens.swift */,
 				200C8811715FB24AA7CA8091 /* DeviceListView.swift */,
 				46C282C21C963EE0A2EEB372 /* FileBrowserView.swift */,
 				FD7A9D6DBF1CB9D732DF45E0 /* FileDetailsView.swift */,
@@ -561,6 +567,7 @@
 			files = (
 				35D156385907C3D8CBD6FAF6 /* ConfidenceLabel.swift in Sources */,
 				DB4FF45FD4E869D4490DA392 /* ContentView.swift in Sources */,
+				544C93F234E2D74C9554F6D4 /* DesignTokens.swift in Sources */,
 				82973B300A3833E3A4CAE166 /* DeviceListView.swift in Sources */,
 				4E4930C119561323B128C398 /* DeviceListViewModel.swift in Sources */,
 				B7B0C2A5219E6799897814A2 /* FileBrowserView.swift in Sources */,
@@ -600,6 +607,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				73E0F92F5CB9AE58C3AB227D /* AppIconTests.swift in Sources */,
+				998B445F79379D4A401CC7CE /* DesignTokensTests.swift in Sources */,
 				D86AD77E4FE679401396EFA9 /* DeviceListViewModelTests.swift in Sources */,
 				F5E8464D6D6A84FE7DD21DBA /* FileDetailsTests.swift in Sources */,
 				97888E8DFF91BCCC70E558AA /* ImageSourceTests.swift in Sources */,

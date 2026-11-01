@@ -74,7 +74,7 @@ struct FilePreviewView<Details: View>: View {
                     if truncated {
                         Text("Showing the first 1 MB.")
                             .font(.caption)
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(.inkTertiary)
                             .padding(8)
                     }
                 }
@@ -122,7 +122,7 @@ private struct NoPreview: View {
                     .padding(.top, 8)
             }
         }
-        .foregroundStyle(.tertiary)
+        .foregroundStyle(.inkTertiary)
         .padding(24)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("No preview available. \(reason.message)")
@@ -142,7 +142,7 @@ private struct PreviewMetadataHeader: View {
                 if file.isDeleted {
                     Text("Deleted")
                         .font(.caption.weight(.medium))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.inkSecondary)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
                         .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(Color(nsColor: .separatorColor)))
@@ -150,7 +150,7 @@ private struct PreviewMetadataHeader: View {
             }
             Text(details)
                 .font(.subheadline)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.inkSecondary)
         }
         .accessibilityElement(children: .combine)
     }

@@ -530,9 +530,14 @@ final class SalvageUITests: XCTestCase {
     /// accessibility-only change can't fix, or nil for a new issue that must fail the test.
     private static func knownIssue(_ issue: XCUIAccessibilityAuditIssue, window: CGRect, table: CGRect,
                                    sheet: CGRect) -> String? {
-        // Secondary/tertiary text and the window title fall short of the audit's contrast ratio:
-        // a DESIGN.md color-token change, outside accessibility-only modifiers.
-        if issue.auditType.contains(.contrast) { return "contrast needs a design token change" }
+        // Secondary/tertiary text now uses DESIGN.md's ink tokens (DesignTokens.swift), so its
+        // contrast findings are no longer known. The window title "Salvage" is drawn by AppKit's
+        // titlebar, dimmed while the window is inactive; the app doesn't render or style it.
+        if issue.auditType.contains(.contrast), let element = issue.element {
+            let inTitlebar = element.label == "Salvage" && element.frame.height <= 60
+                && element.frame.minY < window.minY + 60
+            if inTitlebar || element.elementType == .window { return "system-drawn inactive window title" }
+        }
         // An AppKit-internal parent/child mismatch with no element to point at.
         if issue.auditType.contains(.parentChild), issue.element == nil { return "framework parent/child mismatch" }
         guard let element = issue.element else { return nil }

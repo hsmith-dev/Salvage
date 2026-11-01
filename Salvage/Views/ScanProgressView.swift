@@ -9,7 +9,7 @@ struct ScanProgressView: View {
         VStack(alignment: .leading, spacing: 16) {
             Text(title).font(.title2)
                 .accessibilityIdentifier("scan-title")
-            if let device = model.device { Text(device.displayName).foregroundStyle(.secondary) }
+            if let device = model.device { Text(device.displayName).foregroundStyle(.inkSecondary) }
             if model.state == .resumable {
                 resumeOffer
             } else if model.state == .preparing {
@@ -21,7 +21,7 @@ struct ScanProgressView: View {
                     .accessibilityValue("\(model.state == .paused ? "Paused" : "Scanning"), \(percent(model.bytesScanned, of: model.totalBytes)) percent")
                     .accessibilityIdentifier("scan-progress")
                 Text("\(Int(Double(model.bytesScanned) / Double(model.totalBytes) * 100))% of supported volume bytes read")
-                    .font(.subheadline).foregroundStyle(.secondary)
+                    .font(.subheadline).foregroundStyle(.inkSecondary)
                     .accessibilityIdentifier("scan-progress-percent")
             }
             TimelineView(.periodic(from: .now, by: 1)) { context in
@@ -33,7 +33,7 @@ struct ScanProgressView: View {
                         Text("Remaining: \(model.estimatedRemaining(at: context.date).map(duration) ?? "Calculating…")")
                     }
                     Text("\(model.files.count) files indexed")
-                }.font(.subheadline).foregroundStyle(.secondary)
+                }.font(.subheadline).foregroundStyle(.inkSecondary)
             }
             if case .failed(let error) = model.state {
                 let needsApproval = PrivilegedHelperApproval.isApprovalRequired(error)
@@ -44,17 +44,17 @@ struct ScanProgressView: View {
                 }
             }
             Text("Files listed here have been indexed from intact metadata. No files have been copied or recovered.")
-                .font(.subheadline).foregroundStyle(.secondary)
+                .font(.subheadline).foregroundStyle(.inkSecondary)
             List(model.files) { file in
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(file.path).lineLimit(2).textSelection(.enabled)
                         if let volume = volumeLabels[file.sourceMetadata.volumeOffset] {
-                            Text(volume).font(.caption).foregroundStyle(.secondary)
+                            Text(volume).font(.caption).foregroundStyle(.inkSecondary)
                         }
                     }
                     Spacer()
-                    Text(ByteCountFormatter.string(fromByteCount: file.sizeBytes, countStyle: .file)).foregroundStyle(.secondary)
+                    Text(ByteCountFormatter.string(fromByteCount: file.sizeBytes, countStyle: .file)).foregroundStyle(.inkSecondary)
                 }
                 // One read-only line per file: its path, volume and size (combining the children
                 // kept only the size, as the selectable path text isn't merged).
@@ -67,11 +67,11 @@ struct ScanProgressView: View {
             .accessibilityLabel("Files indexed so far")
             if model.state == .paused {
                 Text("Scan paused. Salvage is not reading the device. Resume continues from the same point.")
-                    .font(.subheadline).foregroundStyle(.secondary)
+                    .font(.subheadline).foregroundStyle(.inkSecondary)
             } else if model.resumedFromCheckpoint, model.isActive {
                 // Set only once the core's first progress shows it accepted the checkpoint.
                 Text("Resumed from where the previous scan stopped.")
-                    .font(.subheadline).foregroundStyle(.secondary)
+                    .font(.subheadline).foregroundStyle(.inkSecondary)
             }
             if model.isActive {
                 HStack {

@@ -61,7 +61,7 @@ struct FileBrowserView: View {
             selectionMenu
             if let summary = model.selectionSummary {
                 Text(summary)
-                    .font(.subheadline).foregroundStyle(.secondary)
+                    .font(.subheadline).foregroundStyle(.inkSecondary)
                     .help("Ticked files hidden by the current filter or search aren't recovered.")
             }
             Button(model.recoverButtonTitle) {
@@ -122,14 +122,14 @@ struct FileBrowserView: View {
             TableColumn("Name", value: \ResultsViewModel.Row.name) { row in
                 HStack(spacing: 6) {
                     Text(row.name).lineLimit(1).truncationMode(.middle)
-                    if row.file.isDeleted { Text("Deleted").font(.caption).foregroundStyle(.secondary) }
-                    if row.isReconstructed { Text(ResultsViewModel.reconstructedSectionTitle).font(.caption).foregroundStyle(.secondary) }
-                    if row.isPartial { Text(ResultsViewModel.partialTag).font(.caption).foregroundStyle(.secondary) }
+                    if row.file.isDeleted { Text("Deleted").font(.caption).foregroundStyle(.inkSecondary) }
+                    if row.isReconstructed { Text(ResultsViewModel.reconstructedSectionTitle).font(.caption).foregroundStyle(.inkSecondary) }
+                    if row.isPartial { Text(ResultsViewModel.partialTag).font(.caption).foregroundStyle(.inkSecondary) }
                 }
             }
             .width(min: 160, ideal: 240)
             TableColumn("Path", value: \ResultsViewModel.Row.path) { row in
-                Text(row.path).lineLimit(1).truncationMode(.middle).foregroundStyle(.secondary)            }
+                Text(row.path).lineLimit(1).truncationMode(.middle).foregroundStyle(.inkSecondary)            }
             .width(min: 120, ideal: 220)
             TableColumn("Size", value: \ResultsViewModel.Row.sizeBytes) { row in
                 Text(ByteCountFormatter.string(fromByteCount: row.sizeBytes, countStyle: .file)).monospacedDigit()
@@ -137,7 +137,7 @@ struct FileBrowserView: View {
             .width(min: 64, ideal: 80)
             TableColumn("Modified", value: \ResultsViewModel.Row.modifiedSortKey) { row in
                 Text(row.file.modified.map { $0.formatted(date: .abbreviated, time: .shortened) } ?? "Unknown")
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.inkSecondary)
             }
             .width(min: 110, ideal: 150)
             TableColumn("Confidence") { row in ConfidenceLabel(confidence: row.confidence) }
@@ -175,7 +175,7 @@ struct FileBrowserView: View {
         .overlay {
             if model.visibleRows.isEmpty {
                 Text(model.searchText.isEmpty ? "No files in this category." : "No files match your search.")
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.inkSecondary)
             }
         }
     }
@@ -186,9 +186,9 @@ struct FileBrowserView: View {
         if let row = model.focusedRow {
             FilePreviewView(file: row.file, source: source) {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(row.path).font(.subheadline).foregroundStyle(.secondary).textSelection(.enabled)
+                    Text(row.path).font(.subheadline).foregroundStyle(.inkSecondary).textSelection(.enabled)
                     HStack(spacing: 6) {
-                        Text(row.isRecoverable ? "Recovery confidence:" : "Status:").font(.subheadline).foregroundStyle(.secondary)
+                        Text(row.isRecoverable ? "Recovery confidence:" : "Status:").font(.subheadline).foregroundStyle(.inkSecondary)
                         ConfidenceLabel(confidence: row.confidence)
                     }
                     .accessibilityElement(children: .ignore)
@@ -196,21 +196,21 @@ struct FileBrowserView: View {
                     .accessibilityLabel(ConfidenceLabel(confidence: row.confidence).accessibilityText)
                     if !row.isRecoverable {
                         Text("Salvage couldn't locate this file's contents on the device.")
-                            .font(.subheadline).foregroundStyle(.secondary)
+                            .font(.subheadline).foregroundStyle(.inkSecondary)
                     }
                     if row.isReconstructed {
                         Text("Reconstructed from raw bytes by its file signature. No original name, folder or date is available.")
-                            .font(.subheadline).foregroundStyle(.secondary)
+                            .font(.subheadline).foregroundStyle(.inkSecondary)
                     }
                     if row.isPartial {
                         Text("\(ResultsViewModel.partialTag). This file could not be fully reconstructed; its end was not found.")
-                            .font(.subheadline).foregroundStyle(.secondary)
+                            .font(.subheadline).foregroundStyle(.inkSecondary)
                     }
                 }
             }
         } else {
             Text(model.selection.isEmpty ? "Select a file to preview." : "\(model.selection.count.formatted()) files selected.")
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.inkTertiary)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(24)
         }

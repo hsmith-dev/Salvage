@@ -72,7 +72,7 @@ struct ContentView: View {
         } detail: {
             Group {
                 if scan.state == .idle {
-                    Text("Select a device to start scanning.").foregroundStyle(.secondary)
+                    Text("Select a device to start scanning.").foregroundStyle(.inkSecondary)
                 } else if ResultsViewModel.showsResults(state: scan.state, isActive: scan.isActive, fileCount: scan.files.count) {
                     // A fresh results surface per finished scan.
                     ResultsView(scan: scan, partitionRequest: $partitionRequest).id(scan.endedAt)
@@ -163,7 +163,7 @@ private struct EncryptedVolumeNote: View {
             Text(text).fixedSize(horizontal: false, vertical: true)
         }
         .font(.subheadline)
-        .foregroundStyle(.secondary)
+        .foregroundStyle(.inkSecondary)
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.bar)

@@ -170,7 +170,7 @@ struct SavedScanBanner: View {
                 }
                 if reopened.hasEncryptedFiles {
                     Text("Files on encrypted volumes need the password again. Scan \(device.displayName) again and unlock it to preview or recover them.")
-                        .font(.subheadline).foregroundStyle(.secondary)
+                        .font(.subheadline).foregroundStyle(.inkSecondary)
                 }
             }
             .padding(12)

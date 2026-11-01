@@ -213,7 +213,7 @@ extension DeviceListView {
                 if let error = images.openError {
                     Text(error)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.inkSecondary)
                         .fixedSize(horizontal: false, vertical: true)
                         .selectionDisabled()
                         .accessibilityIdentifier("image-open-error")
@@ -240,7 +240,7 @@ private struct DiskImageRow: View {
                     .truncationMode(.middle)
                 Text(inUse ? "In use by another scan" : deviceSizeFormatter.string(fromByteCount: image.sizeBytes))
                     .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.inkSecondary)
             }
             Spacer()
         }
@@ -269,21 +269,21 @@ private struct DeviceRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(device.displayName)
                     .font(.headline)
-                    .foregroundStyle(device.isBootVolume ? .secondary : .primary)
+                    .foregroundStyle(device.isBootVolume ? InkStyle.secondary : InkStyle.primary)
 
                 if device.isBootVolume {
                     Text(bootVolumeReason)
                         .font(.subheadline)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.inkTertiary)
                 } else {
                     Text(inUse ? "In use by another scan" : (isLocked ? "\(sizeText(for: device)) · Locked" : sizeText(for: device)))
                         .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.inkSecondary)
                     // Story 2.4: while the unlock sheet is withheld, say plainly what happens.
                     if !inUse, let note = UnlockViewModel.pickerNote(for: device) {
                         Text(note)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.inkSecondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
@@ -367,10 +367,10 @@ private struct PartitionRow: View {
             Spacer(minLength: 8)
             Text(detail)
                 .monospacedDigit()
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.inkTertiary)
         }
         .font(.subheadline)
-        .foregroundStyle(.secondary)
+        .foregroundStyle(.inkSecondary)
         .padding(.vertical, 2)
     }
 
@@ -400,7 +400,7 @@ private struct StatusMessage: View {
                 .font(.headline)
             Text(detail)
                 .font(.subheadline)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.inkSecondary)
                 .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

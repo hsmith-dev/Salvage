@@ -35,7 +35,7 @@ struct FileVaultUnlockSheet: View {
     private var entry: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text(UnlockViewModel.Copy.subtitle)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.inkSecondary)
                 .fixedSize(horizontal: false, vertical: true)
 
             Picker("Unlock with", selection: $model.credentialKind) {
@@ -48,7 +48,7 @@ struct FileVaultUnlockSheet: View {
             .disabled(model.isUnlocking)
 
             VStack(alignment: .leading, spacing: 6) {
-                Text(credentialLabel).font(.subheadline).foregroundStyle(.secondary)
+                Text(credentialLabel).font(.subheadline).foregroundStyle(.inkSecondary)
                 SecureField(credentialLabel, text: $model.secret)
                     .textFieldStyle(.roundedBorder)
                     .labelsHidden()
@@ -72,7 +72,7 @@ struct FileVaultUnlockSheet: View {
             HStack(spacing: 8) {
                 if model.isUnlocking {
                     ProgressView().controlSize(.small)
-                    Text("Unlocking…").foregroundStyle(.secondary)
+                    Text("Unlocking…").foregroundStyle(.inkSecondary)
                 }
                 Spacer()
                 Button("Cancel", role: .cancel) { resolve() }
