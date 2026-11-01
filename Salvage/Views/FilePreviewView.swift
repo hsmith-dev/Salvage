@@ -22,6 +22,7 @@ struct FilePreviewView<Details: View>: View {
 
     @State private var loaded: (id: RecoveredFile.ID, result: PreviewResult)?
     @State private var showRawBytes = false
+    @State private var showsDetails = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -37,6 +38,7 @@ struct FilePreviewView<Details: View>: View {
             VStack(alignment: .leading, spacing: 4) {
                 PreviewMetadataHeader(file: file)
                 details
+                DisclosureGroup(isExpanded: $showsDetails) { ScrollView { FileDetailsView(details: FileDetails(file: file, device: source?.device), showsAllRuns: false).padding(.top, 4) }.frame(minHeight: 160, maxHeight: 240) } label: { Button("Details") { showsDetails.toggle() }.buttonStyle(.plain).accessibilityIdentifier("preview-details-toggle") }
             }
         }
         .padding(24)

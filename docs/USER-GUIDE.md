@@ -199,6 +199,37 @@ Under the preview are the file's name, size, modified date, path and confidence.
 file adds "Reconstructed from raw bytes by its file signature. No original name, folder or date
 is available."
 
+## File details and "why this confidence"
+
+Select a file and press **⌘I**, or click **Show Details** in the file browser, to see everything
+Salvage knows about it. The preview pane also has a **Details** disclosure with the same
+information and the first few runs.
+
+The panel starts with the confidence label and one sentence explaining it, for example:
+
+- "High: found through the filesystem's own records; its data is in one piece."
+- "Medium: reconstructed from raw data, not found through the filesystem's records, so it can't
+  be rated higher; its data is in one piece and its end was confirmed."
+- "Low: reconstructed from raw data, and the end of the file couldn't be confirmed."
+
+The sentence comes from the same evidence the label is scored from, so the two always agree.
+Below it are:
+
+- **File**: the original path, size, modified date and status: live, deleted or reconstructed,
+  and whether it's partial.
+- **Source**: the filesystem, the volume (its name and where it starts on the drive) and how the
+  file was found.
+- **Evidence**: how many pieces its data is in, and Salvage's estimate of whether it was
+  overwritten.
+- **Reconstruction** (reconstructed files only): the file signature that matched, where its
+  header is, and how its end was found: by a size field in its header, by its end marker
+  (footer), by checking its internal structure, or cut short.
+- **Where its bytes are**: each run's position on the drive and length. Holes, which read as
+  zeros, and encrypted runs are marked. Positions are in bytes, with the hex value in brackets.
+
+**Copy Details** copies all of this as plain text. It includes up to 10,000 runs; the panel shows
+up to 500.
+
 ## Recover
 
 1. **Tick the files you want.** Use the checkbox in each row, or the keyboard:
