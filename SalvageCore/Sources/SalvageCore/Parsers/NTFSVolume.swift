@@ -43,6 +43,19 @@ actor NTFSVolume {
     var bitmap: NTFSDataStream?
     var bitmapPageIndex: Int64 = -1
     var bitmapPage = Data()
+    /// The whole initialized `$Bitmap`, read once (sequentially) on the first deleted-file check
+    /// when it is at most `cachedBitmapLimit` (`maxCachedBitmapBytes`); nil until then, or when it is larger or couldn't
+    /// be read whole, and lookups then page through it instead. Deleted files' clusters are
+    /// scattered over the volume, so paging cost a small random read per candidate, which on a
+    /// hard drive is a seek each; a 320 GB volume's bitmap is about 10 MB.
+    var wholeBitmap: Data?
+    var wholeBitmapTried = false
+    /// 64 MiB covers 2 TiB at 4 KiB clusters.
+    static let maxCachedBitmapBytes: Int64 = 64 * 1024 * 1024
+    var cachedBitmapLimit = NTFSVolume.maxCachedBitmapBytes
+
+    /// Test seam: the largest `$Bitmap` read whole (0 always pages, as before the cache).
+    func limitCachedBitmap(to bytes: Int64) { cachedBitmapLimit = bytes }
     /// Deleted candidates (by record number) whose runs were all collected, and those among them
     /// whose runs overlap another deleted candidate's.
     var deletedRuns: [DeletedRun] = []
@@ -236,6 +249,9 @@ actor NTFSVolume {
         guard let parent = try directoryPath(name.parent, name.parentSequence) else { return }
         if parent.isEmpty, name.name.hasPrefix("$") { return }
         if !record.inUse, !(try await deletedClustersAreFree(number, data, g)) { return }
+        let content = try content(of: data, hasAttributeList: record.hasAttributeList, g)
+        let isResident: Bool
+        if case .resident = content { isResident = true } else { isResident = false }
         try await emit(RecoveredFile(
             name: name.name, path: parent + "/" + name.name, sizeBytes: data.size,
             modified: record.modified, isDeleted: !record.inUse,
@@ -243,8 +259,19 @@ actor NTFSVolume {
                                            recordOffset: try checkedAdd(extent.offset, offset),
                                            allocationStart: number,
                                            contiguous: data.runs.count == 1 && data.runs[0].lcn != nil,
-                                           rawRecord: fixed),
-            content: try content(of: data, hasAttributeList: record.hasAttributeList, g)))
+                                           rawRecord: isResident ? fixed : Self.usedPart(of: fixed)),
+            content: content))
+    }
+
+    /// The fixed-up record up to its bytes-in-use field: every attribute and the end marker, without
+    /// the unused slack after them (a copy, so the full record's buffer isn't kept alive). A file
+    /// with resident data keeps the whole record instead, because a saved scan locates that data
+    /// inside it. Records are 1 KiB and typically use 300-600 bytes, and every found file keeps its
+    /// record for the whole session, so this roughly halves the largest per-file allocation.
+    static func usedPart(of fixed: Data) -> Data {
+        guard let used = try? Int(fixed.number(0x18, 4)), used > 0, used < fixed.count else { return fixed }
+        // `Data(fixed.prefix(used))` would share (and keep alive) the 1 KiB buffer; copy the bytes.
+        return fixed.prefix(used).withUnsafeBytes { Data($0) }
     }
 
     /// Where the unnamed `$DATA` stream's bytes live. Compressed or encrypted streams, and files with
@@ -367,6 +394,8 @@ actor NTFSVolume {
         let page: Data, pageStart: Int64
         if let resident = bitmap.residentValue {
             page = resident; pageStart = 0
+        } else if let whole = try await loadWholeBitmap(bitmap, g) {
+            page = whole; pageStart = 0
         } else {
             let pageBytes = min(g.clusterBytes, 64 * 1024)
             let index = byte / pageBytes
@@ -390,5 +419,38 @@ actor NTFSVolume {
             value |= UInt64(page[Int(byte - pageStart) + i]) << UInt64(i * 8)
         }
         return value
+    }
+
+    /// Reads the initialized part of a non-resident `$Bitmap` in one pass, once. Returns nil (and
+    /// lookups page instead, as before) when it is larger than `cachedBitmapLimit`, its runs
+    /// don't cover it, or a read fails: a damaged spot the paged lookups might never touch must
+    /// not fail the volume. Cancellation still propagates.
+    func loadWholeBitmap(_ bitmap: NTFSDataStream, _ g: NTFSGeometry) async throws -> Data? {
+        if let wholeBitmap { return wholeBitmap }
+        guard !wholeBitmapTried else { return nil }
+        wholeBitmapTried = true
+        guard bitmap.initialized > 0, bitmap.initialized <= cachedBitmapLimit else { return nil }
+        var whole = Data()
+        whole.reserveCapacity(Int(bitmap.initialized))
+        var remaining = bitmap.initialized
+        do {
+            for run in bitmap.runs where remaining > 0 {
+                guard let lcn = run.lcn else { return nil }
+                var offset = try checkedMultiply(lcn, g.clusterBytes)
+                var runBytes = min(try checkedMultiply(run.length, g.clusterBytes), remaining)
+                while runBytes > 0 {
+                    let count = min(runBytes, 8 * 1024 * 1024)
+                    whole.append(try await read(offset, Int(count)))
+                    offset += count; runBytes -= count; remaining -= count
+                }
+            }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            return nil
+        }
+        guard remaining == 0 else { return nil }
+        wholeBitmap = whole
+        return whole
     }
 }

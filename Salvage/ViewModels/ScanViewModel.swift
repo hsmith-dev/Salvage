@@ -32,6 +32,16 @@ final class ScanViewModel {
     /// Checkpoints arrive per sweep unit; disk writes are throttled to this interval, except while
     /// paused or tearing down, when every checkpoint is written at once.
     static let checkpointSaveInterval: TimeInterval = 1
+    /// Scan events reach the main actor in batches at most this often (sooner for events other
+    /// than progress and found files). A large drive yields hundreds of thousands of files: taking
+    /// each event on the main actor cost a main-thread wakeup per file, and appending each file to
+    /// the observed `files` re-evaluated every view that reads it once per file, which with the
+    /// per-redraw volume labels was O(n²) main-thread work.
+    nonisolated static let eventBatchInterval: Duration = .milliseconds(250)
+    /// The remaining-time estimate uses the scan rate over about this much recent active time
+    /// (once that much has passed), so it follows a drive that slows down towards its inner
+    /// tracks, or a slower stretch of the scan, rather than the average since the start.
+    static let rateWindow: TimeInterval = 90
 
     private(set) var state: State = .idle
     private(set) var device: BlockDevice?
@@ -72,6 +82,14 @@ final class ScanViewModel {
     private var pausedAt: Date?
     private var pausedTotal: TimeInterval = 0
     private var seenFiles: Set<FileKey> = []
+    /// The running scan's events not yet applied on the main actor (see `eventBatchInterval`).
+    @ObservationIgnored private var relay: EventRelay?
+    /// How many times `files` grew during scans (tests: discoveries are batched, not per file).
+    @ObservationIgnored private(set) var filePublications = 0
+    /// The distinct volume offsets of `files`, kept as files arrive, for `sourceVolumeLabels`.
+    private var volumeOffsets: Set<Int64> = []
+    /// (active scan time, bytes scanned) at most once a second, covering `rateWindow`.
+    @ObservationIgnored private var rateSamples: [(time: TimeInterval, bytes: Int64)] = []
     private var lastCheckpointSave: Date?
     private var requestedResume = false
     private var stopReason: StopReason?
@@ -116,6 +134,7 @@ final class ScanViewModel {
     func pause() {
         guard canPause, let gate else { return }
         gate.pause()
+        if let relay { apply(relay) }
         pausedAt = now(); state = .paused
         persistLatestCheckpoint()
     }
@@ -166,6 +185,7 @@ final class ScanViewModel {
     private func reset(for device: BlockDevice) {
         discardPasswordRetryCredentials()
         self.device = device; files = []; seenFiles = []; bytesScanned = 0; totalBytes = 0
+        relay = nil; volumeOffsets = []; rateSamples = []
         lostPartitions = []; unlockRequests = []
         notices = []
         startedAt = nil; scanningStartedAt = nil; endedAt = nil; baselineBytes = 0
@@ -206,9 +226,11 @@ final class ScanViewModel {
         startedAt = now(); state = .preparing; isActive = true
         let gate = ScanPauseGate()
         self.gate = gate
+        let relay = EventRelay()
+        self.relay = relay
         task = Task { [runner] in
             await previous?.close()
-            let (stream, continuation) = AsyncStream<ScanEvent>.makeStream(bufferingPolicy: .bufferingOldest(64))
+            let (stream, continuation) = AsyncStream<ScanEvent>.makeStream(bufferingPolicy: .bufferingOldest(1024))
             let (checkpointStream, checkpoints) = AsyncStream<ScanCheckpoint>.makeStream(bufferingPolicy: .bufferingNewest(1))
             let (noticeStream, notices) = AsyncStream<ScanNotice>.makeStream()
             let run = ScanRun(device: device, pauseGate: gate, checkpoints: checkpoints,
@@ -220,7 +242,6 @@ final class ScanViewModel {
                                   // Let the explanation render before the dialog takes focus.
                                   try? await Task.sleep(for: Self.passwordExplanationLead)
                               })
-            var completed = false
             await withTaskGroup(of: Void.self) { group in
                 group.addTask {
                     do { try await runner(run, continuation) }
@@ -236,33 +257,35 @@ final class ScanViewModel {
                 group.addTask {
                     for await notice in noticeStream { await self.receive(notice) }
                 }
-                for await event in stream {
-                    switch event {
-                    case .progress(let bytes, let total):
-                        if scanningStartedAt == nil {
-                            scanningStartedAt = now()
-                            // The core's first progress counts only bytes a checkpoint covered, so a
-                            // nonzero value means it accepted the resume point. Only bytes read now
-                            // measure the rate.
-                            resumedFromCheckpoint = requestedResume && bytes > 0
-                            baselineBytes = resumedFromCheckpoint ? bytes : 0
+                // Events are taken off the main actor and applied there in batches: progress and
+                // found files within `eventBatchInterval`, anything else (and the first progress)
+                // at once, after the files before it. Cancelling the scan's task ends this loop;
+                // what it already took is still applied, so discoveries so far stay visible.
+                group.addTask {
+                    var started = false
+                    for await event in stream {
+                        switch event {
+                        case .progress where !started:
+                            // The first progress ends "Preparing" (and enables Pause) at once.
+                            started = true
+                            _ = relay.add(event)
+                            await self.apply(relay)
+                        case .progress, .found:
+                            guard relay.add(event) else { continue }
+                            Task { @MainActor in
+                                try? await Task.sleep(for: Self.eventBatchInterval)
+                                self.apply(relay)
+                            }
+                        case .error, .completed, .lostPartitionFound, .unlockRequired:
+                            _ = relay.add(event)
+                            await self.apply(relay)
                         }
-                        if state == .preparing { state = .running }
-                        isAwaitingAdministratorPassword = false
-                        bytesScanned = bytes; totalBytes = total
-                    case .found(let file):
-                        let key = FileKey(volumeOffset: file.sourceMetadata.volumeOffset,
-                                          recordOffset: file.sourceMetadata.recordOffset, path: file.path)
-                        if seenFiles.insert(key).inserted { files.append(file) }
-                    case .error(let error): state = .failed(error)
-                    case .completed: completed = true
-                    case .lostPartitionFound(let candidate): lostPartitions.append(candidate)
-                    case .unlockRequired(let device): unlockRequests.append(device)
                     }
+                    await self.apply(relay)
                 }
-                if Task.isCancelled { group.cancelAll() }
                 await group.waitForAll()
             }
+            let completed = relay.completed
             let ended = now()
             endedAt = ended; isActive = false; isAwaitingAdministratorPassword = false
             if let pausedAt { pausedTotal += max(0, ended.timeIntervalSince(pausedAt)); self.pausedAt = nil }
@@ -291,6 +314,47 @@ final class ScanViewModel {
             self.gate = nil
             task = nil
         }
+    }
+
+    /// Applies the events `relay` holds, in arrival order. Found files are appended to `files` in
+    /// one change per call (before any later event that isn't a file or progress).
+    private func apply(_ relay: EventRelay) {
+        let events = relay.take()
+        guard !events.isEmpty else { return }
+        var found: [RecoveredFile] = []
+        func publish() {
+            guard !found.isEmpty else { return }
+            for file in found { volumeOffsets.insert(file.sourceMetadata.volumeOffset) }
+            files.append(contentsOf: found)
+            found.removeAll()
+            filePublications += 1
+        }
+        for event in events {
+            switch event {
+            case .progress(let bytes, let total):
+                if scanningStartedAt == nil {
+                    scanningStartedAt = now()
+                    // The core's first progress counts only bytes a checkpoint covered, so a
+                    // nonzero value means it accepted the resume point. Only bytes read now
+                    // measure the rate.
+                    resumedFromCheckpoint = requestedResume && bytes > 0
+                    baselineBytes = resumedFromCheckpoint ? bytes : 0
+                }
+                if state == .preparing { state = .running }
+                isAwaitingAdministratorPassword = false
+                bytesScanned = bytes; totalBytes = total
+                recordRateSample()
+            case .found(let file):
+                let key = FileKey(volumeOffset: file.sourceMetadata.volumeOffset,
+                                  recordOffset: file.sourceMetadata.recordOffset, path: file.path)
+                if seenFiles.insert(key).inserted { found.append(file) }
+            case .error(let error): publish(); state = .failed(error)
+            case .completed: publish(); relay.completed = true
+            case .lostPartitionFound(let candidate): publish(); lostPartitions.append(candidate)
+            case .unlockRequired(let device): publish(); unlockRequests.append(device)
+            }
+        }
+        publish()
     }
 
     private func receive(_ notice: ScanNotice) {
@@ -378,6 +442,7 @@ final class ScanViewModel {
         releaseSource()
         reset(for: archive.device)
         files = archive.files
+        volumeOffsets = Set(archive.files.lazy.map(\.sourceMetadata.volumeOffset))
         lostPartitions = archive.lostPartitions
         notices = archive.notices
         latestCheckpoint = archive.checkpoint
@@ -426,9 +491,25 @@ final class ScanViewModel {
         return .connected
     }
 
-    var sourceVolumeLabels: [Int64: String] { Self.volumeLabels(for: files) }
+    /// "Volume 1", "Volume 2"… by volume offset when the files span several volumes. Read on every
+    /// redraw of the progress view, so it comes from the offsets kept as files arrive rather than
+    /// from a pass over `files`.
+    /// The progress screen lists at most this many files: the most recently found.
+    static let recentFileLimit = 200
+    /// The newest `recentFileLimit` files, oldest first.
+    var recentFiles: ArraySlice<RecoveredFile> { files.suffix(Self.recentFileLimit) }
+    /// "Showing the latest 200 of 12,345 files." once the list is cut; nil while every file shows.
+    var recentFilesNote: String? {
+        guard files.count > Self.recentFileLimit else { return nil }
+        return "Showing the latest \(Self.recentFileLimit.formatted()) of \(files.count.formatted()) files."
+    }
+
+    var sourceVolumeLabels: [Int64: String] { Self.volumeLabels(forOffsets: volumeOffsets) }
     static func volumeLabels(for files: [RecoveredFile]) -> [Int64: String] {
-        let volumes = Set(files.map { $0.sourceMetadata.volumeOffset }).sorted()
+        volumeLabels(forOffsets: Set(files.lazy.map { $0.sourceMetadata.volumeOffset }))
+    }
+    static func volumeLabels(forOffsets offsets: Set<Int64>) -> [Int64: String] {
+        let volumes = offsets.sorted()
         guard volumes.count > 1 else { return [:] }
         return Dictionary(uniqueKeysWithValues: volumes.enumerated().map { ($0.element, "Volume \($0.offset + 1)") })
     }
@@ -442,11 +523,63 @@ final class ScanViewModel {
         let end = endedAt ?? now
         return max(0, end.timeIntervalSince(startedAt) - pausedTime(at: end))
     }
-    func estimatedRemaining(at now: Date) -> TimeInterval? {
+    /// Active scanning time (since the first progress, paused time excluded).
+    private func scanningTime(at now: Date) -> TimeInterval? {
         guard let scanningStartedAt else { return nil }
-        let elapsed = max(0, now.timeIntervalSince(scanningStartedAt) - pausedTime(at: now))
+        return max(0, now.timeIntervalSince(scanningStartedAt) - pausedTime(at: now))
+    }
+
+    /// Keeps one sample a second; drops those older than `rateWindow`, except the newest of them,
+    /// so the samples always reach back at least a full window.
+    private func recordRateSample() {
+        guard let time = scanningTime(at: now()) else { return }
+        if let last = rateSamples.last, time - last.time < 1 { return }
+        rateSamples.append((time, bytesScanned))
+        let stale = rateSamples.lastIndex { time - $0.time >= Self.rateWindow }
+        if let stale, stale > 0 { rateSamples.removeFirst(stale) }
+    }
+
+    /// Remaining time at the measured rate: over the last `rateWindow` of active scanning once that
+    /// much has passed, otherwise since scanning started (bytes a resumed checkpoint covered don't
+    /// count as measured).
+    func estimatedRemaining(at now: Date) -> TimeInterval? {
+        guard let elapsed = scanningTime(at: now) else { return nil }
         let measured = bytesScanned - baselineBytes
         guard state == .running, elapsed >= 3, measured > 0, totalBytes > bytesScanned else { return nil }
+        if let oldest = rateSamples.first, elapsed - oldest.time >= Self.rateWindow {
+            let span = elapsed - oldest.time, recent = bytesScanned - oldest.bytes
+            guard recent > 0 else { return nil }
+            return span * Double(totalBytes - bytesScanned) / Double(recent)
+        }
         return elapsed * Double(totalBytes - bytesScanned) / Double(measured)
+    }
+}
+
+/// One scan's events between the stream's consumer (off the main actor) and the main actor,
+/// which takes them in batches (`ScanViewModel.eventBatchInterval`).
+private final class EventRelay: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [ScanEvent] = []
+    private var scheduled = false
+    private var sawCompleted = false
+    /// Set on the main actor when it applies `.completed`.
+    var completed: Bool {
+        get { lock.withLock { sawCompleted } }
+        set { lock.withLock { sawCompleted = newValue } }
+    }
+    /// Holds `event`; true when no batch was pending, so the caller schedules one.
+    func add(_ event: ScanEvent) -> Bool {
+        lock.withLock {
+            events.append(event)
+            defer { scheduled = true }
+            return !scheduled
+        }
+    }
+    func take() -> [ScanEvent] {
+        lock.withLock {
+            scheduled = false
+            defer { events = [] }
+            return events
+        }
     }
 }

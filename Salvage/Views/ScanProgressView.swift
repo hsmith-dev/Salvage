@@ -54,7 +54,13 @@ struct ScanProgressView: View {
             }
             Text("Files listed here have been indexed from intact metadata. No files have been copied or recovered.")
                 .font(.subheadline).foregroundStyle(.inkSecondary)
-            List(model.files) { file in
+            // Only the newest files are listed while scanning: a list of every file found on a large
+            // drive (hundreds of thousands) is diffed in full on each update. The count is above.
+            if let note = model.recentFilesNote {
+                Text(note).font(.subheadline).foregroundStyle(.inkSecondary)
+                    .accessibilityIdentifier("scan-recent-files-note")
+            }
+            List(model.recentFiles) { file in
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(file.path).lineLimit(2).textSelection(.enabled)

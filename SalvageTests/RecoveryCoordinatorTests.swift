@@ -362,7 +362,47 @@ struct RecoveryCoordinatorTests {
             return RecoveryEngine.durableSync(fd)
         })
         #expect(summary(coordinator)?.written.count == 2)
-        #expect(log.entries == [[], ["a.txt"]])
+        // Both are staged (as .partial, fsynced), then one full flush, then both are published.
+        #expect(log.entries == [[]])
+    }
+
+    /// Hundreds of thousands of small files: one full flush per batch, never one per file, and a
+    /// file is published only after the flush that covers it.
+    @Test func filesAreFlushedOncePerBatchBeforeAnyOfThemIsPublished() async throws {
+        let dir = try TempDir()
+        let log = SyncLog()
+        let base = dir.url
+        let count = RecoveryEngine.publishBatchFiles * 2 + 6
+        let files = (0..<count).map { file("/many/f\($0).txt", size: 1, content: .resident(Data("x".utf8))) }
+        let coordinator = await recover(files, reader: MemoryReader(bytes: Data()), into: base, sync: { fd in
+            let all = TempDir.regularFiles(under: base)
+            log.append(["\(all.filter { !$0.hasSuffix(".partial") }.count) published", "\(all.filter { $0.hasSuffix(".partial") }.count) staged"])
+            return RecoveryEngine.durableSync(fd)
+        })
+        let result = try #require(summary(coordinator))
+        #expect(result.written.count == count && result.failed.isEmpty)
+        #expect(result.written.map(\.sourcePath) == files.map(\.path), "Written in selection order")
+        let batch = RecoveryEngine.publishBatchFiles
+        #expect(log.entries == [["0 published", "\(batch) staged"], ["\(batch) published", "\(batch) staged"],
+                                ["\(2 * batch) published", "6 staged"]])
+        #expect(!TempDir.regularFiles(under: base).contains { $0.hasSuffix(".partial") })
+    }
+
+    @Test func aFailedBatchFlushPublishesNoneOfThatBatch() async throws {
+        let dir = try TempDir()
+        let base = dir.url
+        let calls = Counter()
+        let count = RecoveryEngine.publishBatchFiles + 5
+        let files = (0..<count).map { file("/b/f\($0).txt", size: 1, content: .resident(Data("y".utf8))) }
+        let coordinator = await recover(files, reader: MemoryReader(bytes: Data()), into: base, sync: { fd in
+            calls.next() == 2 ? EIO : RecoveryEngine.durableSync(fd)
+        })
+        let result = try #require(summary(coordinator))
+        #expect(result.written.map(\.sourcePath) == files.prefix(RecoveryEngine.publishBatchFiles).map(\.path))
+        #expect(result.failed.map(\.sourcePath) == files.suffix(5).map(\.path))
+        #expect(result.failed.allSatisfy { $0.reason == RecoveryEngine.CopyFailure.destination(EIO).reason })
+        let left = TempDir.regularFiles(under: base)
+        #expect(left.count == RecoveryEngine.publishBatchFiles && !left.contains { $0.hasSuffix(".partial") })
     }
 
     @Test func fullSyncFallsBackToFsyncOnlyWhenUnsupported() {

@@ -220,11 +220,28 @@ private actor Collected {
     var files: [RecoveredFile] = []
     func add(_ file: RecoveredFile) { files.append(file) }
 }
-private func scanVolume(_ image: Data, budget: Int64? = nil) async -> (files: [RecoveredFile], error: ScanError?, checks: Int) {
+/// Counts reads that touch a byte range (the `$Bitmap` runs, in the cache tests).
+private final class RangeCountingReader: BlockReader, @unchecked Sendable {
+    let base: ImageReader
+    let watched: [Range<Int64>]
+    private let lock = NSLock()
+    private var hits = 0
+    var count: Int { lock.withLock { hits } }
+    var sizeBytes: Int64 { base.sizeBytes }
+    init(data: Data, watched: [Range<Int64>]) { base = ImageReader(data: data); self.watched = watched }
+    func read(at offset: Int64, count: Int) async throws -> Data {
+        let range = offset..<offset + Int64(count)
+        if watched.contains(where: { $0.overlaps(range) }) { lock.withLock { hits += 1 } }
+        return try await base.read(at: offset, count: count)
+    }
+}
+private func scanVolume(_ image: Data, budget: Int64? = nil, bitmapCache: Int64? = nil,
+                        reader: (any BlockReader)? = nil) async -> (files: [RecoveredFile], error: ScanError?, checks: Int) {
     let collected = Collected()
-    let volume = NTFSVolume(reader: ImageReader(data: image), extent: VolumeExtent(offset: 0, length: Int64(image.count), format: .ntfs),
+    let volume = NTFSVolume(reader: reader ?? ImageReader(data: image), extent: VolumeExtent(offset: 0, length: Int64(image.count), format: .ntfs),
                             emit: { await collected.add($0) })
     if let budget { await volume.limitDeletedChecks(to: budget) }
+    if let bitmapCache { await volume.limitCachedBitmap(to: bitmapCache) }
     var failure: ScanError?
     do { try await volume.scan() } catch { failure = error as? ScanError ?? .malformed("\(error)") }
     return (await collected.files, failure, await volume.bitmapChecks)
@@ -266,9 +283,16 @@ struct NTFSVolumeTests {
         let report = found[1].sourceMetadata
         #expect(report.filesystem == .ntfs && report.volumeOffset == 0)
         #expect(report.recordOffset == Int64(Data.recordOffset(18)) && report.allocationStart == 18)
-        #expect(report.contiguous && report.rawRecord.count == recordSize)
-        // The raw record is fixed up: stride tails hold the original bytes, not the sequence number.
-        #expect(report.rawRecord[510] == 0 && report.rawRecord[511] == 0)
+        // A non-resident file keeps its fixed-up record up to the bytes-in-use field, not the slack.
+        var expected = NTFSImage.standard().records[18]!
+        #expect(applyNTFSFixup(&expected))
+        let used = Int(expected[0x18]) | Int(expected[0x19]) << 8
+        #expect(used > 0x38 && used < recordSize)
+        #expect(report.contiguous && report.rawRecord == expected.prefix(used))
+        // A resident file keeps its whole record (a saved scan locates the data in it), fixed up:
+        // stride tails hold the original bytes, not the sequence number.
+        let hello = found[0].sourceMetadata.rawRecord
+        #expect(hello.count == recordSize && hello[510] == 0 && hello[511] == 0)
         #expect(!found[0].sourceMetadata.contiguous && !found[5].sourceMetadata.contiguous)
         #expect(image == original)
     }
@@ -607,6 +631,43 @@ struct NTFSVolumeTests {
         let result = await scanVolume(image.build())
         #expect(result.error == nil)
         #expect(result.files.map(\.name) == ["page1.bin", "page16.bin", "page10.bin"])
+    }
+
+    /// Deleted files whose clusters are scattered across the volume, checked in MFT order: the
+    /// `$Bitmap` is read once, in one read per run, instead of a page per lookup (a seek each on a
+    /// hard drive); the files found are the same as with paging.
+    @Test func scatteredDeletedFilesReadTheBitmapOnce() async {
+        var image = largeImage()
+        let clusters = [70_000, 1_000, 40_000, 9_000, 66_000, 20_000, 52_000, 3_000, 30_000, 60_000]
+        for (index, lcn) in clusters.enumerated() {
+            image.records[16 + index] = deletedFile("scattered \(index).bin", [.at(lcn, 2)])
+        }
+        image.used.insert(30_001)
+        let built = image.build()
+        let watched = image.bitmapRuns.map { Int64($0.lcn * sector)..<Int64(($0.lcn + $0.length) * sector) }
+        let cachedReader = RangeCountingReader(data: built, watched: watched)
+        let cached = await scanVolume(built, reader: cachedReader)
+        let pagedReader = RangeCountingReader(data: built, watched: watched)
+        let paged = await scanVolume(built, bitmapCache: 0, reader: pagedReader)
+        #expect(cached.error == nil && paged.error == nil)
+        // The file on cluster 30,000 shares an allocated cluster, so it isn't emitted either way.
+        #expect(cached.files.map(\.name) == clusters.indices.filter { $0 != 8 }.map { "scattered \($0).bin" })
+        #expect(cached.files.map(\.path) == paged.files.map(\.path))
+        #expect(cached.checks == paged.checks)
+        #expect(cachedReader.count == image.bitmapRuns.count)
+        #expect(pagedReader.count >= clusters.count - 1)
+    }
+
+    /// A `$Bitmap` larger than the cache limit is still paged through, with the same results.
+    @Test func bitmapOverTheCacheLimitIsPaged() async {
+        var image = largeImage()
+        image.records[16] = deletedFile("far.bin", [.at(70_000, 1)])
+        image.records[17] = deletedFile("near.bin", [.at(1_000, 1)])
+        let built = image.build()
+        let limited = await scanVolume(built, bitmapCache: Int64((image.clusterCount + 7) / 8 - 1))
+        let whole = await scanVolume(built)
+        #expect(limited.error == nil && limited.files.map(\.name) == ["far.bin", "near.bin"])
+        #expect(limited.files.map(\.path) == whole.files.map(\.path))
     }
 
     @Test func residentBitmapIsHonoured() async {

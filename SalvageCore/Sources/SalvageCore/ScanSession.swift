@@ -117,21 +117,11 @@ public struct ScanSession: Sendable, Identifiable {
                 // stopped on damaged metadata; only one the device couldn't read is left alone.
                 if unreadable.contains(index) { continue }
                 try await carver.beginExtent(offset: extent.offset, length: extent.length)
-                var offset: Int64 = index == start?.volume ? start?.offset ?? 0 : 0
-                while offset < extent.length {
-                    try Task.checkCancellation()
-                    try await pauseGate?.wait()
-                    let count = Int(min(1024 * 1024, extent.length - offset))
-                    let deviceOffset = try checkedAdd(extent.offset, offset)
-                    let chunk: Data
-                    do { chunk = try await measured.read(at: deviceOffset, count: count) }
-                    catch ScanError.io(let reason) {
-                        // An unreadable spot in a lost partition ends that partition's sweep only.
-                        guard extent.isLost else { throw ScanError.io(reason) }
-                        break
-                    }
+                let from: Int64 = index == start?.volume ? start?.offset ?? 0 : 0
+                // An unreadable spot in a lost partition ends that partition's sweep only.
+                try await Self.sweep(extent, from: from, to: extent.length, pauseGate: pauseGate,
+                                     read: { try await measured.read(at: $0, count: $1) }) { chunk, deviceOffset, offset in
                     try await carver.consume(chunk, at: deviceOffset)
-                    offset += Int64(count)
                     checkpoints?.yield(ScanCheckpoint(deviceSizeBytes: reader.sizeBytes, totalBytes: total,
                                                       extents: fingerprint, sweepVolumeIndex: index, sweepOffset: offset,
                                                       bytesScanned: measured.measured))
@@ -193,23 +183,53 @@ public struct ScanSession: Sendable, Identifiable {
                 dropped.set(from..<to)
             }
             try await carver.beginExtent(offset: extent.offset, length: extent.length)
-            var offset: Int64 = 0
-            while offset < readEnd {
-                try Task.checkCancellation()
-                try await pauseGate?.wait()
-                let count = Int(min(1024 * 1024, readEnd - offset))
-                let deviceOffset = try checkedAdd(extent.offset, offset)
-                let chunk: Data
-                do { chunk = try await reader.read(at: deviceOffset, count: count) }
-                catch ScanError.io(let reason) {
-                    guard extent.isLost else { throw ScanError.io(reason) }
-                    break
-                }
+            let reader = reader
+            try await Self.sweep(extent, from: 0, to: readEnd, pauseGate: pauseGate, read: { offset, count in
+                let chunk = try await reader.read(at: offset, count: count)
                 guard chunk.count == count else { throw ScanError.malformed("Truncated device.") }
+                return chunk
+            }) { chunk, deviceOffset, offset in
                 try await carver.consume(chunk, at: deviceOffset)
-                offset += Int64(count)
                 await checkpoint(extentBase + min(offset, region))
             }
+        }
+    }
+
+    /// The chunk size of the sweep and the carve backfill.
+    static let sweepChunkBytes: Int64 = 1024 * 1024
+
+    /// Reads `extent` from `from` to `to` (extent-relative) in `sweepChunkBytes` chunks, in order,
+    /// and hands each to `body` with its device offset and the extent-relative offset just past it.
+    ///
+    /// The next chunk is read while `body` carves the current one, so the source isn't idle while
+    /// the carver works: on a USB hard drive, read time and carving time overlap instead of adding
+    /// up. At most one read is in flight, and reads stay strictly sequential. Each chunk's read
+    /// first checks cancellation and waits at the pause gate, so no read starts while paused; the
+    /// sweep then parks there, after `body` handled (and checkpointed) every chunk before it. A
+    /// `ScanError.io` inside a lost extent ends that extent's sweep after the chunks before it.
+    static func sweep(_ extent: VolumeExtent, from: Int64, to end: Int64, pauseGate: ScanPauseGate?,
+                      read: @escaping @Sendable (Int64, Int) async throws -> Data,
+                      body: (Data, Int64, Int64) async throws -> Void) async throws {
+        let isLost = extent.isLost
+        @Sendable func chunk(at offset: Int64) async throws -> Data? {
+            guard offset < end else { return nil }
+            try Task.checkCancellation()
+            try await pauseGate?.wait()
+            let count = Int(min(sweepChunkBytes, end - offset))
+            do { return try await read(try checkedAdd(extent.offset, offset), count) }
+            catch ScanError.io(let reason) {
+                guard isLost else { throw ScanError.io(reason) }
+                return nil
+            }
+        }
+        var offset = from
+        var current = try await chunk(at: offset)
+        while let data = current {
+            let next = offset + Int64(data.count)
+            async let ahead = chunk(at: next)
+            try await body(data, try checkedAdd(extent.offset, offset), next)
+            offset = next
+            current = try await ahead
         }
     }
 

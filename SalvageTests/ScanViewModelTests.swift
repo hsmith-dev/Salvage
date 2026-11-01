@@ -702,3 +702,134 @@ private actor CloseCounter {
     var count = 0
     func close() { count += 1 }
 }
+
+/// Scale pass: a large drive's hundreds of thousands of discoveries reach the main actor in
+/// batches, and the remaining-time estimate follows the recent scan rate.
+@MainActor @Suite("Scan events at scale")
+struct ScanEventBatchingTests {
+    let device = BlockDevice(bsdName: "disk43", displayName: "Big", sizeBytes: 1 << 40, isInternal: false, isBootVolume: false)
+
+    static func file(_ index: Int, volume: Int64 = 0) -> RecoveredFile {
+        RecoveredFile(name: "f\(index).txt", path: "/d/f\(index).txt", sizeBytes: 1,
+                      sourceMetadata: SourceMetadata(filesystem: .ntfs, volumeOffset: volume, recordOffset: volume + Int64(index) * 1024,
+                                                     allocationStart: UInt64(index), contiguous: true, rawRecord: Data()))
+    }
+
+    @Test func manyDiscoveriesArePublishedInFewBatchesInOrder() async throws {
+        let files = (0..<20_000).map { Self.file($0) }
+        let model = ScanViewModel { _, events in
+            try await events.send(.progress(bytesScanned: 0, totalBytes: 100))
+            for file in files { try await events.send(.found(file)) }
+            try await events.send(.completed)
+        }
+        model.start(device)
+        try await waitUntil { !model.isActive }
+        #expect(model.state == .completed)
+        #expect(model.files.map(\.id) == files.map(\.id))
+        // One change per batch (every `eventBatchInterval`, and before `.completed`), not per file.
+        #expect(model.filePublications >= 1 && model.filePublications < 100)
+    }
+
+    @Test func progressListShowsOnlyTheNewestFiles() async throws {
+        let few = (0..<3).map { Self.file($0) }
+        let many = (0..<(ScanViewModel.recentFileLimit + 50)).map { Self.file($0) }
+        for files in [few, many] {
+            let model = ScanViewModel { _, events in
+                for file in files { try await events.send(.found(file)) }
+                try await events.send(.completed)
+            }
+            model.start(device)
+            try await waitUntil { !model.isActive }
+            #expect(Array(model.recentFiles) == Array(files.suffix(ScanViewModel.recentFileLimit)))
+            #expect(model.files.count == files.count)
+        }
+        let model = ScanViewModel { _, events in
+            for file in many { try await events.send(.found(file)) }
+            try await events.send(.completed)
+        }
+        #expect(model.recentFilesNote == nil)
+        model.start(device)
+        try await waitUntil { !model.isActive }
+        #expect(model.recentFilesNote == "Showing the latest 200 of 250 files.")
+    }
+
+    @Test func filesFoundBeforeAnotherEventAreShownWithIt() async throws {
+        let first = Self.file(1), second = Self.file(2)
+        let lost = LostPartitionCandidate(offset: 4096, sizeBytes: 4096, formatName: "FAT32")
+        let model = ScanViewModel { _, events in
+            try await events.send(.found(first))
+            try await events.send(.found(second))
+            try await events.send(.lostPartitionFound(lost))
+            try await Task.sleep(for: .seconds(60))
+        }
+        model.start(device)
+        try await waitUntil { model.lostPartitions.count == 1 }
+        #expect(model.files == [first, second])
+        model.cancel()
+        try await waitUntil { !model.isActive }
+    }
+
+    @Test func aLoneDiscoveryIsShownWithoutWaitingForMore() async throws {
+        let only = Self.file(7)
+        let model = ScanViewModel { _, events in
+            try await events.send(.found(only))
+            try await Task.sleep(for: .seconds(60))
+        }
+        model.start(device)
+        let started = ContinuousClock.now
+        try await waitUntil { model.files.count == 1 }
+        #expect(started.duration(to: .now) < .seconds(5))
+        #expect(model.files == [only])
+        model.cancel()
+        try await waitUntil { !model.isActive }
+        #expect(model.files == [only], "Discoveries so far stay after a cancel")
+    }
+
+    @Test func volumeLabelsFollowTheFilesAsTheyArrive() async throws {
+        let files = [Self.file(1, volume: 2048), Self.file(2, volume: 1024), Self.file(3, volume: 2048)]
+        let (proceed, go) = AsyncStream<Void>.makeStream()
+        let model = ScanViewModel { _, events in
+            try await events.send(.found(files[0]))
+            try await events.send(.lostPartitionFound(LostPartitionCandidate(offset: 1 << 30, sizeBytes: 1)))
+            for await _ in proceed { break }
+            try await events.send(.found(files[1])); try await events.send(.found(files[2]))
+            try await events.send(.completed)
+        }
+        model.start(device)
+        try await waitUntil { model.lostPartitions.count == 1 }
+        #expect(model.sourceVolumeLabels.isEmpty, "One volume so far")
+        go.yield()
+        try await waitUntil { !model.isActive }
+        #expect(model.sourceVolumeLabels == ScanViewModel.volumeLabels(for: model.files))
+        #expect(model.sourceVolumeLabels == [1024: "Volume 1", 2048: "Volume 2"])
+    }
+
+    /// A drive that reads 50 B/s for 100 s and then 10 B/s: after a full rate window at the slower
+    /// rate, the estimate uses it rather than the average since the start.
+    @Test func remainingTimeFollowsTheRecentRate() async throws {
+        let clock = TestClock()
+        let (steps, feed) = AsyncStream<Int64>.makeStream()
+        let model = ScanViewModel(runner: { _, events in
+            for await bytes in steps { try await events.send(.progress(bytesScanned: bytes, totalBytes: 10_000)) }
+        }, now: { clock.date })
+        model.start(device)
+        func step(_ seconds: TimeInterval, _ bytes: Int64) async throws {
+            clock.date = Date(timeIntervalSince1970: seconds)
+            feed.yield(bytes)
+            try await waitUntil { model.bytesScanned == bytes && model.state == .running }
+        }
+        try await step(0, 1)
+        try await step(60, 3_000)
+        // Until a full window has passed, the average since the start is used: 3,000 B in 60 s.
+        let early = model.estimatedRemaining(at: Date(timeIntervalSince1970: 60))
+        #expect(abs((early ?? 0) - 60.0 * 7_000 / 3_000) < 0.001)
+        try await step(100, 5_000)
+        for tick in 1...9 { try await step(100 + Double(tick) * 10, 5_000 + Int64(tick) * 100) }
+        // At 190 s the newest sample at least 90 s old is (100 s, 5,000 B): 900 B in 90 s.
+        let estimate = try #require(model.estimatedRemaining(at: Date(timeIntervalSince1970: 190)))
+        #expect(abs(estimate - 90 * Double(10_000 - 5_900) / 900) < 0.001)
+        model.cancel()
+        feed.finish()
+        try await waitUntil { !model.isActive }
+    }
+}
