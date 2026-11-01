@@ -11,12 +11,21 @@ struct RecoverySheet: View {
     /// `rootName` names the recovery folder after a partition ("Photos (exFAT) (recovered …)");
     /// `reconstructedFiles` are offered behind an "Include reconstructed files" checkbox, off by
     /// default. Both are for Recover all files…; an ordinary selection passes neither.
+    /// `scanIncomplete` (a cancelled or failed scan) titles it "Recover all files found so far…"
+    /// and says the scan didn't finish.
     init(files: [RecoveredFile], source: SourceSession, rootName: String? = nil,
-         reconstructedFiles: [RecoveredFile] = [], onDone: @escaping () -> Void) {
+         reconstructedFiles: [RecoveredFile] = [], scanIncomplete: Bool = false, onDone: @escaping () -> Void) {
         self.onDone = onDone
-        _coordinator = State(initialValue: CompositionRoot.recoveryCoordinator(files: files, source: source, rootName: rootName,
-                                                                              reconstructedFiles: reconstructedFiles,
-                                                                              sourceLabel: rootName))
+        let coordinator = CompositionRoot.recoveryCoordinator(files: files, source: source, rootName: rootName,
+                                                              reconstructedFiles: reconstructedFiles, sourceLabel: rootName)
+        coordinator.scanIncomplete = scanIncomplete
+        _coordinator = State(initialValue: coordinator)
+    }
+
+    /// Recover all files… for one partition's plan.
+    init(plan: PartitionRecoveryPlan, source: SourceSession, onDone: @escaping () -> Void) {
+        self.init(files: plan.files, source: source, rootName: plan.name, reconstructedFiles: plan.reconstructed,
+                  scanIncomplete: plan.scanIncomplete, onDone: onDone)
     }
 
     var body: some View {
@@ -35,13 +44,18 @@ struct RecoverySheet: View {
 
     private var confirmation: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text(coordinator.sourceLabel.map { "Recover all files from \($0)" } ?? "Recover \(fileCount(coordinator.files.count))")
+            Text(coordinator.confirmationTitle)
                 .font(.title2.weight(.semibold))
                 .accessibilityAddTraits(.isHeader)
-            if coordinator.sourceLabel != nil {
-                Text(coordinator.files.isEmpty ? "No recoverable files were found in this partition."
-                                               : "\(fileCount(coordinator.files.count)), keeping their folders. Deleted files go in the same folders, with their own names.")
-                    .fixedSize(horizontal: false, vertical: true)
+            if let note = coordinator.contentsNote {
+                Text(note).fixedSize(horizontal: false, vertical: true)
+            }
+            if let note = coordinator.scanNote {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: "info.circle").accessibilityHidden(true)
+                    Text(note).fixedSize(horizontal: false, vertical: true)
+                }
+                .accessibilityElement(children: .combine)
             }
             if !coordinator.reconstructedFiles.isEmpty {
                 VStack(alignment: .leading, spacing: 2) {

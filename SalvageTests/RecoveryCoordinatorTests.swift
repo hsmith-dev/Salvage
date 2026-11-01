@@ -518,6 +518,10 @@ private final class SyncLog: @unchecked Sendable {
 
 /// A small FAT32/exFAT disk image created, attached (`-nobrowse`, at a private mount point) and
 /// detached by the test itself. Nothing outside its own temporary directory is touched.
+/// Real-image tests run unless `SALVAGE_SKIP_HDIUTIL` is set; with it unset they fail, never
+/// silently pass, when `hdiutil` can't make an image here.
+private let hdiutilSkipped = ProcessInfo.processInfo.environment["SALVAGE_SKIP_HDIUTIL"] != nil
+
 private final class ScratchDiskImage: @unchecked Sendable {
     static let hdiutil = "/usr/bin/hdiutil"
     static var isAvailable: Bool { FileManager.default.isExecutableFile(atPath: hdiutil) }
@@ -705,5 +709,142 @@ struct PartitionRecoveryCoordinatorTests {
             #expect(coordinator.phase == .ready)
             #expect(dir.allFiles().isEmpty)
         }
+    }
+
+    // MARK: Review fixes
+
+    /// FAT32 and exFAT report 0 for important-usage capacity; the fallback reads the real figure.
+    @Test(.enabled(if: !hdiutilSkipped), arguments: ["ExFAT", "MS-DOS FAT32"])
+    func freeSpaceOnRealFATVolumesIsKnownAndASmallSelectionDoesNotWarn(filesystem: String) async throws {
+        guard ScratchDiskImage.isAvailable, let image = ScratchDiskImage(filesystem: filesystem) else {
+            Issue.record("Couldn't create or attach a \(filesystem) image (set SALVAGE_SKIP_HDIUTIL=1 to skip).")
+            return
+        }
+        defer { image.detach() }
+        let free = try #require(RecoveryCoordinator.availableCapacity(at: image.mountPoint))
+        #expect(free > 0 && free <= 64 * 1024 * 1024, "\(filesystem) reported \(free) bytes free")
+        let coordinator = RecoveryCoordinator(files: [file("/a.txt", size: 1, content: .resident(Data("a".utf8)))],
+                                              content: FileContentReader(reader: MemoryReader(bytes: Data())), deviceName: "Drive",
+                                              destinationCheck: checked(.safe))
+        await coordinator.chooseDestination(image.mountPoint)
+        #expect(coordinator.destinationStatus == .safe)
+        #expect((coordinator.destinationFreeBytes ?? 0) > 0)
+        #expect(coordinator.spaceShortfall == nil && coordinator.spaceWarning == nil)
+    }
+
+    @Test func freeSpaceFallsBackFromAZeroImportantUsageFigure() {
+        // Important usage when it is positive.
+        #expect(RecoveryCoordinator.availableCapacity(importantUsage: 500, available: 900, statfs: { 700 }) == 500)
+        // exFAT / FAT32: important usage is 0, the available capacity is the answer.
+        #expect(RecoveryCoordinator.availableCapacity(importantUsage: 0, available: 900, statfs: { 700 }) == 900)
+        // Neither key: statfs.
+        #expect(RecoveryCoordinator.availableCapacity(importantUsage: 0, available: nil, statfs: { 700 }) == 700)
+        #expect(RecoveryCoordinator.availableCapacity(importantUsage: nil, available: 0, statfs: { 700 }) == 700)
+        // Unknown everywhere: nil, so no warning.
+        #expect(RecoveryCoordinator.availableCapacity(importantUsage: nil, available: nil, statfs: { nil }) == nil)
+        // Every source says 0: really full.
+        #expect(RecoveryCoordinator.availableCapacity(importantUsage: 0, available: 0, statfs: { nil }) == 0)
+    }
+
+    @Test func filesAreStoredOnceAndRebuiltOnlyWhenTheCheckboxChanges() async throws {
+        let base = (0..<200).map { file("/f\($0).txt", size: 1, content: .resident(Data("x".utf8))) }
+        let rebuilt = [file("/Reconstructed/jpeg-1.jpg", size: 1, content: .resident(Data("j".utf8)))]
+        let coordinator = RecoveryCoordinator(files: base, content: FileContentReader(reader: MemoryReader(bytes: Data())),
+                                              deviceName: "Drive", rootName: "P", reconstructedFiles: rebuilt,
+                                              destinationCheck: checked(.safe))
+        #expect(coordinator.filesBuildCount == 1)
+        for _ in 0..<1000 { _ = coordinator.files.count; _ = coordinator.totalBytes }  // as the sheet reads per progress update
+        #expect(coordinator.filesBuildCount == 1)
+        coordinator.setIncludeReconstructed(true)
+        #expect(coordinator.filesBuildCount == 2 && coordinator.files.count == 201 && coordinator.totalBytes == 201)
+        coordinator.setIncludeReconstructed(true)  // no change, no rebuild
+        #expect(coordinator.filesBuildCount == 2)
+        let dir = try TempDir()
+        await coordinator.chooseDestination(dir.url)
+        coordinator.start()
+        await coordinator.waitUntilFinished()
+        #expect(try #require(summary(coordinator)).written.count == 201)
+        #expect(coordinator.filesBuildCount == 2)
+    }
+
+    @Test func onlyReconstructedFilesStartTickedAndAreExplained() async throws {
+        let rebuilt = [file("/Reconstructed/Pictures/jpeg-1.jpg", size: 2, content: .resident(Data("jj".utf8)))]
+        let coordinator = RecoveryCoordinator(files: [], content: FileContentReader(reader: MemoryReader(bytes: Data())),
+                                              deviceName: "Drive", rootName: "Unpartitioned space", reconstructedFiles: rebuilt,
+                                              sourceLabel: "Unpartitioned space", destinationCheck: checked(.safe))
+        #expect(coordinator.includeReconstructed)
+        #expect(coordinator.files == rebuilt && coordinator.totalBytes == 2)
+        #expect(coordinator.contentsNote == RecoveryCoordinator.onlyReconstructedNote)
+        #expect(coordinator.contentsNote?.hasPrefix("This area only has reconstructed files") == true)
+        let dir = try TempDir()
+        await coordinator.chooseDestination(dir.url)
+        #expect(coordinator.canRecover)
+        coordinator.start()
+        await coordinator.waitUntilFinished()
+        let result = try #require(summary(coordinator))
+        #expect(result.written.count == 1)
+        #expect(try Data(contentsOf: result.root.appendingPathComponent("Reconstructed/Pictures/jpeg-1.jpg")) == Data("jj".utf8))
+
+        // With filesystem files too, reconstructed ones stay opt-in.
+        let mixed = RecoveryCoordinator(files: [file("/a.txt", size: 1, content: .resident(Data("a".utf8)))],
+                                        content: FileContentReader(reader: MemoryReader(bytes: Data())), deviceName: "Drive",
+                                        rootName: "P", reconstructedFiles: rebuilt, sourceLabel: "P", destinationCheck: checked(.safe))
+        #expect(!mixed.includeReconstructed && mixed.contentsNote?.hasPrefix("1 file, keeping") == true)
+        // Nothing at all says so.
+        let empty = RecoveryCoordinator(files: [], content: FileContentReader(reader: MemoryReader(bytes: Data())),
+                                        deviceName: "Drive", rootName: "P", sourceLabel: "P", destinationCheck: checked(.safe))
+        #expect(empty.contentsNote == "No recoverable files were found in this partition." && !empty.includeReconstructed)
+    }
+
+    @Test func anUnfinishedScanTitlesTheSheetFoundSoFarWithANote() {
+        let files = [file("/a.txt", size: 1, content: .resident(Data("a".utf8)))]
+        let coordinator = RecoveryCoordinator(files: files, content: FileContentReader(reader: MemoryReader(bytes: Data())),
+                                              deviceName: "Drive", rootName: "Photos (exFAT)", sourceLabel: "Photos (exFAT)",
+                                              destinationCheck: checked(.safe))
+        #expect(coordinator.confirmationTitle == "Recover all files from Photos (exFAT)")
+        #expect(coordinator.scanNote == nil)
+        coordinator.scanIncomplete = true
+        #expect(coordinator.confirmationTitle == "Recover all files found so far from Photos (exFAT)")
+        #expect(coordinator.scanNote == RecoveryCoordinator.incompleteScanNote)
+        #expect(coordinator.scanNote?.contains("didn't finish") == true)
+        // An ordinary selection is unchanged.
+        let plain = RecoveryCoordinator(files: files, content: FileContentReader(reader: MemoryReader(bytes: Data())),
+                                        deviceName: "Drive", destinationCheck: checked(.safe))
+        #expect(plain.confirmationTitle == "Recover 1 file" && plain.scanNote == nil && plain.contentsNote == nil)
+    }
+
+    @Test func longRootFolderNamesKeepTheirDateSuffixWhole() async throws {
+        let long = String(repeating: "P", count: 250) + ".jpg"  // 254 characters, with a fake extension
+        let name255 = String(repeating: "é", count: 120) + String(repeating: "x", count: 15)  // 255 UTF-8 bytes
+        #expect(name255.utf8.count == 255)
+        for label in [String(repeating: "a", count: 255), long, name255] {
+            let folder = RecoveryCoordinator.rootFolderName(partition: label, date: epoch)
+            #expect(folder.hasSuffix(" (recovered \(Self.stamp(epoch)))"), "\(folder)")
+            #expect(folder.utf8.count <= RecoveryPaths.maxComponentBytes)
+            #expect(folder.hasPrefix(String(label.prefix(10))))
+            // The engine keeps it as is: no ".suffix" is preserved at the expense of the date.
+            #expect(RecoveryPaths.sanitizeFolderName(folder) == folder)
+            let device = RecoveryCoordinator.rootFolderName(device: label, date: epoch)
+            #expect(device.hasPrefix("Salvage Recovery ") && device.hasSuffix(" \(Self.stamp(epoch))"))
+            #expect(device.utf8.count <= RecoveryPaths.maxComponentBytes)
+        }
+        let dir = try TempDir()
+        let label = String(repeating: "a", count: 255)
+        let coordinator = RecoveryCoordinator(files: [file("/a.txt", size: 1, content: .resident(Data("a".utf8)))],
+                                              content: FileContentReader(reader: MemoryReader(bytes: Data())), deviceName: "Drive",
+                                              rootName: label, now: { Date(timeIntervalSince1970: 0) }, destinationCheck: checked(.safe))
+        await coordinator.chooseDestination(dir.url)
+        coordinator.start()
+        await coordinator.waitUntilFinished()
+        let root = try #require(summary(coordinator)).root.lastPathComponent
+        #expect(root == RecoveryCoordinator.rootFolderName(partition: label, date: epoch))
+        #expect(root.hasSuffix(")") && root.contains("(recovered "))
+    }
+
+    private static func stamp(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd HH.mm.ss"
+        return formatter.string(from: date)
     }
 }

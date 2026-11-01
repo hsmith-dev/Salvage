@@ -61,6 +61,12 @@ enum RecoveryPaths {
     /// invisible (format / default-ignorable) characters -- working on Unicode scalars, so a dot
     /// followed by a combining mark can't hide from the check -- and maps an empty result to `_`.
     static func sanitize(_ component: String) -> String {
+        let name = clean(component)
+        return name == "_" ? name : truncate(name, keepingExtension: true)
+    }
+
+    /// `sanitize` without the length limit.
+    static func clean(_ component: String) -> String {
         var scalars: [Unicode.Scalar] = component.unicodeScalars.filter {
             $0 != "/" && $0 != ":" && $0.value >= 0x20 && $0.value != 0x7F
         }
@@ -69,7 +75,21 @@ enum RecoveryPaths {
         view.append(contentsOf: scalars)
         let name = String(view)
         if name.isEmpty || name == "." || name == ".." { return "_" }
-        return truncate(name, keepingExtension: true)
+        return name
+    }
+
+    /// Like `sanitize`, for a folder name: no part of it is an extension, so a long name is cut
+    /// at its end without trying to keep a ".suffix".
+    static func sanitizeFolderName(_ component: String) -> String {
+        let cleaned = clean(component)
+        return cleaned == "_" ? cleaned : truncate(cleaned, keepingExtension: false)
+    }
+
+    /// `name` cut (on a character boundary) to at most `bytes` UTF-8 bytes.
+    static func prefix(_ name: String, maxBytes bytes: Int) -> String {
+        var result = name
+        while result.utf8.count > bytes { result.removeLast() }
+        return result
     }
 
     private static func isInvisibleLeader(_ scalar: Unicode.Scalar) -> Bool {
@@ -158,7 +178,7 @@ struct RecoveryEngine: Sendable {
         }
 
         let rootFD: Int32, rootActual: String
-        switch Self.makeDirectory(in: destinationFD, named: RecoveryPaths.sanitize(rootName), reuseExisting: false) {
+        switch Self.makeDirectory(in: destinationFD, named: RecoveryPaths.sanitizeFolderName(rootName), reuseExisting: false) {
         case .success(let made): (rootFD, rootActual) = made
         case .failure(let error): return .failure(.destinationUnavailable(Self.describe(errno: error.code)))
         }
@@ -512,15 +532,23 @@ final class RecoveryCoordinator {
     static let blockedMessage = "This folder is on the drive you're recovering from. Choose a folder on a different drive."
 
     /// The files this run copies: the selection, plus the optional reconstructed files when
-    /// `includeReconstructed` is on.
-    var files: [RecoveredFile] { includeReconstructed ? baseFiles + reconstructedFiles : baseFiles }
-    var totalBytes: Int64 { includeReconstructed ? baseBytes + reconstructedBytes : baseBytes }
+    /// `includeReconstructed` is on. Stored, and rebuilt only when the checkbox changes, so the
+    /// sheet's per-progress reads don't copy the list.
+    private(set) var files: [RecoveredFile] = []
+    private(set) var totalBytes: Int64 = 0
+    /// How many times `files` was built (tests: it isn't rebuilt per read).
+    @ObservationIgnored private(set) var filesBuildCount = 0
+    /// The selection without reconstructed files: live and deleted files of a partition.
+    let baseFiles: [RecoveredFile]
     /// Reconstructed files offered behind "Include reconstructed files (N)" (Recover all files…);
     /// empty for an ordinary recovery. They can be partial and have generated names, so they are
-    /// left out unless the user ticks the box.
+    /// left out unless the user ticks the box, or unless they are all there is.
     let reconstructedFiles: [RecoveredFile]
-    /// Off by default; changed with `setIncludeReconstructed(_:)`, only before a run starts.
+    /// Off by default (on when there are only reconstructed files); changed with
+    /// `setIncludeReconstructed(_:)`, only before a run starts.
     private(set) var includeReconstructed = false
+    /// The scan these files come from was cancelled or failed: they are what it found so far.
+    var scanIncomplete = false
     /// What the files are recovered from, e.g. "Photos (exFAT)", for the summary sentence; nil
     /// for an ordinary selection.
     let sourceLabel: String?
@@ -532,7 +560,6 @@ final class RecoveryCoordinator {
     private(set) var destinationStatus: DestinationStatus = .none
     private(set) var progress = RecoveryProgress(filesFinished: 0, bytesDone: 0, currentName: nil)
 
-    private let baseFiles: [RecoveredFile]
     private let baseBytes: Int64
     private let reconstructedBytes: Int64
     private let engine: RecoveryEngine
@@ -565,6 +592,15 @@ final class RecoveryCoordinator {
         self.deviceName = deviceName
         self.now = now
         self.destinationCheck = destinationCheck
+        // Only reconstructed files (a carved-only area): copying them is the point, so they start ticked.
+        includeReconstructed = files.isEmpty && !reconstructedFiles.isEmpty
+        rebuildFiles()
+    }
+
+    private func rebuildFiles() {
+        files = includeReconstructed ? baseFiles + reconstructedFiles : baseFiles
+        totalBytes = includeReconstructed ? baseBytes + reconstructedBytes : baseBytes
+        filesBuildCount += 1
     }
 
     convenience init(files: [RecoveredFile], source: SourceSession, rootName: String? = nil,
@@ -578,9 +614,36 @@ final class RecoveryCoordinator {
     /// Ticks or unticks "Include reconstructed files (N)". Ignored once a run has started, or
     /// when there are none to include.
     func setIncludeReconstructed(_ on: Bool) {
-        guard isConfirming, !reconstructedFiles.isEmpty else { return }
+        guard isConfirming, !reconstructedFiles.isEmpty, on != includeReconstructed else { return }
         includeReconstructed = on
+        rebuildFiles()
     }
+
+    // MARK: Sheet text (Recover all files…)
+
+    /// The confirmation's title: "Recover all files from Photos (exFAT)", "Recover all files found
+    /// so far from …" after an unfinished scan, or "Recover 3 files" for an ordinary selection.
+    var confirmationTitle: String {
+        guard let sourceLabel else { return files.count == 1 ? "Recover 1 file" : "Recover \(files.count) files" }
+        return scanIncomplete ? "Recover all files found so far from \(sourceLabel)" : "Recover all files from \(sourceLabel)"
+    }
+
+    /// What the partition holds, under the title; nil for an ordinary selection.
+    var contentsNote: String? {
+        guard sourceLabel != nil else { return nil }
+        if baseFiles.isEmpty, !reconstructedFiles.isEmpty {
+            return Self.onlyReconstructedNote
+        }
+        if baseFiles.isEmpty { return "No recoverable files were found in this partition." }
+        let count = baseFiles.count == 1 ? "1 file" : "\(baseFiles.count) files"
+        return "\(count), keeping their folders. Deleted files go in the same folders, with their own names."
+    }
+
+    nonisolated static let onlyReconstructedNote = "This area only has reconstructed files: Salvage rebuilt them from raw bytes because no folder records survived, so they have generated names and some may be incomplete. They are included below."
+    nonisolated static let incompleteScanNote = "The scan didn't finish, so these are only the files it found before it stopped. Scanning again to the end may find more."
+
+    /// Shown when the scan was cancelled or failed; nil otherwise.
+    var scanNote: String? { scanIncomplete && sourceLabel != nil ? Self.incompleteScanNote : nil }
 
     /// How many bytes the selection exceeds the destination's free space by, or nil when it fits
     /// or the free space is unknown. Recovery may still go ahead: files that don't fit are
@@ -602,10 +665,33 @@ final class RecoveryCoordinator {
         return "These files need \(need), but the destination has only \(have) free. Recovery will stop copying files once it is full. You can continue anyway, or cancel and choose another folder."
     }
 
-    /// The destination volume's free space for important use, or nil when it can't be read.
+    /// The destination volume's free space, or nil when it can't be read. The important-usage
+    /// figure is preferred, but FAT32 and exFAT report it as 0, so a non-positive value falls back
+    /// to the plain available capacity, then to `statfs` (`f_bavail × f_bsize`).
     nonisolated static func availableCapacity(at url: URL) -> Int64? {
-        let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-        return values?.volumeAvailableCapacityForImportantUsage
+        let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey])
+        return availableCapacity(importantUsage: values?.volumeAvailableCapacityForImportantUsage,
+                                 available: values?.volumeAvailableCapacity.map(Int64.init),
+                                 statfs: { statfsAvailable(at: url) })
+    }
+
+    /// The fallback order of `availableCapacity(at:)`: important usage when > 0, else the
+    /// available capacity, else `statfs`; nil (unknown, no warning) when none answers.
+    nonisolated static func availableCapacity(importantUsage: Int64?, available: Int64?,
+                                              statfs: () -> Int64?) -> Int64? {
+        if let importantUsage, importantUsage > 0 { return importantUsage }
+        if let available, available > 0 { return available }
+        if let fromStatfs = statfs() { return fromStatfs }
+        // Every source answered 0 (a really full volume) rather than not at all.
+        if importantUsage != nil || available != nil { return 0 }
+        return nil
+    }
+
+    nonisolated static func statfsAvailable(at url: URL) -> Int64? {
+        var info = statfs()
+        guard statfs(url.resolvingSymlinksInPath().path, &info) == 0 else { return nil }
+        let (bytes, overflow) = Int64(clamping: info.f_bavail).multipliedReportingOverflow(by: Int64(info.f_bsize))
+        return overflow ? Int64.max : bytes
     }
 
     /// Whether the confirmation is showing: before a run, or after one failed to start (the user
@@ -684,7 +770,17 @@ final class RecoveryCoordinator {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd HH.mm.ss"
         let label = device.trimmingCharacters(in: .whitespacesAndNewlines)
-        return "Salvage Recovery \(label.isEmpty ? "Drive" : label) \(formatter.string(from: date))"
+        let suffix = " \(formatter.string(from: date))"
+        return "Salvage Recovery " + fit(label.isEmpty ? "Drive" : label, before: "Salvage Recovery " + suffix) + suffix
+    }
+
+    /// `label` sanitized and cut so it and `rest` fit one folder name: the date suffix is never
+    /// lost to truncation, and is never mistaken for a file extension.
+    nonisolated private static func fit(_ label: String, before rest: String) -> String {
+        let cleaned = RecoveryPaths.clean(label)
+        let budget = RecoveryPaths.maxComponentBytes - rest.utf8.count
+        let cut = RecoveryPaths.prefix(cleaned, maxBytes: max(1, budget)).trimmingCharacters(in: .whitespaces)
+        return cut.isEmpty ? "_" : cut
     }
 
     /// "Photos (exFAT) (recovered 2026-10-31 14.02.11)": the folder for Recover all files….
@@ -693,6 +789,7 @@ final class RecoveryCoordinator {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd HH.mm.ss"
         let label = partition.trimmingCharacters(in: .whitespacesAndNewlines)
-        return "\(label.isEmpty ? "Partition" : label) (recovered \(formatter.string(from: date)))"
+        let suffix = " (recovered \(formatter.string(from: date)))"
+        return fit(label.isEmpty ? "Partition" : label, before: suffix) + suffix
     }
 }

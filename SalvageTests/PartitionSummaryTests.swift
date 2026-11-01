@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import SalvageCore
 import SalvageDiskIO
@@ -66,7 +67,8 @@ struct PartitionSummaryTests {
         #expect(photos.title == "Photos (exFAT), \(ByteCountFormatter.string(fromByteCount: 63_790_000_000, countStyle: .file))")
         // live + deleted + carved; the unmapped file and the hidden system file aren't counted.
         #expect(photos.recoverableCount == 3 && photos.deletedCount == 1 && photos.reconstructedCount == 1)
-        #expect(photos.countsText == "3 files, of which 1 deleted and 1 reconstructed")
+        // What a default run copies, then what the checkbox adds.
+        #expect(photos.countsText == "2 files, of which 1 deleted (+1 reconstructed)")
 
         let lost = rows[2]
         #expect(lost.name == "Lost partition — FAT32" && lost.sizeBytes == 1_000_000_000)
@@ -97,7 +99,8 @@ struct PartitionSummaryTests {
         let apfs = [DevicePartition(bsdName: "disk0s2", displayName: "APFS container", sizeBytes: 500, formatName: "APFS",
                                     children: [DevicePartition(bsdName: "disk3s1", displayName: "Data", sizeBytes: nil, formatName: "APFS")],
                                     offsetBytes: 1_048_576)]
-        #expect(PartitionGrouping.name(forVolumeAt: 1_048_576, formatName: "APFS", partitions: apfs).name == "APFS container (APFS)")
+        // Its display name already starts with its format: not "APFS container (APFS)".
+        #expect(PartitionGrouping.name(forVolumeAt: 1_048_576, formatName: "APFS", partitions: apfs).name == "APFS container")
         // No match (unknown offsets, or a different one): format name and offset.
         let fallback = PartitionGrouping.name(forVolumeAt: 5_000_000, formatName: "NTFS", partitions: tree)
         #expect(fallback.name == "NTFS volume at \(ByteCountFormatter.string(fromByteCount: 5_000_000, countStyle: .file))")
@@ -163,10 +166,12 @@ struct PartitionSummaryTests {
 
         // No finished scan: nothing offered.
         #expect(model.recoverAllTarget(for: tree[1]) == nil)
-        // A finished scan of disk6 offers its partitions only; a container volume resolves to its container.
+        // A finished scan of disk6 offers its partitions only; a container's volume is its own
+        // target (its files carry its name and UUID), the container itself too.
         model.finishedScanDevice = stick
         #expect(model.recoverAllTarget(for: tree[1]) == tree[1])
-        #expect(model.recoverAllTarget(for: container.children[0]) == container)
+        #expect(model.recoverAllTarget(for: container.children[0]) == container.children[0])
+        #expect(model.recoverAllTarget(for: container) == container)
         #expect(model.recoverAllTarget(for: other.partitions[0]) == nil)
         // The same name re-attached as a different drive doesn't qualify.
         model.finishedScanDevice = BlockDevice(bsdName: "disk6", displayName: "SanDisk", sizeBytes: 1, isInternal: false,
@@ -192,12 +197,211 @@ struct PartitionSummaryTests {
         #expect(scan.deviceWithFinishedResults == device)
     }
 
+    // MARK: APFS volumes sharing a container
+
+    @Test func apfsVolumesSharingAContainerAreSeparateGroupsThatRecoverOnlyTheirOwnFiles() async throws {
+        let mine = apfs("/Documents/report.txt", volume: "Personal", id: personalID, record: 10_000, data: "mine")
+        let mineGone = apfs("/Documents/old.txt", volume: "Personal", id: personalID, record: 11_000, data: "old", deleted: true)
+        let theirs = apfs("/Documents/report.txt", volume: "Work", id: workID, record: 20_000, data: "theirs")
+        let rebuilt = carved("jpeg-9.jpg", extent: containerOffset, start: containerOffset + 50_000)
+        let model = ResultsViewModel(files: [mine, theirs, mineGone, rebuilt])
+        let cache = PartitionSectionCache()
+        let rows = model.partitionSummaries(devicePartitions: apfsTree, cache: cache)
+        #expect(rows.map(\.key) == [.volume(containerOffset, volumeID: personalID), .volume(containerOffset, volumeID: workID),
+                                    .volume(containerOffset)])
+        #expect(rows.map(\.name) == ["Personal (APFS)", "Work (APFS)", "APFS container"])
+        #expect(rows.map(\.recoverableCount) == [2, 1, 1] && rows[0].deletedCount == 1)
+        #expect(!rows.contains { $0.name.contains("(APFS) (APFS)") || $0.name.hasSuffix("container (APFS)") })
+
+        let personal = model.recoverAllPlan(for: rows[0], devicePartitions: apfsTree, cache: cache)
+        let work = model.recoverAllPlan(for: rows[1], devicePartitions: apfsTree, cache: cache)
+        #expect(personal.name == "Personal (APFS)" && personal.files.map(\.id) == [mine.id, mineGone.id] && personal.reconstructed.isEmpty)
+        #expect(work.name == "Work (APFS)" && work.files.map(\.id) == [theirs.id])
+
+        // The sidebar: a volume recovers only itself; the container recovers all of it.
+        let container = apfsTree[0]
+        #expect(model.recoverAllPlan(for: container.children[0], devicePartitions: apfsTree, cache: cache) == personal)
+        #expect(model.recoverAllPlan(for: container.children[1], devicePartitions: apfsTree, cache: cache) == work)
+        let whole = model.recoverAllPlan(for: container, devicePartitions: apfsTree, cache: cache)
+        #expect(whole.name == "APFS container" && Set(whole.files.map(\.id)) == [mine.id, theirs.id, mineGone.id])
+        #expect(whole.reconstructed.map(\.id) == [rebuilt.id])
+        // Two volumes of one name are ambiguous: the container, never a guess.
+        let twins = [DevicePartition(bsdName: "disk6s2", displayName: "APFS container", sizeBytes: 500_000_000, formatName: "APFS",
+                                     children: [DevicePartition(bsdName: "disk7s1", displayName: "Personal", sizeBytes: nil, formatName: "APFS"),
+                                                DevicePartition(bsdName: "disk7s2", displayName: "Work", sizeBytes: nil, formatName: "APFS")],
+                                     offsetBytes: containerOffset)]
+        let twinModel = ResultsViewModel(files: [mine, apfs("/x.txt", volume: "Personal", id: workID, record: 30_000, data: "x")])
+        let fallback = twinModel.recoverAllPlan(for: twins[0].children[0], devicePartitions: twins, cache: PartitionSectionCache())
+        #expect(fallback.name == "APFS container" && fallback.files.count == 2)
+
+        // Each volume's recovery has its own folder tree: the shared path never becomes "report (2).txt".
+        let destination = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: destination) }
+        for plan in [personal, work] {
+            let coordinator = RecoveryCoordinator(files: plan.files, content: FileContentReader(reader: EmptyReader()), deviceName: "Mac",
+                                                  rootName: plan.name, reconstructedFiles: plan.reconstructed, sourceLabel: plan.name,
+                                                  destinationCheck: safeCheck)
+            await coordinator.chooseDestination(destination)
+            coordinator.start()
+            await coordinator.waitUntilFinished()
+            guard case .finished(let summary) = coordinator.phase else { Issue.record("recovery didn't finish"); return }
+            #expect(summary.failed.isEmpty && summary.written.count == plan.files.count)
+            #expect(!regularFiles(under: summary.root).contains { $0.contains(" (2)") })
+            let expected = plan.name == "Work (APFS)" ? "theirs" : "mine"
+            #expect(try String(contentsOf: summary.root.appendingPathComponent("Documents/report.txt"), encoding: .utf8) == expected)
+        }
+    }
+
+    // MARK: Carved-only areas
+
+    @Test func aCarvedOnlyAreaRecoversItsReconstructedFilesByDefaultAndSaysSo() async throws {
+        let bytes = Data((0..<16_384).map { UInt8(truncatingIfNeeded: $0 &* 7) })
+        let first = carved("jpeg-1.jpg", extent: 0, start: 4096), second = carved("png-1.png", extent: 0, start: 8192, size: 300)
+        let model = ResultsViewModel(files: [first, second])
+        let cache = PartitionSectionCache()
+        let area = try #require(model.partitionSummaries(devicePartitions: [], cache: cache).first)
+        #expect(area.key == .unpartitioned && area.canRecoverAll)
+        // The count is what a default run copies.
+        #expect(area.countsText == "2 reconstructed files")
+        let plan = model.recoverAllPlan(for: area, devicePartitions: [], cache: cache)
+        #expect(plan.files.isEmpty && plan.reconstructed.map(\.id) == [first.id, second.id])
+
+        let destination = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: destination) }
+        let coordinator = RecoveryCoordinator(files: plan.files, content: FileContentReader(reader: DataReader(bytes: bytes)),
+                                              deviceName: "Drive", rootName: plan.name, reconstructedFiles: plan.reconstructed,
+                                              sourceLabel: plan.name, destinationCheck: safeCheck)
+        #expect(coordinator.includeReconstructed && coordinator.files.count == 2 && coordinator.totalBytes == 400)
+        #expect(coordinator.contentsNote?.hasPrefix("This area only has reconstructed files") == true)
+        await coordinator.chooseDestination(destination)
+        #expect(coordinator.canRecover)
+        coordinator.start()
+        await coordinator.waitUntilFinished()
+        guard case .finished(let summary) = coordinator.phase else { Issue.record("recovery didn't finish"); return }
+        #expect(summary.written.count == 2 && summary.failed.isEmpty)
+        #expect(try Data(contentsOf: summary.root.appendingPathComponent("Reconstructed/Pictures/png-1.png")) == bytes.subdata(in: 8192..<8492))
+    }
+
+    @Test func countsTextMatchesWhatADefaultRunCopies() {
+        var summary = PartitionSummary(key: .volume(0), kind: .mapped, name: "X", sizeBytes: nil)
+        summary.recoverableCount = 12; summary.deletedCount = 3; summary.reconstructedCount = 2
+        #expect(summary.countsText == "10 files, of which 3 deleted (+2 reconstructed)")
+        summary.reconstructedCount = 0
+        #expect(summary.countsText == "12 files, of which 3 deleted")
+        summary.recoverableCount = 1; summary.deletedCount = 0; summary.reconstructedCount = 1
+        #expect(summary.countsText == "1 reconstructed file")
+    }
+
+    // MARK: Unknown offsets and skipped volumes
+
+    @Test func aPartitionWithAnUnknownOffsetIsMatchedByFormatAndSize() {
+        let f = Fixture()
+        let unplaced = [DevicePartition(bsdName: "disk6s1", displayName: "EFI", sizeBytes: 209_715_200, formatName: "EFI"),
+                        DevicePartition(bsdName: "disk6s2", displayName: "Photos", sizeBytes: 63_790_000_000, formatName: "exFAT"),
+                        DevicePartition(bsdName: "disk6s3", displayName: "Backup", sizeBytes: 4_000_000_000, formatName: "exFAT")]
+        let other = found("/b/x.bin", volume: 80_000_000_000)
+        let context = PartitionScanContext(extents: [.init(offset: photosOffset, length: 63_790_000_000),
+                                                     .init(offset: 80_000_000_000, length: 4_000_000_000)])
+        let model = ResultsViewModel(files: [f.live, f.deleted, other])
+        let cache = PartitionSectionCache()
+        let rows = model.partitionSummaries(devicePartitions: unplaced, context: context, cache: cache)
+        #expect(rows.map(\.name) == ["Photos (exFAT)", "Backup (exFAT)"])
+        let photos = model.recoverAllPlan(for: unplaced[1], devicePartitions: unplaced, context: context, cache: cache)
+        #expect(photos.name == "Photos (exFAT)" && photos.files.map(\.id) == [f.live.id, f.deleted.id])
+        let backup = model.recoverAllPlan(for: unplaced[2], devicePartitions: unplaced, context: context, cache: cache)
+        #expect(backup.files.map(\.id) == [other.id])
+        #expect(model.recoverAllPlan(for: unplaced[0], devicePartitions: unplaced, context: context, cache: cache).files.isEmpty)
+
+        // Without the scan's extents (sizes unknown), the only exFAT partition is still its match...
+        let single = [unplaced[1]]
+        let lone = ResultsViewModel(files: [f.live, f.deleted])
+        #expect(lone.recoverAllPlan(for: single[0], devicePartitions: single, cache: PartitionSectionCache()).files.count == 2)
+        // ...but two exFAT partitions of unknown size and offset are ambiguous: nothing is guessed.
+        let ambiguous = model.recoverAllPlan(for: unplaced[1], devicePartitions: unplaced, cache: PartitionSectionCache())
+        #expect(ambiguous.files.isEmpty && ambiguous.name == "Photos (exFAT)")
+    }
+
+    @Test func carvesFromASkippedVolumeBelongToIt() {
+        let skippedOffset: Int64 = 5_242_880
+        let fromSweep = carved("jpeg-5.jpg", extent: skippedOffset, start: skippedOffset + 4096)
+        let fromRawSweep = carved("jpeg-6.jpg", extent: 0, start: skippedOffset + 8192)
+        let outside = carved("jpeg-7.jpg", extent: 0, start: 512)
+        let rows = [fromSweep, fromRawSweep, outside].map(ResultsViewModel.Row.init)
+        // Without the scan's notices, the skipped volume is unknown: its carves look unpartitioned.
+        #expect(PartitionGrouping.keys(for: rows, partitions: [], lostPartitions: []) == [.unpartitioned, .unpartitioned, .unpartitioned])
+        let context = PartitionScanContext(
+            notices: [.volumeSkipped(formatName: "NTFS", offset: skippedOffset, reason: "damaged"), .carvingLimitReached(count: 9)],
+            extents: [.init(offset: 0, length: 1_048_576), .init(offset: skippedOffset, length: 1_000_000)], isIncomplete: false)
+        let keys = PartitionGrouping.keys(for: rows, partitions: [], lostPartitions: [], context: context)
+        // The whole-device extent at 0 is not a volume, so its carve outside the skipped one stays unpartitioned.
+        #expect(keys == [.volume(skippedOffset), .volume(skippedOffset), .unpartitioned])
+        let summaries = PartitionGrouping.summaries(rows: rows, keys: keys, partitions: [], lostPartitions: [],
+                                                    includingSystemFiles: false, context: context)
+        #expect(summaries.first?.name == "NTFS volume at \(ByteCountFormatter.string(fromByteCount: skippedOffset, countStyle: .file))")
+        #expect(summaries.first?.sizeBytes == 1_000_000 && summaries.first?.reconstructedCount == 2)
+        #expect(summaries.first?.countsText == "2 reconstructed files")
+    }
+
+    @Test func theScanContextComesFromItsNoticesCheckpointAndEnd() async throws {
+        let device = BlockDevice(bsdName: "disk6", displayName: "SanDisk", sizeBytes: 4096, isInternal: false,
+                                 isBootVolume: false, mediaIdentity: 6, partitions: tree)
+        let checkpoint = ScanCheckpoint(deviceSizeBytes: 4096, totalBytes: 4096, extents: [.init(offset: 1024, length: 2048)],
+                                        sweepVolumeIndex: 0, sweepOffset: 0, bytesScanned: 0)
+        let scan = ScanViewModel(runner: { run, events in
+            run.notices.yield(.volumeSkipped(formatName: "exFAT", offset: 1024, reason: "damaged"))
+            run.checkpoints.yield(checkpoint)
+            events.yield(.found(carved("jpeg-1.jpg", extent: 1024, start: 2048)))
+            events.yield(.error(.io("unplugged")))
+            await run.keepSource(SourceSession(device: run.device, reader: EmptyReader(), close: {}))
+        })
+        scan.start(device)
+        for _ in 0..<300 where scan.isActive || scan.source == nil { try await Task.sleep(for: .milliseconds(10)) }
+        guard case .failed = scan.state else { Issue.record("expected a failed scan, got \(scan.state)"); return }
+        let context = scan.partitionScanContext
+        #expect(context.isIncomplete)
+        #expect(context.skippedVolumes == [.init(offset: 1024, formatName: "exFAT")])
+        #expect(context.extents == [.init(offset: 1024, length: 2048)])
+    }
+
+    // MARK: Naming at the drive's first byte, unfinished scans
+
+    @Test func aWholeDriveFilesystemIsNamedAsSuch() {
+        #expect(PartitionGrouping.name(forVolumeAt: 0, formatName: "exFAT", partitions: []).name == "exFAT volume (whole drive)")
+        let model = ResultsViewModel(files: [found("/a.txt", volume: 0)])
+        #expect(model.partitionSummaries(devicePartitions: [], cache: PartitionSectionCache()).map(\.name) == ["exFAT volume (whole drive)"])
+    }
+
+    @Test func anUnfinishedScanOffersTheFilesFoundSoFar() {
+        let f = Fixture()
+        let model = ResultsViewModel(files: f.files, lostPartitions: [f.lost])
+        let done = model.partitionSummaries(devicePartitions: tree, cache: PartitionSectionCache())
+        #expect(done.allSatisfy { $0.recoverAllTitle == "Recover all files…" && !$0.isScanIncomplete })
+        let cache = PartitionSectionCache()
+        let cut = model.partitionSummaries(devicePartitions: tree, context: PartitionScanContext(isIncomplete: true), cache: cache)
+        #expect(cut.allSatisfy { $0.recoverAllTitle == "Recover all files found so far…" })
+        #expect(cut[1].recoverAllAccessibilityLabel == "Recover all files found so far from Photos (exFAT)")
+        let plan = model.recoverAllPlan(for: cut[1], devicePartitions: tree, context: PartitionScanContext(isIncomplete: true), cache: cache)
+        #expect(plan.scanIncomplete)
+        let sidebar = model.recoverAllPlan(for: tree[1], devicePartitions: tree, context: PartitionScanContext(isIncomplete: true), cache: cache)
+        #expect(sidebar.scanIncomplete && sidebar.files.count == 2)
+    }
+
     // MARK: End to end on a real exFAT image
 
-    @Test(.enabled(if: ExFATImage.isAvailable))
+    /// Real-image runs fail rather than silently pass when they can't run, unless
+    /// SALVAGE_SKIP_HDIUTIL is set; with SALVAGE_REQUIRE_HDIUTIL=1 (CI) even that is an issue.
+    @Test func realImageTestReportsWhyItIsSkipped() {
+        guard let reason = ExFATImage.skipReason else { return }
+        print("Partition E2E real-image test skipped: \(reason)")
+        if ProcessInfo.processInfo.environment["SALVAGE_REQUIRE_HDIUTIL"] == "1" {
+            Issue.record("SALVAGE_REQUIRE_HDIUTIL=1 but the partition E2E real-image test can't run: \(reason)")
+        }
+    }
+
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["SALVAGE_SKIP_HDIUTIL"] == nil))
     func endToEndRecoversAWholeRealExFATPartitionByteForByte() async throws {
-        guard let image = ExFATImage() else {
-            print("Skipping: couldn't create or attach an exFAT disk image here.")
+        guard ExFATImage.hdiutilExists, let image = ExFATImage() else {
+            Issue.record("Couldn't create or attach an exFAT disk image here (set SALVAGE_SKIP_HDIUTIL=1 to skip).")
             return
         }
         defer { image.destroy() }
@@ -213,10 +417,11 @@ struct PartitionSummaryTests {
         ]
         let doomed: [String: Data] = ["Documents/Taxes/old-return.pdf": random(40_000)]
         try image.populate(live: live, deleted: doomed)
-        let bytes = try Data(contentsOf: image.imageURL)
+        let digestBefore = try sha256(of: image.imageURL)
 
-        // Scan the image file (never a device node), exactly as the app scans a drive.
-        let reader = DataReader(bytes: bytes)
+        // Scan the image file itself (never a device node) through a read-only file descriptor,
+        // exactly as the app scans a drive through its reader.
+        let reader = try FileReader(url: image.imageURL)
         let (stream, continuation) = AsyncStream<ScanEvent>.makeStream()
         await ScanSession(reader: reader).run(events: continuation)
         var files: [RecoveredFile] = [], lost: [LostPartitionCandidate] = [], completed = false
@@ -242,17 +447,33 @@ struct PartitionSummaryTests {
         #expect(photos.deletedCount == 1)
         let plan = model.recoverAllPlan(for: photos, devicePartitions: [partition], cache: cache)
 
-        let destination = FileManager.default.temporaryDirectory.appendingPathComponent("SalvageE2E-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        // The real destination check: the image, attached read-only and unmounted, is the source drive.
+        let sourceDisk = try #require(image.attachReadOnly(), "couldn't attach the image read-only")
+        let source = BlockDevice(bsdName: sourceDisk, displayName: "Disk Image", sizeBytes: reader.sizeBytes,
+                                 isInternal: false, isBootVolume: false)
+        let destination = try temporaryFolder()
         defer { try? FileManager.default.removeItem(at: destination) }
+        #expect(DestinationSafety.live.check(destination: destination, source: source) == .safe)
+        // And it blocks a destination on the drive being recovered (here, the temp folder's own drive).
+        if let mounted = mountSourceName(ofPath: destination.resolvingSymlinksInPath().path), let whole = wholeDisk(of: mounted) {
+            let host = BlockDevice(bsdName: whole, displayName: "Host", sizeBytes: 1, isInternal: true, isBootVolume: false)
+            let blocked = RecoveryCoordinator(files: plan.files, content: FileContentReader(reader: reader), deviceName: "Host",
+                                              rootName: plan.name, sourceLabel: plan.name,
+                                              destinationCheck: { DestinationSafety.live.assess(destination: $0, source: host) })
+            await blocked.chooseDestination(destination)
+            #expect(blocked.destinationStatus == .blocked && !blocked.canRecover)
+        }
+
         let coordinator = RecoveryCoordinator(
             files: plan.files, content: FileContentReader(reader: reader), deviceName: "Disk Image", rootName: plan.name,
             reconstructedFiles: plan.reconstructed, sourceLabel: plan.name, now: { Date(timeIntervalSince1970: 0) },
-            destinationCheck: { url in DestinationAssessment(verdict: .safe, mountSource: mountSourceName(ofPath: url.resolvingSymlinksInPath().path)) })
+            destinationCheck: { DestinationSafety.live.assess(destination: $0, source: source) })
         await coordinator.chooseDestination(destination)
+        #expect(coordinator.destinationStatus == .safe)
         coordinator.start()
         await coordinator.waitUntilFinished()
-        guard case .finished(let summary) = coordinator.phase else { Issue.record("recovery didn't finish"); return }
+        image.detach()
+        guard case .finished(let summary) = coordinator.phase else { Issue.record("recovery didn't finish: \(coordinator.phase)"); return }
         #expect(summary.failed.isEmpty, "\(summary.failed.map(\.reason))")
         #expect(summary.root.lastPathComponent == RecoveryCoordinator.rootFolderName(partition: "Photos (exFAT)", date: Date(timeIntervalSince1970: 0)))
         #expect(RecoverySummaryView.headline(summary, sourceName: coordinator.sourceLabel)
@@ -266,11 +487,84 @@ struct PartitionSummaryTests {
         for (path, data) in expected {
             #expect(try Data(contentsOf: summary.root.appendingPathComponent(path)) == data, "\(path) differs")
         }
-        #expect(bytes == (try Data(contentsOf: image.imageURL)), "the source image changed")
+        #expect(try sha256(of: image.imageURL) == digestBefore, "the source image changed")
     }
 }
 
 // MARK: - Helpers
+
+private let containerOffset: Int64 = 1_048_576
+private let personalID = "11111111-2222-3333-4444-555555555555"
+private let workID = "66666666-7777-8888-9999-AAAAAAAAAAAA"
+private let apfsTree = [
+    DevicePartition(bsdName: "disk6s2", displayName: "APFS container", sizeBytes: 500_000_000, formatName: "APFS",
+                    children: [DevicePartition(bsdName: "disk7s1", displayName: "Personal", sizeBytes: nil, formatName: "APFS"),
+                               DevicePartition(bsdName: "disk7s2", displayName: "Work", sizeBytes: nil, formatName: "APFS")],
+                    offsetBytes: containerOffset),
+]
+
+/// A file of one volume inside the synthetic two-volume APFS container, as `APFSContainer` emits it.
+private func apfs(_ path: String, volume: String, id: String, record: Int64, data: String, deleted: Bool = false) -> RecoveredFile {
+    RecoveredFile(name: (path as NSString).lastPathComponent, path: path, sizeBytes: Int64(data.utf8.count), isDeleted: deleted,
+                  sourceMetadata: SourceMetadata(filesystem: .apfs, volumeOffset: containerOffset, recordOffset: containerOffset + record,
+                                                 allocationStart: 18, contiguous: true, rawRecord: Data(),
+                                                 volumeName: volume, volumeID: id),
+                  content: .resident(Data(data.utf8)))
+}
+
+private let safeCheck: @Sendable (URL) -> DestinationAssessment = { url in
+    DestinationAssessment(verdict: .safe, mountSource: mountSourceName(ofPath: url.resolvingSymlinksInPath().path))
+}
+
+private func temporaryFolder() throws -> URL {
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent("SalvagePartition-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    return url
+}
+
+/// "disk3" from "/dev/disk3s5".
+private func wholeDisk(of mountSource: String) -> String? {
+    guard let range = mountSource.range(of: #"disk[0-9]+"#, options: .regularExpression) else { return nil }
+    return String(mountSource[range])
+}
+
+private func sha256(of url: URL) throws -> String {
+    let handle = try FileHandle(forReadingFrom: url)
+    defer { try? handle.close() }
+    var hasher = SHA256()
+    while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty { hasher.update(data: chunk) }
+    return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+}
+
+/// Reads an image file through a read-only descriptor with `pread`, like a drive's reader.
+private final class FileReader: BlockReader, @unchecked Sendable {
+    private let fd: Int32
+    let sizeBytes: Int64
+    init(url: URL) throws {
+        fd = open(url.path, O_RDONLY | O_CLOEXEC)
+        guard fd >= 0 else { throw ScanError.io("open failed") }
+        var info = stat()
+        guard fstat(fd, &info) == 0 else { close(fd); throw ScanError.io("fstat failed") }
+        sizeBytes = Int64(info.st_size)
+    }
+    deinit { close(fd) }
+    func read(at offset: Int64, count: Int) async throws -> Data {
+        guard offset >= 0, count >= 0, offset + Int64(count) <= sizeBytes else { throw ScanError.io("out of range") }
+        var data = Data(count: count)
+        let got = data.withUnsafeMutableBytes { raw -> Int in
+            var done = 0
+            while done < count {
+                let n = pread(fd, raw.baseAddress! + done, count - done, off_t(offset) + off_t(done))
+                if n < 0 { if errno == EINTR { continue }; return -1 }
+                if n == 0 { break }
+                done += n
+            }
+            return done
+        }
+        guard got == count else { throw ScanError.io("short read") }
+        return data
+    }
+}
 
 private struct EmptyReader: BlockReader {
     var sizeBytes: Int64 { 0 }
@@ -319,8 +613,11 @@ private func regularFiles(under url: URL) -> [String] {
 /// directory. The scan then reads the image file, never a device node.
 private final class ExFATImage: @unchecked Sendable {
     static let hdiutil = "/usr/bin/hdiutil"
-    static var isAvailable: Bool {
-        FileManager.default.isExecutableFile(atPath: hdiutil) && ProcessInfo.processInfo.environment["SALVAGE_SKIP_HDIUTIL"] == nil
+    static var hdiutilExists: Bool { FileManager.default.isExecutableFile(atPath: hdiutil) }
+    /// Why the real-image test can't run here, or nil when it can.
+    static var skipReason: String? {
+        if ProcessInfo.processInfo.environment["SALVAGE_SKIP_HDIUTIL"] != nil { return "SALVAGE_SKIP_HDIUTIL is set" }
+        return hdiutilExists ? nil : "\(hdiutil) is not executable"
     }
     /// hdiutil's GPTSPUD layout puts its single partition at 1 MiB.
     static let partitionOffset: Int64 = 1_048_576
@@ -360,9 +657,22 @@ private final class ExFATImage: @unchecked Sendable {
         detach()
     }
 
+    /// Attaches the image again, read-only and unmounted, for the destination check's source
+    /// drive; returns its whole disk ("disk12"). `detach()` detaches it.
+    func attachReadOnly() -> String? {
+        detach()
+        let attach = Self.run(["attach", "-readonly", "-nomount", "-nobrowse", "-noautoopen", "-noverify", "-plist", imageURL.path])
+        guard attach.status == 0,
+              let plist = try? PropertyListSerialization.propertyList(from: attach.output, format: nil) as? [String: Any],
+              let entities = plist["system-entities"] as? [[String: Any]],
+              let whole = entities.compactMap({ $0["dev-entry"] as? String }).min(by: { $0.count < $1.count }) else { return nil }
+        wholeDisk = whole
+        return (whole as NSString).lastPathComponent
+    }
+
     func detach() {
         guard let whole = wholeDisk else { return }
-        if Self.run(["detach", mountPoint.path]).status != 0 { _ = Self.run(["detach", "-force", whole]) }
+        if Self.run(["detach", whole]).status != 0 { _ = Self.run(["detach", "-force", whole]) }
         wholeDisk = nil
     }
 

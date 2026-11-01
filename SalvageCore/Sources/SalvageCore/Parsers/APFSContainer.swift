@@ -707,7 +707,7 @@ actor APFSContainer {
         let extents = try await extents(for: inode, group: group, in: context)
         guard let content = try content(of: inode, extents: extents, deleted: false, converting: context.converting, keyID: activeKeyID) else { return }
         try await emit(.found(file(name: name, path: directory + "/" + name, inode: inode, id: group.id,
-                                   record: record, content: content, deleted: false)))
+                                   record: record, content: content, deleted: false, volume: context.superblock)))
     }
 
     /// The file's extents: the group's when the inode owns its data stream, otherwise (a clone) the
@@ -876,7 +876,7 @@ actor APFSContainer {
     }
 
     func file(name: String, path: String, inode: APFSInode, id: UInt64, record: APFSRecord,
-              content: FileContent, deleted: Bool) throws -> RecoveredFile {
+              content: FileContent, deleted: Bool, volume: APFSVolumeSuperblock) throws -> RecoveredFile {
         let placed: Int
         switch content {
         case .runs(let runs), .encryptedRuns(let runs, _): placed = runs.filter { $0.deviceOffset != nil }.count
@@ -885,7 +885,8 @@ actor APFSContainer {
         let recordOffset = try checkedAdd(extent.offset, checkedAdd(checkedMultiply(record.nodeAddress, blockSize), Int64(record.valueOffset)))
         return RecoveredFile(name: name, path: path, sizeBytes: try signed(inode.size), modified: inode.modified, isDeleted: deleted,
                              sourceMetadata: SourceMetadata(filesystem: .apfs, volumeOffset: extent.offset, recordOffset: recordOffset,
-                                                            allocationStart: id, contiguous: placed <= 1, rawRecord: record.value),
+                                                            allocationStart: id, contiguous: placed <= 1, rawRecord: record.value,
+                                                            volumeName: volume.name, volumeID: volume.uuid.uuidString.uppercased()),
                              content: content)
     }
 
@@ -981,7 +982,8 @@ actor APFSContainer {
         candidateIDs.insert(group.id)
         deletedCandidates.append(APFSDeletedCandidate(id: group.id, volume: volume, inode: inode, record: record, name: name,
                                                       path: directory + "/" + name, extents: extents, xid: old.xid,
-                                                      converting: old.converting || live.converting, keyID: activeKeyID))
+                                                      converting: old.converting || live.converting, keyID: activeKeyID,
+                                                      volumeSuperblock: live.superblock))
     }
 
     /// Emits every candidate, from every volume, whose blocks are all provably still the
@@ -1026,7 +1028,7 @@ actor APFSContainer {
             volumeBudgets[candidate.volume] = deletedWorkRemaining
             guard free else { continue }
             try await emit(.found(file(name: candidate.name, path: candidate.path, inode: candidate.inode, id: candidate.id,
-                                       record: candidate.record, content: content, deleted: true)))
+                                       record: candidate.record, content: content, deleted: true, volume: candidate.volumeSuperblock)))
         }
     }
 
@@ -1158,6 +1160,8 @@ struct APFSDeletedCandidate: Sendable {
     let converting: Bool
     /// The volume's key identifier when it is an unlocked encrypted volume.
     let keyID: String?
+    /// The live volume it belongs to, whose name and UUID the emitted file carries.
+    let volumeSuperblock: APFSVolumeSuperblock
 }
 
 struct APFSNodeCacheKey: Hashable, Sendable { let address: Int64; let decrypted: Bool }
