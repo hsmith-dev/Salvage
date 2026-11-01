@@ -103,7 +103,9 @@ struct DeviceListView: View {
     private func accessibilityValue(for device: BlockDevice) -> String {
         if device.isBootVolume { return bootVolumeReason }
         if isScanning && activeDeviceID == device.id { return "In use by another scan" }
-        return device.encryptedVolumeUUID == nil ? sizeText(for: device) : "Locked, \(sizeText(for: device))"
+        guard device.encryptedVolumeUUID != nil else { return sizeText(for: device) }
+        let locked = "Locked, \(sizeText(for: device))"
+        return UnlockViewModel.pickerNote(for: device).map { "\(locked). \($0)" } ?? locked
     }
 
     /// Routes List's own selection mechanism through `DeviceListViewModel`: a non-nil id goes
@@ -156,6 +158,13 @@ private struct DeviceRow: View {
                     Text(inUse ? "In use by another scan" : (isLocked ? "\(sizeText(for: device)) · Locked" : sizeText(for: device)))
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
+                    // Story 2.4: while the unlock sheet is withheld, say plainly what happens.
+                    if !inUse, let note = UnlockViewModel.pickerNote(for: device) {
+                        Text(note)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             }
 

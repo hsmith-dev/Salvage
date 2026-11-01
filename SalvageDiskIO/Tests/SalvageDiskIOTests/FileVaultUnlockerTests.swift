@@ -73,7 +73,7 @@ struct FileVaultUnlockerTests {
         let fake = DiskUtilFake(["list": listOutput(), "unlockVolume": unlockedOutput])
         let credential = UnlockCredential(kind: .password, secret: "spike-pass-123")
         let result = await fake.unlocker.unlock(volumeUUID: secretUUID.lowercased(), credential: credential)
-        #expect(result == .success(UnlockedVolume(volumeUUID: secretUUID, bsdName: "disk19s2", name: "Secret")))
+        #expect(result == .success(.unlocked(UnlockedVolume(volumeUUID: secretUUID, bsdName: "disk19s2", name: "Secret"))))
         let calls = fake.calls
         #expect(calls.count == 2)
         #expect(calls[0] == .init(arguments: ["apfs", "list", "-plist"], input: nil))
@@ -120,13 +120,30 @@ struct FileVaultUnlockerTests {
         }
     }
 
-    @Test func alreadyUnlockedVolumeSucceedsWithoutRunningUnlock() async {
+    /// An already-unlocked volume is its own outcome, never `.unlocked`: no credential was checked
+    /// (a wrong one comes back the same way), unlockVolume is never run, and the volume is not
+    /// reported as something Salvage unlocked (so nothing downstream may relock it).
+    @Test func alreadyUnlockedVolumeIsADistinctOutcomeThatVerifiesNothing() async {
+        let listed = UnlockedVolume(volumeUUID: secretUUID, bsdName: "disk19s2", name: "Secret")
         let fake = DiskUtilFake(["list": listOutput(secretLocked: false), "unlockVolume": wrongPasswordByCode])
         let credential = UnlockCredential(kind: .password, secret: "irrelevant")
-        #expect(await fake.unlocker.unlock(volumeUUID: secretUUID, credential: credential)
-                == .success(UnlockedVolume(volumeUUID: secretUUID, bsdName: "disk19s2", name: "Secret")))
-        #expect(fake.calls.count == 1)
+        let result = await fake.unlocker.unlock(volumeUUID: secretUUID, credential: credential)
+        #expect(result == .success(.alreadyUnlocked(listed)))
+        #expect(result != .success(.unlocked(listed)))
+        #expect(fake.calls.map(\.arguments) == [["apfs", "list", "-plist"]])
         #expect(credential.isZeroed)
+
+        // Unlocked by someone else between the listing and the attempt: diskutil says "not locked"
+        // (-69589). Still not a success of the credential, still not Salvage's unlock.
+        let notLocked = BoundedProcessOutput(status: 1, standardOutput: plistData(["Success": false, "DiskManagementErrorCode": -69589]),
+                                             standardError: Data("The given APFS Volume is not locked\n".utf8))
+        let raced = DiskUtilFake(["list": listOutput(), "unlockVolume": notLocked])
+        let second = UnlockCredential(kind: .password, secret: "irrelevant")
+        #expect(await raced.unlocker.unlock(volumeUUID: secretUUID, credential: second) == .success(.alreadyUnlocked(listed)))
+        #expect(raced.calls.count == 2)
+        #expect(second.isZeroed)
+        #expect(UnlockOutcome.alreadyUnlocked(listed).volume == listed)
+        #expect(UnlockOutcome.unlocked(listed).volume == listed)
     }
 
     @Test(arguments: ["", "disk19s2", "-nomount", "34CFAFFA-3ECE-46A6-937D-93E622EAA34B -plist", "34CFAFFA3ECE46A6937D93E622EAA34B",
@@ -152,15 +169,24 @@ struct FileVaultUnlockerTests {
     }
 
     @Test func unlockOutputInterpretation() {
-        #expect(interpretUnlockOutput(unlockedOutput) == nil)
-        #expect(interpretUnlockOutput(BoundedProcessOutput(status: 0, standardOutput: Data(), standardError: Data())) == nil)
-        #expect(interpretUnlockOutput(wrongPasswordByCode) == .wrongPassword)
-        #expect(interpretUnlockOutput(wrongPasswordByText) == .wrongPassword)
-        // "The given APFS Volume is not locked (-69589)": the goal state already holds.
-        #expect(interpretUnlockOutput(BoundedProcessOutput(status: 1, standardOutput: plistData(["Success": false, "DiskManagementErrorCode": -69589]), standardError: Data())) == nil)
-        #expect(interpretUnlockOutput(BoundedProcessOutput(status: 1, standardOutput: plistData(["Success": false, "DiskManagementErrorCode": -69593]), standardError: Data())) == .toolFailure)
-        #expect(interpretUnlockOutput(notFoundOutput) == .toolFailure)
-        #expect(interpretUnlockOutput(nil) == .toolFailure)
+        #expect(interpretUnlockOutput(unlockedOutput) == .unlocked)
+        #expect(interpretUnlockOutput(BoundedProcessOutput(status: 0, standardOutput: Data(), standardError: Data())) == .unlocked)
+        #expect(interpretUnlockOutput(wrongPasswordByCode) == .failed(.wrongPassword))
+        #expect(interpretUnlockOutput(wrongPasswordByText) == .failed(.wrongPassword))
+        // "The given APFS Volume is not locked (-69589)": already unlocked, credential unverified.
+        #expect(interpretUnlockOutput(BoundedProcessOutput(status: 1, standardOutput: plistData(["Success": false, "DiskManagementErrorCode": -69589]), standardError: Data())) == .alreadyUnlocked)
+        #expect(interpretUnlockOutput(BoundedProcessOutput(status: 1, standardOutput: plistData(["Success": false, "DiskManagementErrorCode": -69593]), standardError: Data())) == .failed(.toolFailure))
+        #expect(interpretUnlockOutput(notFoundOutput) == .failed(.toolFailure))
+        #expect(interpretUnlockOutput(nil) == .failed(.toolFailure))
+    }
+
+    /// The unlock's blocking subprocess runs on a GCD global queue: not the main thread, and not
+    /// one of the cooperative pool's few threads.
+    @Test func blockingWorkRunsOnAGlobalQueueNotTheCooperativePool() async {
+        let (label, isMain) = await offCooperativePool { (String(cString: __dispatch_queue_get_label(nil)), Thread.isMainThread) }
+        #expect(!isMain)
+        #expect(label.hasPrefix("com.apple.root."), "\(label)")
+        #expect(!label.contains("cooperative"), "\(label)")
     }
 }
 
@@ -188,6 +214,20 @@ struct SensitiveBytesTests {
         credential.zero()
         #expect(credential.isZeroed)
         #expect(credential.bytes.withUnsafeBytes { $0.allSatisfy { $0 == 0 } })
+    }
+
+    /// A recovery key is trimmed on the byte buffer (no trimmed `String` copy); a password keeps
+    /// its spaces. The buffer holds exactly the kept bytes, so `zero()` covers all of them.
+    @Test func trimmingHappensOnTheBytes() {
+        let key = UnlockCredential(kind: .recoveryKey, secret: " \t ABCD-EFGH \n", trimmingWhitespace: true)
+        #expect(key.count == 9)
+        #expect(key.bytes.withUnsafeBytes { Array($0) } == Array("ABCD-EFGH".utf8))
+        let password = UnlockCredential(kind: .password, secret: " pw ", trimmingWhitespace: false)
+        #expect(password.count == 4)
+        #expect(password.bytes.withUnsafeBytes { Array($0) } == Array(" pw ".utf8))
+        let blank = UnlockCredential(kind: .recoveryKey, secret: "   ", trimmingWhitespace: true)
+        #expect(blank.count == 0)
+        #expect(UnlockCredential(kind: .recoveryKey, secret: "", trimmingWhitespace: true).count == 0)
     }
 }
 
@@ -217,10 +257,14 @@ struct BoundedProcessTests {
     }
 
     @Test func childThatIgnoresStdinStillCompletes() throws {
-        // The child exits without reading: the writer must not SIGPIPE or hang the runner.
-        let input = SensitiveBytes(utf8: String(repeating: "x", count: 10_000))
+        // The child exits at once without reading. The input is well past the pipe buffer (64 KB
+        // on macOS), so the writer is guaranteed to block on a full pipe and then see the read end
+        // close: it must come back with EPIPE (never SIGPIPE) and never hang the runner.
+        let input = SensitiveBytes([UInt8](repeating: UInt8(ascii: "x"), count: 256 * 1024))
+        let started = ContinuousClock.now
         let output = try #require(runBoundedProcess(executable: URL(fileURLWithPath: "/bin/sh"), arguments: ["-c", "exit 0"], input: input, timeout: 10))
         #expect(output.status == 0)
+        #expect(started.duration(to: .now) < .seconds(10))
     }
 
     @Test func plistFromProcessStillDecodesStdout() throws {
