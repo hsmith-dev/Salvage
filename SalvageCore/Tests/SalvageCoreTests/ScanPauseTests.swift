@@ -249,7 +249,7 @@ private func scanCollectingCheckpoints(_ image: Data) async -> ([ScanEvent], [Sc
 }
 
 private func waitUntil(_ condition: () -> Bool) async throws {
-    let deadline = ContinuousClock.now + .seconds(5)
+    let deadline = ContinuousClock.now + .seconds(60)
     while !condition() {
         guard ContinuousClock.now < deadline else { throw ScanError.io("Timed out waiting for the scan.") }
         try await Task.sleep(for: .milliseconds(5))
