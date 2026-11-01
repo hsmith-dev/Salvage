@@ -443,7 +443,11 @@ struct NTFSVolumeTests {
         for stride in 1...8 { buffer.put(0x28 + stride * 2, UInt64(stride), 2); buffer.put(stride * 512 - 2, 0x0102, 2) }
         var fixed = buffer
         #expect(applyNTFSFixup(&fixed))
-        #expect((1...8).allSatisfy { fixed[$0 * 512 - 2] == UInt8($0) && fixed[$0 * 512 - 1] == 0 })
+        for stride in 1...8 {
+            let end: Int = stride * 512
+            #expect(fixed[end - 2] == UInt8(stride))
+            #expect(fixed[end - 1] == 0)
+        }
         var torn = buffer; torn[7 * 512 - 1] = 0
         #expect(!applyNTFSFixup(&torn))
         var miscounted = buffer; miscounted.put(6, 4, 2)
