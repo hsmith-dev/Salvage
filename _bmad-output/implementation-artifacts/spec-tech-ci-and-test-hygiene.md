@@ -1,0 +1,51 @@
+---
+title: 'CI and Test Hygiene from the Deferred List'
+type: 'tech'
+created: '2026-10-31'
+status: 'ready-for-dev'
+baseline_commit: 'd04d613'
+route: 'dispatch'
+context:
+  - '{project-root}/_bmad-output/implementation-artifacts/deferred-work.md'
+  - '{project-root}/_bmad-output/implementation-artifacts/spec-1-1-project-foundation-trustworthy-module-scaffold.md'
+  - '{project-root}/_bmad-output/implementation-artifacts/spec-1-12-read-physical-drives-via-a-read-only-privileged-helper.md'
+---
+
+<frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
+
+## Intent
+
+Close the mechanical items in `deferred-work.md`:
+1. **Project sync check (CI).** Fail CI if the committed `Salvage.xcodeproj` differs from what `xcodegen generate` produces from `project.yml`. Install a **pinned** xcodegen version in CI: pin a Homebrew formula version, or download a release by exact version with a SHA-256 check. Regenerate into a temp copy and `diff -r`. Write `scripts/check-xcodeproj-sync.sh`, which works locally too, plus a self-test that plants a drift.
+2. **Boundary-check step 3 coverage.** `scripts/test-check-core-boundary.sh` must exercise the transitive dependency-leak check with a real local package: a throwaway local SwiftPM package in a temp dir whose target imports a forbidden framework, added to a temp copy of SalvageCore's `Package.swift` as a path dependency. It must fail without network access. If step 3 can't detect it, fix the checker.
+3. **DiskWatchRegistration tests.** Add a seam so `DiskWatchRegistration` start/stop can be tested without a real DA session. Inject the register/unregister functions. Prove that unregister uses the same callback/context pair as register, and that no callback fires after stop. Add a deselection test for the device list: model-level `clearSelection` from a nil selection binding.
+4. **Release signing check.** In `.github/workflows/release.yml`, after signing, verify that the bundled helper plist's SpawnConstraint `team-identifier` equals the app's signing Team ID (`codesign -dv` → `TeamIdentifier`). Also verify the nested helper is signed with the same team. The check must fail closed when they differ.
+5. **Real-image test reporting.** Make CI set `SALVAGE_REQUIRE_HDIUTIL=1` (introduced by the HFS+ fixes), so real-image suites can't silently skip on macOS runners. Apply the same env-var rule to the APFS real-image suite (`APFSVolumeTests.swift`), editing only its `.enabled(if:)` condition and adding an availability-report test like HFS+'s.
+
+## Boundaries & Constraints
+
+**Always:**
+- Mark each resolved entry in `deferred-work.md` with a `status:` line.
+- CI changes must keep every existing step.
+
+**Never:** Edit only these:
+- `scripts/`
+- `.github/workflows/ci.yml` and `release.yml`
+- `SalvageDiskIO/Sources/SalvageDiskIO/DeviceWatcher.swift` (seam only) and `DeviceWatcherTests.swift`
+- `Salvage/ViewModels/DeviceListViewModel.swift` (only if the deselection seam needs it) and `SalvageTests/DeviceListViewModelTests.swift`
+- the APFS real-image suite condition in `APFSVolumeTests.swift`
+- `deferred-work.md`
+
+No parser, ScanSession or app-view changes.
+
+</frozen-after-approval>
+
+## Verification
+
+- `./scripts/check-core-boundary.sh && ./scripts/test-check-core-boundary.sh`
+- `./scripts/check-no-network.sh && ./scripts/test-check-no-network.sh`
+- `./scripts/check-xcodeproj-sync.sh` and its self-test
+- `swift test --package-path SalvageDiskIO`
+- `swift test --package-path SalvageCore`
+- `xcodebuild -project Salvage.xcodeproj -scheme Salvage -configuration Debug -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO -only-testing:SalvageTests test`
+- Validate workflow YAML syntax with `ruby -ryaml -e 'YAML.load_file(ARGV[0])' <file>` or python `yaml.safe_load`.

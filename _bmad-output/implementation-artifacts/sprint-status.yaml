@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 10-31-2026 09:25
-last_updated: 10-31-2026 21:30
+last_updated: 10-31-2026 21:45
 project: Salvage
 project_key: NOKEY
 tracking_system: file-system
@@ -55,7 +55,7 @@ development_status:
   2-2-scan-and-recover-deleted-files-from-an-apfs-drive: review
   2-3-scan-and-recover-deleted-files-from-an-hfs-drive: review
   2-4-unlock-and-recover-from-a-filevault-encrypted-volume: review
-  2-5-read-an-unlocked-filevault-volume: backlog
+  2-5-read-an-unlocked-filevault-volume: in-progress
   epic-2-retrospective: optional
 
   epic-3: review
