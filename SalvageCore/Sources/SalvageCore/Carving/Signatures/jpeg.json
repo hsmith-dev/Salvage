@@ -17,6 +17,7 @@
   },
   "footer": "FFD9",
   "embeds": ["jpeg"],
+  "entropy": "jpegBaseline",
   "maxBytes": 134217728,
-  "notes": "SOI must be followed by an APPn, DQT, SOFn/DHT, COM or DRI marker, so a stray FFD8FF does not open (or cut) a carve. Marker segments are walked up to start-of-scan, skipping FF fill bytes, so an EXIF thumbnail's own FFD9 cannot end the file early (and the thumbnail's header is embedded data); the footer search begins at the scan data."
+  "notes": "SOI must be followed by an APPn, DQT, SOFn/DHT, COM or DRI marker, so a stray FFD8FF does not open (or cut) a carve. Marker segments are walked up to start-of-scan, skipping FF fill bytes, so an EXIF thumbnail's own FFD9 cannot end the file early (and the thumbnail's header is embedded data); the footer search begins at the scan data. The baseline entropy decoder checks the scan data: a JPEG whose scan data stops decoding is partial even when an FFD9 follows (fragment reassembly is opt-in, see JPEGReassembly.swift)."
 }

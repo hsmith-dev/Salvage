@@ -92,3 +92,34 @@ Five independent work items, one agent each. Each section lists the files that a
 - `./scripts/check-core-boundary.sh && ./scripts/check-no-network.sh && ./scripts/check-xcodeproj-sync.sh`
 - `xcodebuild -project Salvage.xcodeproj -scheme Salvage -configuration Debug -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO -only-testing:SalvageTests test`
 - `xcodebuild -project Salvage.xcodeproj -scheme Salvage -configuration Release -destination 'platform=macOS' CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO build`
+
+## Implementation Notes — A
+
+**Outcome: the decoder ships and is used; reassembly is built and tested but off by default, because entropy validation turned out not to be reliable enough.** Today's behaviour for split JPEGs (partial, Low) is kept, with one honesty fix (below).
+
+**What shipped** (`SalvageCore/Sources/SalvageCore/Carving/`):
+- `JPEGEntropyDecoder.swift`: a baseline (SOF0) / extended Huffman (SOF1, 8 or 12-bit) decoder. It parses DQT/DHT/SOF/DRI/SOS and decodes every MCU's DC/AC coefficients. It checks Huffman codes (all-ones codes are rejected, as libjpeg does), coefficient positions (k ≤ 63, ZRL room, size categories), the DC range the DC quantizer allows, the restart-marker placement, numbering and one-bit padding, and EOI after exactly the frame's MCU count. It produces no pixels. `JPEGBaselineDecoder.decode(Data)` returns the outcome, `mcusDecoded`/`totalMCUs`, `validUpTo` and `restartSequenceOK`. Progressive, lossless, arithmetic, hierarchical, multi-scan and DNL files are reported as `unsupported`, never as `invalid`. `JPEGScanDecoder` is a value-type streaming decoder; a copy is a snapshot at a byte boundary.
+- Every JPEG carve now runs its scan data through the decoder while it looks for the footer (new signature field `"entropy": "jpegBaseline"` in `jpeg.json`, parsed and validated in `SignatureLibrary.swift`; it requires `segments` with `stopAt` and a `footer`). **Behaviour change:** if the scan data stops decoding, a later `FFD9` no longer validates the carve. It is reported as partial with overwrite 1.0 (`.inconsistent`, Low) instead of complete and Medium. The bytes emitted are unchanged. Files the decoder can't judge, including the existing fake test JPEGs that have no DHT/SOF, behave exactly as before.
+- `JPEGReassembly.swift` implements the spec's search, gated by `SignatureCarver.Limits.reassembleFragmentedJPEGs` (default `false`):
+  - Break candidates are the decoder snapshots at sector boundaries since the last valid RST, up to the failure point or the cut. At most `maxJoinBreaks` = 16 are kept; on real JPEGs, random bytes after a break failed within a median of 52 and a maximum of 591 bytes.
+  - Resume candidates are later, sector-aligned positions within 16 MiB, at most 4096 of them. A position is skipped if it is claimed, holds a header, or lies inside another carve's validated or validly-decoding range.
+  - Total decode work is capped at 64 MiB per JPEG, and at most 4 JPEGs search at once.
+  - A join is emitted only when exactly one (break, resume) pair decodes the full MCU count and RST order to EOI. It gets two runs, `isPartial: false`, overwrite 0.3 and Low confidence. If two pairs validate, the result is ambiguous and nothing is joined.
+
+**Why reassembly is off.** I measured with layouts where the true second fragment is gone. The orphaned tail of another JPEG with the same Huffman tables and dimensions (sibling photos from one camera) often passes full validation. Huffman codes self-synchronize, and among the thousands of (break, resume) pairs tried, one lands the tail on exactly the right MCU index. From there it decodes to EOI with the right count, and with RST markers it also has the right restart numbers, because the indices line up.
+- With tiles of a real photo re-encoded by ImageIO, wrong joins came out in 4/37 layouts at 320×240, 4/17 at 640×480 and 1/5 at 1024×768. Synthetic JPEGs gave 2/210.
+- I prototyped a vertical luma-DC seam-continuity test. Wrong joins scored a seam/reference ratio of 2.2–47, and true joins up to 6.2, so the two overlap. I removed the test rather than ship a heuristic that both lets wrong joins through and drops true ones.
+- Since a wrong picture is worse than a partial one, the default keeps today's behaviour. `aSameSizeSiblingsOrphanedTailCanPassEntropyValidationWhichIsWhyJoiningIsOff` pins this hazard down.
+- Two further recall limits when the flag is on:
+  - If the gap holds zeros and the tables code `00` bits as DC-0 + EOB (ImageIO's do), a join shifted through the zeros validates as well as the true one, so the tie is refused.
+  - Joined results are held back until the search window has passed. A scan cancelled or checkpointed in that window loses the held partial, just as open carves are lost today.
+- Making joins reliable likely needs pixel-domain boundary matching (IDCT plus edge continuity), which this spec puts out of scope.
+
+**Tests** (`CarvingTests.swift`, new suite "Baseline JPEG entropy decoding and bifragment reassembly", 14 tests):
+- Decoding: in-test T.81 encoder output (4:2:0, 4:2:2 SOF1, 4:4:4, gray; with and without restart markers), ImageIO baseline JPEGs, and ImageIO progressive JPEGs (unsupported). Broken, out-of-sequence-RST, truncated and early-EOI data.
+- Carving: contiguous real JPEGs still give one validated run. A two-fragment layout with an unrelated PNG between the fragments is joined with the flag on, at four chunk sizes, with and without RST. A headerless gap with a stray `FFD9`, and a claimed live file between the fragments, are also joined.
+- Not joined: decoys (FF-free filler, stuffed random bytes, the true tail with one corrupted byte); two valid continuations (ambiguous); a progressive JPEG; a fragment outside the search window.
+- With the defaults, a split JPEG stays partial, and a stray footer no longer validates broken scan data.
+- I also checked the decoder offline against 300 JPEGs on this Mac: 294 decoded `complete`, 6 progressive were `unsupported`, 0 were wrongly invalid, and 160 of them use restart markers.
+
+**Performance:** always-on decoding of carved JPEG scan data measured about 90–110 MB/s of JPEG bytes in a release build, on a loaded machine. This only touches unclaimed JPEG regions. It is a possible scan bottleneck on fast drives full of deleted photos, and is reported here for D rather than tuned further.

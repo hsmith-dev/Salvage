@@ -38,8 +38,17 @@ extension Carver {
 /// walk or structure carries `overwriteConfidence` 0 and is not partial. A carve cut short by
 /// `maxBytes`, the next header or the end of the extent, or whose size claim exceeds the
 /// signature's `trustedMaxBytes`, is partial with 0.6. A carve cut by a claimed run (its bytes
-/// belong to a live file) or whose own structure is inconsistent is partial with 1.0. Every
-/// carved file is one contiguous run: fragmented reassembly is out of scope for v1.
+/// belong to a live file) or whose own structure is inconsistent is partial with 1.0.
+///
+/// A JPEG (a signature with `entropy`) also has its scan data run through the baseline entropy
+/// decoder: when the data stops decoding, a footer found later can't validate it, and the carve is
+/// partial with 1.0 instead (the bytes past the break belong to something else).
+///
+/// Carved files are one contiguous run by default. With `Limits.reassembleFragmentedJPEGs`, a JPEG
+/// whose scan data stops decoding, or is cut by the next header, may be joined with a later
+/// fragment: the join is emitted, as two runs, only when the decoder validates every MCU of the
+/// frame and the restart sequence across it, ending at EOI, and no other join validates (see
+/// `JPEGReassembly.swift`, which also says why this is off by default).
 actor SignatureCarver: Carver {
     static let isImplemented = true
     /// `rawRecord` keeps at most this many header bytes.
@@ -55,6 +64,24 @@ actor SignatureCarver: Carver {
         /// Largest validated size-field / record-walk size for signatures that don't declare
         /// `trustedMaxBytes`.
         var defaultTrustedMaxBytes: Int64 = 64 * 1024 * 1024
+        /// Bifragment JPEG reassembly (see `JPEGReassembly.swift`). Off by default: entropy
+        /// validation can't tell a JPEG's real second fragment from the orphaned tail of another
+        /// JPEG with the same tables and dimensions (a sibling photo from the same camera), and
+        /// measured on real images such tails validated in roughly 10-25% of the layouts where one
+        /// sat in the search window. A wrong picture is worse than a partial one.
+        var reassembleFragmentedJPEGs = false
+        /// Second fragments are looked for at sector-aligned offsets in this many bytes after the
+        /// first fragment breaks off ...
+        var joinSearchBytes: Int64 = 16 * 1024 * 1024
+        /// ... trying at most this many resume offsets ...
+        var maxJoinResumeStarts = 4096
+        /// ... from each of at most this many break points (sector boundaries since the last valid
+        /// restart marker, nearest the point where decoding failed) ...
+        var maxJoinBreaks = 16
+        /// ... decoding at most this many entropy bytes in all, per JPEG.
+        var maxJoinDecodeBytes: Int64 = 64 * 1024 * 1024
+        /// JPEGs searching for a second fragment at the same time; more stay partial.
+        var maxPendingJoins = 4
         static let `default` = Limits()
     }
 
@@ -100,6 +127,8 @@ actor SignatureCarver: Carver {
         /// The end came from a size field or a record walk (not a footer or a trailer), so it is
         /// only trusted up to `trustedMax`.
         var sizeDerived = false
+        /// Entropy decoding of a JPEG's scan data (signatures with `entropy`).
+        var jpeg: JPEGCarveTrack?
 
         /// Device offset up to which the signature's structure says the bytes belong to this file.
         var cover: Int64 {
@@ -115,7 +144,10 @@ actor SignatureCarver: Carver {
     struct Ended {
         let carve: OpenCarve
         let end: Int64
-        let cut: Cut
+        var cut: Cut
+        /// Set when the carve was reassembled from two fragments.
+        var join: JPEGJoin?
+        init(carve: OpenCarve, end: Int64, cut: Cut) { self.carve = carve; self.end = end; self.cut = cut }
     }
 
     let emit: @Sendable (RecoveredFile) async throws -> Void
@@ -135,8 +167,12 @@ actor SignatureCarver: Carver {
     private var explicitExtent: Range<Int64>?
     /// Next sector-aligned device offset to test for a header.
     private var nextHeaderSearch: Int64 = 0
-    private var open: [OpenCarve] = []
+    var open: [OpenCarve] = []
     private var usedNames: Set<String> = []
+    /// JPEGs looking for their second fragment (see `JPEGReassembly.swift`).
+    var joins: [PendingJoin] = []
+    /// Recent byte ranges known to belong to other files, where no second fragment can start.
+    var ownedRanges: [Range<Int64>] = []
     private(set) var emittedCount = 0
     /// True once `maxCarvedFiles` was reached and further carves were dropped. Exposed through
     /// `Carver.hitFileLimit` so the scan can report that carving stopped early.
@@ -177,6 +213,7 @@ actor SignatureCarver: Carver {
         }
         claimed = merged
         carry = Data(); streamEnd = nil; open = []; explicitExtent = nil
+        joins = []; ownedRanges = []
     }
 
     func beginExtent(offset: Int64, length: Int64) async throws {
@@ -252,6 +289,7 @@ actor SignatureCarver: Carver {
                 for carve in open { ended.append(cut(carve, at: windowEnd, .extentEnd)) }
                 open = []
             }
+            ended = settleJoins(ended, context)
             carryStart = min(carryStart, nextHeaderSearch)
             for carve in open {
                 switch carve.phase {
@@ -259,7 +297,9 @@ actor SignatureCarver: Carver {
                 case .walker(let walker): carryStart = min(carryStart, walker.retainFrom)
                 case .ending, .openEnded: break
                 }
+                if let retain = carve.jpeg?.retainFrom { carryStart = min(carryStart, retain) }
             }
+            for join in joins where !join.searchDone { carryStart = min(carryStart, join.nextResume) }
         }
         carryStart = min(max(carryStart, windowStart), windowEnd)
         if !final {
@@ -349,6 +389,7 @@ actor SignatureCarver: Carver {
             }
         } else if let segments = signature.segments {
             carve.phase = .walking(start + Int64(segments.start))
+            if signature.entropy == .jpegBaseline { carve.jpeg = JPEGCarveTrack() }
         } else if let structure = signature.structure {
             switch structure {
             case .gif: carve.phase = .gif(start + 6, .screen)
@@ -366,6 +407,7 @@ actor SignatureCarver: Carver {
     /// header position, or the window's end). Returns the carve when it has ended at or before
     /// `limit`.
     private func advance(_ carve: inout OpenCarve, through limit: Int64, _ context: Window) -> Ended? {
+        carve.jpeg?.completePendingSegment(context)
         while true {
             switch carve.phase {
             case .ending(let end, let cut):
@@ -408,7 +450,11 @@ actor SignatureCarver: Carver {
                     carve.sizeDerived = true
                     return Ended(carve: carve, end: next, cut: .validated)
                 }
-                if segments.stopAt.contains(where: { context.matches($0, at: next + Int64(segments.typeOffset)) }) {
+                let stop = segments.stopAt.contains(where: { context.matches($0, at: next + Int64(segments.typeOffset)) })
+                if carve.jpeg != nil, let marker = context.byte(at: next + 1) {
+                    carve.jpeg?.headerSegment(marker: marker, at: next, size: size, startsScan: stop, context)
+                }
+                if stop {
                     carve.phase = .footer(next)
                     continue
                 }
@@ -479,24 +525,38 @@ actor SignatureCarver: Carver {
                         continue
                     case .truncated:
                         // The footer record runs past the end of the extent.
+                        feedEntropy(&carve, upTo: context.end, context)
                         return cut(carve, at: context.end, .extentEnd)
                     case .overflow:
+                        feedEntropy(&carve, upTo: min(match, bound), context)
                         return Ended(carve: carve, end: min(match, bound), cut: .inconsistent)
                     case .end(let end):
-                        if end > bound { return closeFooterSearch(carve, at: bound) }
+                        if end > bound {
+                            feedEntropy(&carve, upTo: min(bound, context.end), context)
+                            return closeFooterSearch(carve, at: bound)
+                        }
                         if signature.footerMode == .first { found = end } else { carve.lastFooterEnd = end }
                     }
                     if found != nil { break }
                 }
                 if let found {
+                    feedEntropy(&carve, upTo: min(found, context.end), context)
                     carve.phase = .ending(found, .validated)
                     continue
                 }
                 carve.phase = .footer(max(from, searchEnd))
+                feedEntropy(&carve, upTo: min(limit, bound, context.end), context)
                 if bound <= limit { return closeFooterSearch(carve, at: bound) }
                 return nil
             }
         }
+    }
+
+    /// Feeds a JPEG carve's entropy decoder the scan data up to `end`.
+    private func feedEntropy(_ carve: inout OpenCarve, upTo end: Int64, _ context: Window) {
+        guard carve.jpeg != nil else { return }
+        carve.jpeg?.feed(upTo: end, context, sectorSize: Int64(limits.sectorSize),
+                         maxBreaks: limits.reassembleFragmentedJPEGs ? limits.maxJoinBreaks : 0)
     }
 
     /// A footer-terminated carve reached its claim or size bound: it ends at the last footer seen,
@@ -518,6 +578,7 @@ actor SignatureCarver: Carver {
 
     private func finalize(_ item: Ended) async throws {
         let carve = item.carve
+        if let join = item.join { return try await emitJoined(carve, join) }
         let size = item.end - carve.start
         guard size > 0 else { return }
         guard emittedCount < limits.maxCarvedFiles else { hitFileLimit = true; return }
@@ -541,9 +602,37 @@ actor SignatureCarver: Carver {
         try await emit(file)
     }
 
+    /// Emits a JPEG reassembled from two fragments. Two runs make it Low confidence (AD-7), and the
+    /// overwrite estimate says the join is inferred, not recorded anywhere on disk.
+    private func emitJoined(_ carve: OpenCarve, _ join: JPEGJoin) async throws {
+        let first = join.breakAt - carve.start, second = join.end - join.resumeAt
+        guard first >= 0, second > 0 else { return }
+        guard emittedCount < limits.maxCarvedFiles else { hitFileLimit = true; return }
+        let signature = carve.signature
+        let base = "\(signature.id)-\(String(format: "%012llx", carve.start))"
+        var name = "\(base).\(signature.extension)"
+        var sequence = 2
+        while usedNames.contains(name) { name = "\(base)-\(sequence).\(signature.extension)"; sequence += 1 }
+        usedNames.insert(name)
+        var runs: [DataRun] = []
+        if first > 0 { runs.append(DataRun(deviceOffset: carve.start, length: first)) }
+        runs.append(DataRun(deviceOffset: join.resumeAt, length: second))
+        let file = RecoveredFile(
+            name: name, path: "/Reconstructed/\(signature.category.displayName)/\(name)", sizeBytes: first + second,
+            modified: nil, isDeleted: false,
+            sourceMetadata: SourceMetadata(filesystem: .carved, volumeOffset: extentStart, recordOffset: carve.start,
+                                           allocationStart: UInt64(carve.start), contiguous: false, rawRecord: carve.headerBytes),
+            content: .runs(runs), recoveryMethod: .carved, isPartial: false, overwriteConfidence: Self.joinedOverwrite)
+        emittedCount += 1
+        try await emit(file)
+    }
+
+    /// Overwrite estimate reported for a reassembled JPEG.
+    static let joinedOverwrite = 0.3
+
     // MARK: Claimed runs
 
-    private func claimedRange(containing offset: Int64) -> Range<Int64>? {
+    func claimedRange(containing offset: Int64) -> Range<Int64>? {
         var low = 0, high = claimed.count
         while low < high {
             let middle = (low + high) / 2
@@ -553,7 +642,7 @@ actor SignatureCarver: Carver {
         return claimed[low]
     }
 
-    private func nextClaimStart(after offset: Int64) -> Int64 {
+    func nextClaimStart(after offset: Int64) -> Int64 {
         var low = 0, high = claimed.count
         while low < high {
             let middle = (low + high) / 2
@@ -562,7 +651,7 @@ actor SignatureCarver: Carver {
         return low < claimed.count ? claimed[low].lowerBound : Int64.max
     }
 
-    private func alignUp(_ offset: Int64) -> Int64 {
+    func alignUp(_ offset: Int64) -> Int64 {
         let sector = Int64(limits.sectorSize)
         let remainder = offset % sector
         guard remainder != 0 else { return offset }
