@@ -3,7 +3,7 @@ title: 'Batch 7: disk-image scanning, saved scans, file details, recovery report
 type: 'feature'
 created: '2026-10-31'
 status: 'ready-for-dev'
-baseline_commit: 'TBD-at-launch'
+baseline_commit: '3836be8'
 route: 'dispatch'
 context:
   - '{project-root}/_bmad-output/planning-artifacts/architecture/architecture-DataRecoveryTool-2026-10-30/ARCHITECTURE-SPINE.md'
