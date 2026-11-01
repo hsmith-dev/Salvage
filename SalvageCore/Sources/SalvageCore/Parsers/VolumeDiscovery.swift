@@ -5,7 +5,19 @@ extension Data {
         guard offset >= 0, width > 0, width <= 8, offset <= count, width <= count - offset else {
             throw ScanError.malformed("Truncated structure.")
         }
-        return (0..<width).reduce(0) { $0 | UInt64(self[startIndex + offset + $1]) << ($1 * 8) }
+        // One unaligned load for the common widths; same value as summing the bytes little-endian.
+        return withUnsafeBytes { (buffer: UnsafeRawBufferPointer) -> UInt64 in
+            switch width {
+            case 1: return UInt64(buffer[offset])
+            case 2: return UInt64(UInt16(littleEndian: buffer.loadUnaligned(fromByteOffset: offset, as: UInt16.self)))
+            case 4: return UInt64(UInt32(littleEndian: buffer.loadUnaligned(fromByteOffset: offset, as: UInt32.self)))
+            case 8: return UInt64(littleEndian: buffer.loadUnaligned(fromByteOffset: offset, as: UInt64.self))
+            default:
+                var value: UInt64 = 0
+                for index in 0..<width { value |= UInt64(buffer[offset + index]) << (index * 8) }
+                return value
+            }
+        }
     }
     /// Big-endian counterpart of `number`, for HFS+ headers.
     func bigEndian(_ offset: Int, _ width: Int) throws -> UInt64 {

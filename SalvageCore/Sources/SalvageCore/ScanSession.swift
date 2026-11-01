@@ -44,7 +44,7 @@ public struct ScanSession: Sendable, Identifiable {
         let claimed = ClaimedRuns()
         let dropped = CarveDropRange()
         let carver: any Carver = SignatureCarver(emit: { file in
-            if await dropped.drops(file) { return }
+            if dropped.drops(file) { return }
             try await emit(.found(file))
         }, library: signatureLibrary, limits: carverLimits)
         // A resumed scan owes a carve-only pass over the bytes it skipped until that pass ends.
@@ -63,11 +63,11 @@ public struct ScanSession: Sendable, Identifiable {
             if let start {
                 for (index, extent) in extents.enumerated() where index <= start.volume {
                     let covered = index < start.volume ? extent.length : start.offset
-                    if covered > 0 { await measured.cover(extent.offset..<(extent.offset + covered)) }
+                    if covered > 0 { measured.cover(extent.offset..<(extent.offset + covered)) }
                 }
             }
             backfillOutstanding = start.map { $0.volume > 0 || $0.offset > 0 } ?? false
-            try await emit(.progress(bytesScanned: await measured.measured, totalBytes: total))
+            try await emit(.progress(bytesScanned: measured.measured, totalBytes: total))
             // Per lost extent: whether its own parser finished, and whether the device failed to read
             // inside it (then nothing more is read there).
             var parserFailed = Set<Int>(), unreadable = Set<Int>()
@@ -77,7 +77,7 @@ public struct ScanSession: Sendable, Identifiable {
                         // Encrypted files' blocks are claimed too, so carving never reads ciphertext as content.
                         if case .found(let file) = event {
                             switch file.content {
-                            case .runs(let runs), .encryptedRuns(let runs, _): await claimed.add(runs)
+                            case .runs(let runs), .encryptedRuns(let runs, _): claimed.add(runs)
                             case .unmapped, .resident: break
                             }
                         }
@@ -110,7 +110,7 @@ public struct ScanSession: Sendable, Identifiable {
             // source bytes actually read, including metadata; unsupported partitions are skipped.
             // The carver sees every swept chunk; a resumed scan then carves the skipped bytes too.
             if !signatureLibrary.skipped.isEmpty { notices?.yield(.signaturesSkipped(signatureLibrary.skipped.map(\.file))) }
-            try await carver.begin(claimed: await claimed.runs, deviceSizeBytes: reader.sizeBytes)
+            try await carver.begin(claimed: claimed.runs, deviceSizeBytes: reader.sizeBytes)
             for (index, extent) in extents.enumerated() {
                 guard index >= (start?.volume ?? 0) else { continue }
                 // Every lost extent is swept for the carver, including one whose parser failed or
@@ -134,7 +134,7 @@ public struct ScanSession: Sendable, Identifiable {
                     offset += Int64(count)
                     checkpoints?.yield(ScanCheckpoint(deviceSizeBytes: reader.sizeBytes, totalBytes: total,
                                                       extents: fingerprint, sweepVolumeIndex: index, sweepOffset: offset,
-                                                      bytesScanned: await measured.measured))
+                                                      bytesScanned: measured.measured))
                 }
             }
             if let start, backfillOutstanding {
@@ -142,7 +142,7 @@ public struct ScanSession: Sendable, Identifiable {
                                         dropped: dropped, pauseGate: pauseGate, checkpoint: { carved in
                     checkpoints?.yield(ScanCheckpoint(deviceSizeBytes: reader.sizeBytes, totalBytes: total, extents: fingerprint,
                                                       sweepVolumeIndex: extents.count - 1, sweepOffset: extents[extents.count - 1].length,
-                                                      bytesScanned: await measured.measured, carveBackfillOffset: carved))
+                                                      bytesScanned: measured.measured, carveBackfillOffset: carved))
                 })
             }
             try await carver.finish()
@@ -190,7 +190,7 @@ public struct ScanSession: Sendable, Identifiable {
             let readEnd = index < start.volume ? extent.length : min(extent.length, overrunEnd)
             if readEnd > region {
                 let from = try checkedAdd(extent.offset, region), to = try checkedAdd(extent.offset, extent.length)
-                await dropped.set(from..<to)
+                dropped.set(from..<to)
             }
             try await carver.beginExtent(offset: extent.offset, length: extent.length)
             var offset: Int64 = 0
@@ -255,25 +255,39 @@ public struct ScanSession: Sendable, Identifiable {
 }
 
 /// Union of successfully read byte ranges, never elapsed-time-based or double-counted work.
-actor MeasuredReader: BlockReader {
+///
+/// Every parser read goes through here, so it is a lock-protected class rather than an actor:
+/// a read costs no executor hop of its own. The coverage update and the decision to report
+/// progress happen together under the lock; the source read and the progress event happen
+/// outside it, as they did while the actor was suspended on them.
+final class MeasuredReader: BlockReader, @unchecked Sendable {
     let base: any BlockReader
-    nonisolated let sizeBytes: Int64
+    let sizeBytes: Int64
     let extents: [VolumeExtent]
     let total: Int64
     let emit: @Sendable (ScanEvent) async throws -> Void
     let interval: Duration
     let now: @Sendable () -> Duration
-    var ranges: [Range<Int64>] = []
-    var lastEmission: Duration
-    var measured: Int64 = 0
     let gate: ScanPauseGate?
+    private let lock = NSLock()
+    /// Guarded by `lock`.
+    private var state: State
+    private struct State {
+        var ranges: [Range<Int64>] = []
+        var lastEmission: Duration
+        var measured: Int64 = 0
+    }
     init(base: any BlockReader, extents: [VolumeExtent], total: Int64,
          emit: @escaping @Sendable (ScanEvent) async throws -> Void,
          interval: Duration, now: @escaping @Sendable () -> Duration, gate: ScanPauseGate? = nil) {
         self.base = base; self.sizeBytes = base.sizeBytes; self.extents = extents
-        self.total = total; self.emit = emit; self.interval = interval; self.now = now; self.lastEmission = now()
+        self.total = total; self.emit = emit; self.interval = interval; self.now = now
+        self.state = State(lastEmission: now())
         self.gate = gate
     }
+    var ranges: [Range<Int64>] { lock.withLock { state.ranges } }
+    var measured: Int64 { lock.withLock { state.measured } }
+
     func read(at offset: Int64, count: Int) async throws -> Data {
         // Parsers read only through here, so no source read is issued while paused.
         try await gate?.wait()
@@ -284,32 +298,38 @@ actor MeasuredReader: BlockReader {
         }
         let data = try await base.read(at: offset, count: count)
         guard data.count == count else { throw ScanError.malformed("Truncated device.") }
-        cover(offset..<end)
-        let now = now()
-        if now - lastEmission >= interval || measured == total {
-            try await emit(.progress(bytesScanned: measured, totalBytes: total))
-            lastEmission = now
+        let report: Int64? = lock.withLock {
+            Self.cover(offset..<end, in: &state)
+            let now = now()
+            guard now - state.lastEmission >= interval || state.measured == total else { return nil }
+            state.lastEmission = now
+            return state.measured
         }
+        if let report { try await emit(.progress(bytesScanned: report, totalBytes: total)) }
         return data
+    }
+
+    func cover(_ added: Range<Int64>) {
+        lock.withLock { Self.cover(added, in: &state) }
     }
 
     /// `ranges` stays sorted, disjoint and non-touching. Binary search finds the first range that
     /// overlaps or touches `added`; only the neighbors actually merged are visited.
-    func cover(_ added: Range<Int64>) {
+    private static func cover(_ added: Range<Int64>, in state: inout State) {
         var lower = added.lowerBound, upper = added.upperBound
-        var low = 0, high = ranges.count
+        var low = 0, high = state.ranges.count
         while low < high {
             let middle = (low + high) / 2
-            if ranges[middle].upperBound < lower { low = middle + 1 } else { high = middle }
+            if state.ranges[middle].upperBound < lower { low = middle + 1 } else { high = middle }
         }
         var last = low
-        while last < ranges.count, ranges[last].lowerBound <= upper {
-            measured -= ranges[last].upperBound - ranges[last].lowerBound
-            lower = min(lower, ranges[last].lowerBound); upper = max(upper, ranges[last].upperBound)
+        while last < state.ranges.count, state.ranges[last].lowerBound <= upper {
+            state.measured -= state.ranges[last].upperBound - state.ranges[last].lowerBound
+            lower = min(lower, state.ranges[last].lowerBound); upper = max(upper, state.ranges[last].upperBound)
             last += 1
         }
-        measured += upper - lower
-        ranges.replaceSubrange(low..<last, with: CollectionOfOne(lower..<upper))
+        state.measured += upper - lower
+        state.ranges.replaceSubrange(low..<last, with: CollectionOfOne(lower..<upper))
     }
 }
 
@@ -347,17 +367,26 @@ extension ScanError {
 
 /// Carved files starting inside `range` are not emitted: the carve backfill's overrun past the
 /// resume point finds again what the resumed sweep already reported.
-actor CarveDropRange {
+/// Lock-protected rather than an actor: it is asked once per carved file, so no executor hop.
+final class CarveDropRange: @unchecked Sendable {
+    private let lock = NSLock()
     private var range: Range<Int64>?
-    func set(_ range: Range<Int64>) { self.range = range }
+    func set(_ range: Range<Int64>) { lock.withLock { self.range = range } }
     func drops(_ file: RecoveredFile) -> Bool {
-        guard let range, case .runs(let runs) = file.content, let first = runs.first?.deviceOffset else { return false }
+        guard let range = lock.withLock({ self.range }), case .runs(let runs) = file.content,
+              let first = runs.first?.deviceOffset else { return false }
         return range.contains(first)
     }
 }
 
-/// Device-absolute byte ranges owned by files found through metadata.
-actor ClaimedRuns {
-    private(set) var runs: [DataRun] = []
-    func add(_ new: [DataRun]) { runs.append(contentsOf: new.filter { $0.deviceOffset != nil }) }
+/// Device-absolute byte ranges owned by files found through metadata. Appended once per found
+/// file, from the parser's own task, so it is a lock-protected buffer rather than an actor: a
+/// claim costs no executor hop. Runs keep the order they were added in.
+final class ClaimedRuns: @unchecked Sendable {
+    private let lock = NSLock()
+    private var buffer: [DataRun] = []
+    var runs: [DataRun] { lock.withLock { buffer } }
+    func add(_ new: [DataRun]) {
+        lock.withLock { for run in new where run.deviceOffset != nil { buffer.append(run) } }
+    }
 }
