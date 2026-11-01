@@ -114,3 +114,26 @@ Five independent items, one agent each. Each lists the files it owns. Global rul
 - `xcodebuild -project Salvage.xcodeproj -scheme Salvage -configuration Debug -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO -only-testing:SalvageTests test`
 - `xcodebuild -project Salvage.xcodeproj -scheme Salvage -configuration Release -destination 'platform=macOS' CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO build`
 - UI tests for your item: `xcodebuild … CODE_SIGN_IDENTITY="-" test -only-testing:SalvageUITests/<YourTestClass>`. Report results honestly, including focus-stealing interference from other apps.
+
+## Implementation Notes — E
+
+**Design.** A disk platter that is also a lifebuoy: a white ring with faint concentric tracks and a spindle hub reads as a platter, and four teal bands on the diagonals turn the same ring into a lifebuoy (rescue, the app's name). It sits on a graphite tile on the standard macOS grid (1024 canvas, 824 tile, radius 185) with a soft drop shadow and a faint rim light. Teal (`#2E6E6E`, lightening to `#438A89` at the top of each band) is the only chromatic colour, as in `DESIGN.md`. The graphite tile follows the Console/Terminal family of system utilities rather than a coloured SaaS tile. There is no arrow, text or gloss. I chose the graphite tile over a teal one after rendering both: on teal, the accent fights the tile for attention, and the bands lose contrast at 16 px. At 16 and 32 px the icon reads as a white ring with four teal quarters, which is distinct and legible. I did not hand-tune separate small sizes. The design avoids Disk Utility's drive and stethoscope and Time Machine's clock and arrow. Lifebuoy glyphs are common as "help" symbols, so before release a human should check the mark against competitors' current marks.
+
+**Files.**
+- `docs/brand/icon.svg` is the master artwork, written by hand with shapes only. It uses no filters, because the system SVG renderer ignores them, so the shadows are layered fills.
+- `scripts/render-icon.sh` and `scripts/render-icon.swift` render the SVG through AppKit's built-in SVG support (CoreSVG) into an sRGB CoreGraphics context. The script writes the 10 AppIcon PNGs (16 to 512 pt, @1x and @2x) and `docs/brand/icon-1024.png`. Output is deterministic: re-running it on the same SVG gives byte-identical PNGs, which I verified. It also fails if a render comes out empty.
+- `Salvage/Assets.xcassets` holds the `AppIcon.appiconset` with a committed `Contents.json`.
+- `project.yml` adds `ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon`. No separate catalog line is needed because the `Salvage` source path already picks the catalog up. `Salvage.xcodeproj` is regenerated.
+- `SalvageTests/AppIconTests.swift` is new. It covers the Info.plist keys, the `.icns` fallback and the 1024 px rendition from the asset catalog. I added this file under the global "every feature gets unit tests" rule; it is outside E's listed files.
+
+**No template variant.** The app has no menu-bar extra, so no monochrome or template icon is used, and none was added.
+
+**Built-app check.** In the Release build, `Info.plist` has `CFBundleIconFile = AppIcon` and `CFBundleIconName = AppIcon`. `Resources/` contains `AppIcon.icns` and `Assets.car`. `assetutil --info` lists all 10 `AppIcon` renditions, 16 to 1024 px. actool puts only the 16 to 128 pt sizes into the `.icns` and keeps the larger ones in `Assets.car`, which is normal.
+
+**Verification.**
+- `swift test` passed for SalvageCore (406 tests) and SalvageDiskIO (168 tests).
+- `check-core-boundary`, `check-no-network` and `check-xcodeproj-sync` all passed.
+- The Debug `SalvageTests` run passed (180 tests, including the 3 new ones).
+- The Release build succeeded.
+- No UI test was added, because the icon has no in-app UI.
+- The first SalvageCore run had one failure while a Release build was running in parallel. An isolated rerun passed, so it looks like a timing-sensitive test under load and is not related to this change, which touches no Swift package code.

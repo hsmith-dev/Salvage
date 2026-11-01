@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Salvage app icon (master artwork). Original design, see the
+  "Implementation Notes - E" section of _bmad-output/implementation-artifacts/spec-tech-batch-7.md.
+
+  Motif: a disk platter that doubles as a lifebuoy. The white ring is the platter
+  (faint concentric tracks, spindle hub in the middle); its four teal bands make it
+  read as a lifebuoy, i.e. rescue. Graphite tile, one teal accent (#2E6E6E), as in DESIGN.md.
+
+  Grid: 1024 x 1024 canvas, 824 x 824 tile at (100,100), corner radius 185 (the
+  standard macOS app-icon grid). Shapes only, no text, no fonts, no filters (the system
+  SVG renderer used by scripts/render-icon.sh ignores filters, so the shadows are layered fills).
+
+  Edit this file, then run scripts/render-icon.sh to regenerate every PNG.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+<defs>
+<linearGradient id="tile" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#4B5053"/><stop offset="1" stop-color="#25292B"/></linearGradient>
+<linearGradient id="plat" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="#D9DFDE"/></linearGradient>
+<linearGradient id="band" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#438A89"/><stop offset="1" stop-color="#2E6E6E"/></linearGradient>
+<linearGradient id="rim" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFFFFF" stop-opacity="0.22"/><stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0.04"/><stop offset="1" stop-color="#000000" stop-opacity="0.15"/></linearGradient>
+<clipPath id="rc"><path d="M216 512 a296 296 0 1 0 592 0 a296 296 0 1 0 -592 0 Z M378 512 a134 134 0 1 1 268 0 a134 134 0 1 1 -268 0 Z" clip-rule="evenodd"/></clipPath>
+</defs>
+<!-- Tile drop shadow: stacked, slightly offset translucent tiles (a soft blur, without filters) -->
+<rect x="98.5" y="103.4" width="827" height="827" rx="186.5" fill="#000" fill-opacity="0.022"/>
+<rect x="97" y="102.8" width="830" height="830" rx="188" fill="#000" fill-opacity="0.022"/>
+<rect x="95.5" y="102.2" width="833" height="833" rx="189.5" fill="#000" fill-opacity="0.022"/>
+<rect x="94" y="101.6" width="836" height="836" rx="191" fill="#000" fill-opacity="0.022"/>
+<rect x="92.5" y="101" width="839" height="839" rx="192.5" fill="#000" fill-opacity="0.022"/>
+<rect x="91" y="100.4" width="842" height="842" rx="194" fill="#000" fill-opacity="0.022"/>
+<rect x="89.5" y="99.8" width="845" height="845" rx="195.5" fill="#000" fill-opacity="0.022"/>
+<rect x="88" y="99.2" width="848" height="848" rx="197" fill="#000" fill-opacity="0.022"/>
+<rect x="86.5" y="98.6" width="851" height="851" rx="198.5" fill="#000" fill-opacity="0.022"/>
+<rect x="85" y="98" width="854" height="854" rx="200" fill="#000" fill-opacity="0.022"/>
+<rect x="83.5" y="97.4" width="857" height="857" rx="201.5" fill="#000" fill-opacity="0.022"/>
+<rect x="82" y="96.8" width="860" height="860" rx="203" fill="#000" fill-opacity="0.022"/>
+<!-- Tile -->
+<rect x="100" y="100" width="824" height="824" rx="185" ry="185" fill="url(#tile)"/>
+<rect x="102" y="102" width="820" height="820" rx="183" ry="183" fill="none" stroke="url(#rim)" stroke-width="4"/>
+<!-- Ring shadow -->
+<path d="M216 522 a296 296 0 1 0 592 0 a296 296 0 1 0 -592 0 Z M378 522 a134 134 0 1 1 268 0 a134 134 0 1 1 -268 0 Z" fill="#000" fill-opacity="0.06" fill-rule="evenodd"/>
+<path d="M212 526 a300 300 0 1 0 600 0 a300 300 0 1 0 -600 0 Z M382 526 a130 130 0 1 1 260 0 a130 130 0 1 1 -260 0 Z" fill="#000" fill-opacity="0.06" fill-rule="evenodd"/>
+<path d="M208 530 a304 304 0 1 0 608 0 a304 304 0 1 0 -608 0 Z M386 530 a126 126 0 1 1 252 0 a126 126 0 1 1 -252 0 Z" fill="#000" fill-opacity="0.06" fill-rule="evenodd"/>
+<path d="M204 534 a308 308 0 1 0 616 0 a308 308 0 1 0 -616 0 Z M390 534 a122 122 0 1 1 244 0 a122 122 0 1 1 -244 0 Z" fill="#000" fill-opacity="0.06" fill-rule="evenodd"/>
+<!-- Platter ring -->
+<path d="M216 512 a296 296 0 1 0 592 0 a296 296 0 1 0 -592 0 Z M378 512 a134 134 0 1 1 268 0 a134 134 0 1 1 -268 0 Z" fill="url(#plat)" fill-rule="evenodd"/>
+<!-- Tracks and lifebuoy bands, clipped to the ring -->
+<g clip-path="url(#rc)">
+  <circle cx="512" cy="512" r="170" fill="none" stroke="#000" stroke-opacity="0.07" stroke-width="2.5"/>
+  <circle cx="512" cy="512" r="200" fill="none" stroke="#000" stroke-opacity="0.07" stroke-width="2.5"/>
+  <circle cx="512" cy="512" r="230" fill="none" stroke="#000" stroke-opacity="0.07" stroke-width="2.5"/>
+  <circle cx="512" cy="512" r="260" fill="none" stroke="#000" stroke-opacity="0.07" stroke-width="2.5"/>
+  <path d="M780.27 637.10 A296 296 0 0 1 637.10 780.27 L568.63 633.45 A134 134 0 0 0 633.45 568.63 Z" fill="url(#band)"/>
+  <path d="M386.90 780.27 A296 296 0 0 1 243.73 637.10 L390.55 568.63 A134 134 0 0 0 455.37 633.45 Z" fill="url(#band)"/>
+  <path d="M243.73 386.90 A296 296 0 0 1 386.90 243.73 L455.37 390.55 A134 134 0 0 0 390.55 455.37 Z" fill="url(#band)"/>
+  <path d="M637.10 243.73 A296 296 0 0 1 780.27 386.90 L633.45 455.37 A134 134 0 0 0 568.63 390.55 Z" fill="url(#band)"/>
+</g>
+<path d="M216 512 a296 296 0 1 0 592 0 a296 296 0 1 0 -592 0 Z M378 512 a134 134 0 1 1 268 0 a134 134 0 1 1 -268 0 Z" fill="none" stroke="#000" stroke-opacity="0.18" stroke-width="3"/>
+<!-- Spindle hub -->
+<circle cx="512" cy="512" r="56" fill="url(#plat)"/>
+<circle cx="512" cy="512" r="56" fill="none" stroke="#000" stroke-opacity="0.18" stroke-width="3"/>
+<circle cx="512" cy="512" r="18" fill="#25292B"/>
+</svg>
