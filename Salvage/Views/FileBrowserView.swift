@@ -123,8 +123,7 @@ struct FileBrowserView: View {
             }
             .width(min: 160, ideal: 240)
             TableColumn("Path", value: \ResultsViewModel.Row.path) { row in
-                Text(row.path).lineLimit(1).truncationMode(.middle).foregroundStyle(.secondary)
-            }
+                Text(row.path).lineLimit(1).truncationMode(.middle).foregroundStyle(.secondary)            }
             .width(min: 120, ideal: 220)
             TableColumn("Size", value: \ResultsViewModel.Row.sizeBytes) { row in
                 Text(ByteCountFormatter.string(fromByteCount: row.sizeBytes, countStyle: .file)).monospacedDigit()
@@ -148,6 +147,7 @@ struct FileBrowserView: View {
             }
         }
         .focused($tableFocused)
+        .accessibilityLabel("Files")
         .accessibilityIdentifier("file-table")
         // Space previews, like Quick Look: it shows a hidden preview and never hides a shown one.
         .onKeyPress(.space) {
@@ -186,6 +186,7 @@ struct FileBrowserView: View {
                         ConfidenceLabel(confidence: row.confidence)
                     }
                     .accessibilityElement(children: .ignore)
+                    .accessibilityAddTraits(.isStaticText)
                     .accessibilityLabel(ConfidenceLabel(confidence: row.confidence).accessibilityText)
                     if !row.isRecoverable {
                         Text("Salvage couldn't locate this file's contents on the device.")
