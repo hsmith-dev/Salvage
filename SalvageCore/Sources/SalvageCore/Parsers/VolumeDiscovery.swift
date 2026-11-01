@@ -7,6 +7,13 @@ extension Data {
         }
         return (0..<width).reduce(0) { $0 | UInt64(self[startIndex + offset + $1]) << ($1 * 8) }
     }
+    /// Big-endian counterpart of `number`, for HFS+ headers.
+    func bigEndian(_ offset: Int, _ width: Int) throws -> UInt64 {
+        guard offset >= 0, width > 0, width <= 8, offset <= count, width <= count - offset else {
+            throw ScanError.malformed("Truncated structure.")
+        }
+        return (0..<width).reduce(0) { $0 << 8 | UInt64(self[startIndex + offset + $1]) }
+    }
 }
 
 func checkedAdd(_ a: Int64, _ b: Int64) throws -> Int64 {
@@ -24,10 +31,31 @@ func signed(_ value: UInt64) throws -> Int64 {
     return Int64(value)
 }
 
-struct VolumeExtent: Sendable { let offset: Int64; let length: Int64; var format: VolumeFormat = .fat }
+struct VolumeExtent: Sendable {
+    let offset: Int64
+    let length: Int64
+    var format: VolumeFormat = .fat
+    /// A filesystem found in unallocated space (FR-9). It is read in place like any other extent;
+    /// nothing is ever written back to the partition table.
+    var isLost: Bool = false
+    /// Plain-language name of the signature that revealed a lost volume (e.g. "exFAT"); nil means
+    /// `format.displayName`.
+    var formatName: String? = nil
+}
 
 struct VolumeDiscovery {
     let reader: any BlockReader
+    /// Bounds for the unallocated-space search: header probes and header bytes read per device.
+    /// Probing is sparse (one or two 512-byte reads per probe), so the byte cap mostly guards the
+    /// header-length reads that follow a hit.
+    var maxProbes = 16384
+    var maxProbeBytes: Int64 = 64 << 20
+    /// Candidate offsets: every MiB; 4 KiB steps across the first 64 MiB of the device and the
+    /// first MiB after each known or found extent; and the classic first-partition sectors (GPT's
+    /// first usable LBA 34, CHS's sector 63) that none of those alignments reach.
+    static let fineStride: Int64 = 4096, coarseStride: Int64 = 1 << 20, fineRegion: Int64 = 64 << 20
+    static let classicStarts: [Int64] = [34 * 512, 63 * 512]
+
     func read(_ offset: Int64, _ count: Int) async throws -> Data {
         try Task.checkCancellation()
         guard offset >= 0, count >= 0, offset <= reader.sizeBytes,
@@ -47,11 +75,34 @@ struct VolumeDiscovery {
             throw ScanError.malformed("Only devices with 512-byte logical sectors are supported in this version.")
         }
         let boot = try await read(0, 512)
-        if let format = try await format(at: 0, length: reader.sizeBytes) {
+        if let format = try await format(boot: boot, at: 0, length: reader.sizeBytes) {
             guard format.isScannable else { throw ScanError.unsupportedFilesystem }
             return [VolumeExtent(offset: 0, length: reader.sizeBytes, format: format)]
         }
-        guard try boot.number(510, 2) == 0xaa55 else { throw ScanError.unsupportedFilesystem }
+        // Every table entry is a known extent, supported or not: the unallocated-space search never
+        // probes inside one, so a mapped partition always wins over a stale header within it.
+        var known: [VolumeExtent] = []
+        if try boot.number(510, 2) == 0xaa55 { known = try await partitions(boot) }
+        var supported: [VolumeExtent] = []
+        for extent in known {
+            if let format = try await format(at: extent.offset, length: extent.length), format.isScannable {
+                supported.append(VolumeExtent(offset: extent.offset, length: extent.length, format: format))
+            }
+        }
+        let lost = try await lostVolumes(excluding: known)
+        let result = (supported + lost).sorted { $0.offset < $1.offset }
+        if result.isEmpty {
+            // A table whose volumes are all recognized but unsupported keeps the honest "not supported"
+            // answer. With no table and no signature anywhere, one raw extent lets the sweep and the
+            // carver still run, so completion reports carved files or none, never a silent skip.
+            guard known.isEmpty else { throw ScanError.unsupportedFilesystem }
+            return [VolumeExtent(offset: 0, length: reader.sizeBytes, format: .raw)]
+        }
+        return result
+    }
+
+    /// MBR (or protective-MBR + GPT) entries as bare extents, sorted and non-overlapping.
+    func partitions(_ boot: Data) async throws -> [VolumeExtent] {
         var extents: [VolumeExtent] = []
         var protective = false
         for n in 0..<4 {
@@ -74,18 +125,145 @@ struct VolumeDiscovery {
                 throw ScanError.malformed("Overlapping partitions.")
             }
         }
-        var supported: [VolumeExtent] = []
-        for extent in sorted {
-            if let format = try await format(at: extent.offset, length: extent.length), format.isScannable {
-                supported.append(VolumeExtent(offset: extent.offset, length: extent.length, format: format))
+        return sorted
+    }
+
+    // MARK: Unallocated space (FR-9)
+
+    /// Unallocated byte ranges: the device minus `known` (sorted, non-overlapping).
+    static func gaps(in sizeBytes: Int64, excluding known: [VolumeExtent]) -> [Range<Int64>] {
+        var gaps: [Range<Int64>] = [], cursor: Int64 = 0
+        for extent in known {
+            if extent.offset > cursor { gaps.append(cursor..<extent.offset) }
+            cursor = max(cursor, extent.offset + extent.length)
+        }
+        if cursor < sizeBytes { gaps.append(cursor..<sizeBytes) }
+        return gaps
+    }
+
+    struct ProbeState {
+        var found: [VolumeExtent] = []
+        var probed: Set<Int64> = []
+        var probes = 0
+        var bytes: Int64 = 0
+    }
+
+    /// Filesystem headers in unallocated space. Two bounded passes in device order, the likelier
+    /// starts first: every gap's own start, the classic first-partition sectors, 4 KiB steps for the
+    /// first MiB after each known or found extent, and every MiB; then 4 KiB steps across the first
+    /// 64 MiB. A hit's span (from its own header geometry) is skipped, and a candidate that would
+    /// run into a known extent or an earlier hit is dropped: known extents and earlier hits win.
+    func lostVolumes(excluding known: [VolumeExtent]) async throws -> [VolumeExtent] {
+        let gaps = Self.gaps(in: reader.sizeBytes, excluding: known)
+        // `discover()` has already checked offset 0 against the whole device.
+        var state = ProbeState(probed: [0])
+        for pass in 0..<2 {
+            // The first pass keeps a quarter of the budget for the fine pass.
+            let cap = pass == 0 ? maxProbes - maxProbes / 4 : maxProbes
+            for gap in gaps where pass == 0 || gap.lowerBound < Self.fineRegion {
+                var offset = gap.lowerBound, fineUntil = gap.lowerBound + Self.coarseStride
+                while offset < gap.upperBound, state.probes < cap, state.bytes < maxProbeBytes {
+                    try Task.checkCancellation()
+                    if let hit = state.found.first(where: { $0.offset <= offset && offset < $0.offset + $0.length }) {
+                        // Probe finely right after a found volume, as after a known extent.
+                        offset = hit.offset + hit.length; fineUntil = offset + Self.coarseStride; continue
+                    }
+                    if pass == 1, offset >= Self.fineRegion { break }
+                    if !state.probed.contains(offset) {
+                        if let extent = try await probe(at: offset, gapEnd: gap.upperBound, state: &state) {
+                            state.found.append(extent); continue
+                        }
+                    }
+                    guard let next = Self.nextCandidate(after: offset, fineUntil: fineUntil, pass: pass) else { break }
+                    offset = next
+                }
             }
         }
-        guard !supported.isEmpty else { throw ScanError.unsupportedFilesystem }
-        return supported
+        return state.found
     }
+
+    /// The next candidate offset after `offset`, or nil when the pass has none left in this gap.
+    static func nextCandidate(after offset: Int64, fineUntil: Int64, pass: Int) -> Int64? {
+        func aligned(_ stride: Int64) -> Int64 { (offset / stride + 1) * stride }
+        if pass == 1 { return offset < fineRegion ? aligned(fineStride) : nil }
+        var next = aligned(coarseStride)
+        if offset + 1 < fineUntil { next = min(next, aligned(fineStride)) }
+        if let classic = classicStarts.first(where: { $0 > offset }) { next = min(next, classic) }
+        return next
+    }
+
+    /// One header probe. A hit returns a lost extent whose length comes from the header and fits the
+    /// gap (clamped to the device end); a header with implausible geometry, or one that overlaps a
+    /// known extent or an earlier hit, is dropped.
+    func probe(at offset: Int64, gapEnd: Int64, state: inout ProbeState) async throws -> VolumeExtent? {
+        state.probes += 1; state.probed.insert(offset)
+        let remaining = gapEnd - offset
+        guard remaining >= 512 else { return nil }
+        let boot = try await read(offset, 512)
+        state.bytes += 1024
+        guard let format = try await format(boot: boot, at: offset, length: remaining) else { return nil }
+        state.bytes += 2048
+        let length: Int64?
+        do { length = try await volumeLength(format: format, boot: boot, at: offset) }
+        catch ScanError.malformed { return nil } catch ScanError.unsupportedFilesystem { return nil }
+        guard let length, length > 0 else { return nil }
+        // A header running past the device end is clamped (a short image or an overwritten tail);
+        // one running into a known extent is dropped, since the mapped partition wins.
+        let end = min(offset + length, reader.sizeBytes)
+        guard end > offset, end <= gapEnd else { return nil }
+        guard !state.found.contains(where: { $0.offset < end && offset < $0.offset + $0.length }) else { return nil }
+        let name = format == .fat ? (String(decoding: boot[3..<11], as: UTF8.self) == "EXFAT   " ? "exFAT" : "FAT32") : format.displayName
+        return VolumeExtent(offset: offset, length: end - offset, format: format, isLost: true, formatName: name)
+    }
+
+    /// A volume's byte length from its own header only: FAT BPB total sectors, NTFS total sectors
+    /// (plus the backup boot sector), ext blocks count × block size, APFS container block count ×
+    /// block size, HFS+ total blocks × block size. Nil when the header carries no size (a bare
+    /// APFS volume superblock, a raw region). Not clamped; the caller fits it to the device.
+    func volumeLength(format: VolumeFormat, at offset: Int64) async throws -> Int64? {
+        try await volumeLength(format: format, boot: read(offset, 512), at: offset)
+    }
+    func volumeLength(format: VolumeFormat, boot: Data, at offset: Int64) async throws -> Int64? {
+        switch format {
+        case .fat:
+            if String(decoding: boot[3..<11], as: UTF8.self) == "EXFAT   " {
+                let shift = try boot.number(108, 1)
+                guard (9...12).contains(shift) else { throw ScanError.malformed("Unsupported exFAT sector size.") }
+                return try checkedMultiply(signed(boot.number(72, 8)), Int64(1) << shift)
+            }
+            let sector = try signed(boot.number(11, 2))
+            var total = try signed(boot.number(32, 4))
+            if total == 0 { total = try signed(boot.number(19, 2)) }
+            return try checkedMultiply(total, sector)
+        case .ntfs:
+            let sector = try signed(boot.number(11, 2))
+            guard (512...4096).contains(sector), sector & (sector - 1) == 0 else { throw ScanError.malformed("Unsupported NTFS sector size.") }
+            return try checkedMultiply(checkedAdd(signed(boot.number(0x28, 8)), 1), sector)
+        case .apfs:
+            guard String(decoding: boot[32..<36], as: UTF8.self) == "NXSB" else { return nil }
+            let blockSize = try signed(boot.number(36, 4))
+            guard (4096...65536).contains(blockSize), blockSize & (blockSize - 1) == 0 else { throw ScanError.malformed("Unsupported APFS block size.") }
+            return try checkedMultiply(signed(boot.number(40, 8)), blockSize)
+        case .ext:
+            let sb = try await read(checkedAdd(offset, 1024), 1024)
+            let logBlock = try sb.number(24, 4)
+            guard logBlock <= 6 else { throw ScanError.malformed("Invalid ext block size.") }
+            let wide = try sb.number(76, 4) >= 1 && sb.number(96, 4) & 0x80 != 0
+            let blocks = try sb.number(4, 4) | (wide ? sb.number(336, 4) << 32 : 0)
+            return try checkedMultiply(signed(blocks), Int64(1024) << logBlock)
+        case .hfsPlus:
+            let header = try await read(checkedAdd(offset, 1024), 512)
+            return try checkedMultiply(signed(header.bigEndian(44, 4)), signed(header.bigEndian(40, 4)))
+        case .raw:
+            return nil
+        }
+    }
+
     /// Identifies a volume by its on-disk signature; the format's own parser validates the rest.
     func format(at offset: Int64, length: Int64) async throws -> VolumeFormat? {
-        let boot = try await read(offset, 512)
+        try await format(boot: read(offset, 512), at: offset, length: length)
+    }
+    func format(boot: Data, at offset: Int64, length: Int64) async throws -> VolumeFormat? {
         if isFAT(boot) { return .fat }
         if String(decoding: boot[3..<11], as: UTF8.self) == "NTFS    " { return .ntfs }
         // APFS: nx_superblock (container) or apfs_superblock (bare unlocked volume), magic at 32.

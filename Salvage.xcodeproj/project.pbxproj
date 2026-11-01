@@ -9,7 +9,9 @@
 /* Begin PBXBuildFile section */
 		0062F4592C4C75593540D448 /* ScanProgressView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B06FDFC018E70AED252E2AD4 /* ScanProgressView.swift */; };
 		074A456E4F66C3ABB0932402 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 40F847D0B32D43697B452ADB /* main.swift */; };
+		07C3FE9D4D3ABA0C679465B3 /* ReadOnlySourceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9B50FA188E574035619F7D8 /* ReadOnlySourceTests.swift */; };
 		0D31EF07325DE657CECF20A8 /* RecoveryCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F82CDD0036874C3DF40E624 /* RecoveryCoordinatorTests.swift */; };
+		1027B642F1C02B9E6BB77D81 /* LostPartitionsCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16A95B3E1FAD0DD697F774E3 /* LostPartitionsCard.swift */; };
 		13470E4C7A849C2924C5A455 /* SalvageDiskIO in Frameworks */ = {isa = PBXBuildFile; productRef = CA3B2287E3126452573584A3 /* SalvageDiskIO */; };
 		141EC4A99902299F276C46AF /* ScanCheckpointStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A823EAB151C49C3DEBC69CF6 /* ScanCheckpointStore.swift */; };
 		1E8AF016B1A0E95B494EAAED /* RecoverySheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 808421B06766C5A9FFA274ED /* RecoverySheet.swift */; };
@@ -91,6 +93,7 @@
 		0A4FDEF94C4B425FCAF71692 /* SalvageCore */ = {isa = PBXFileReference; lastKnownFileType = folder; name = SalvageCore; path = SalvageCore; sourceTree = SOURCE_ROOT; };
 		0CD075B0C20C5E1B3BB018F0 /* BSDDeviceNames.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BSDDeviceNames.swift; sourceTree = "<group>"; };
 		13AB8B7E7A20544CD69D8CBF /* PreviewLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewLoader.swift; sourceTree = "<group>"; };
+		16A95B3E1FAD0DD697F774E3 /* LostPartitionsCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LostPartitionsCard.swift; sourceTree = "<group>"; };
 		181533C1F6458A10898E049A /* HelperApprovalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HelperApprovalView.swift; sourceTree = "<group>"; };
 		200C8811715FB24AA7CA8091 /* DeviceListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceListView.swift; sourceTree = "<group>"; };
 		207452AAAA5C899682CD4D98 /* PrivilegedDiskQueries.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivilegedDiskQueries.swift; sourceTree = "<group>"; };
@@ -117,6 +120,7 @@
 		B0933542F4F7159EED639D23 /* SalvageDiskIO */ = {isa = PBXFileReference; lastKnownFileType = folder; name = SalvageDiskIO; path = SalvageDiskIO; sourceTree = SOURCE_ROOT; };
 		B1DE755CB1D6209CEB18BBAE /* SalvageApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SalvageApp.swift; sourceTree = "<group>"; };
 		C5742DFC4C322D2335F60B77 /* Salvage.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Salvage.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		C9B50FA188E574035619F7D8 /* ReadOnlySourceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReadOnlySourceTests.swift; sourceTree = "<group>"; };
 		C9D545C7519DEC1E75E987A4 /* SalvageTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SalvageTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		E40E27E6E6443F51724D8027 /* DeviceListViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceListViewModelTests.swift; sourceTree = "<group>"; };
 		EDF6E74F57E1D6B66721A701 /* ResultsViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResultsViewModelTests.swift; sourceTree = "<group>"; };
@@ -162,6 +166,7 @@
 			children = (
 				E40E27E6E6443F51724D8027 /* DeviceListViewModelTests.swift */,
 				5482A784FE2B89690AB6EF74 /* PreviewLoaderTests.swift */,
+				C9B50FA188E574035619F7D8 /* ReadOnlySourceTests.swift */,
 				3F82CDD0036874C3DF40E624 /* RecoveryCoordinatorTests.swift */,
 				EDF6E74F57E1D6B66721A701 /* ResultsViewModelTests.swift */,
 				7D688D515CDA1F3D3D907DEB /* ScanViewModelTests.swift */,
@@ -206,6 +211,7 @@
 				46C282C21C963EE0A2EEB372 /* FileBrowserView.swift */,
 				8E17D8A77B7537474A88104D /* FilePreviewView.swift */,
 				181533C1F6458A10898E049A /* HelperApprovalView.swift */,
+				16A95B3E1FAD0DD697F774E3 /* LostPartitionsCard.swift */,
 				808421B06766C5A9FFA274ED /* RecoverySheet.swift */,
 				32F1F12AAAACFF6920FA4E1E /* ResultsDashboardView.swift */,
 				B06FDFC018E70AED252E2AD4 /* ScanProgressView.swift */,
@@ -426,6 +432,7 @@
 				B7B0C2A5219E6799897814A2 /* FileBrowserView.swift in Sources */,
 				7258392A62CEBE52A5E50D56 /* FilePreviewView.swift in Sources */,
 				C7C0D2892751F06B6080B61C /* HelperApprovalView.swift in Sources */,
+				1027B642F1C02B9E6BB77D81 /* LostPartitionsCard.swift in Sources */,
 				29BABD96F117CF581C32C536 /* PreviewLoader.swift in Sources */,
 				531815604B039A4847467A94 /* RecoveryCoordinator.swift in Sources */,
 				1E8AF016B1A0E95B494EAAED /* RecoverySheet.swift in Sources */,
@@ -448,6 +455,7 @@
 			files = (
 				D86AD77E4FE679401396EFA9 /* DeviceListViewModelTests.swift in Sources */,
 				7D91E05428F149D39FF3CE3F /* PreviewLoaderTests.swift in Sources */,
+				07C3FE9D4D3ABA0C679465B3 /* ReadOnlySourceTests.swift in Sources */,
 				0D31EF07325DE657CECF20A8 /* RecoveryCoordinatorTests.swift in Sources */,
 				EF65AF81B3862EDF22A9CEF2 /* ResultsViewModelTests.swift in Sources */,
 				59D8A403E40711D298D4493F /* ScanViewModelTests.swift in Sources */,

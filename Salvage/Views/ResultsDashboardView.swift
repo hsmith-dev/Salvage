@@ -13,17 +13,23 @@ struct ResultsView: View {
                 if browsing {
                     FileBrowserView(model: model, source: scan.source, onBack: { browsing = false })
                 } else {
-                    ResultsDashboardView(model: model, scan: scan) { category in
+                    ResultsDashboardView(model: model, scan: scan, onOpen: { category in
                         model.category = category
+                        model.volumeFilter = nil
                         model.focusedID = nil
                         browsing = true
-                    }
+                    }, onOpenLostPartition: { partition in
+                        model.category = nil
+                        model.volumeFilter = partition.offset
+                        model.focusedID = nil
+                        browsing = true
+                    })
                 }
             } else {
                 ProgressView("Organizing results…").frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .task { if model == nil { model = await ResultsViewModel.build(files: scan.files) } }
+        .task { if model == nil { model = await ResultsViewModel.build(files: scan.files, lostPartitions: scan.lostPartitions) } }
     }
 }
 
@@ -33,6 +39,8 @@ struct ResultsDashboardView: View {
     let scan: ScanViewModel
     /// Opens the File Browser, filtered to a category or (nil) showing everything.
     let onOpen: (FileCategory?) -> Void
+    /// Opens the File Browser scoped to one lost partition's files (FR-9/FR-10).
+    var onOpenLostPartition: (LostPartitionCandidate) -> Void = { _ in }
 
     var body: some View {
         ScrollView {
@@ -70,6 +78,10 @@ struct ResultsDashboardView: View {
                             .font(.subheadline).foregroundStyle(.secondary)
                         Button("Browse all files") { onOpen(nil) }
                     }
+                }
+                // Its own section, after the type grid and never inside it (FR-9).
+                if !model.lostPartitions.isEmpty {
+                    LostPartitionsCard(model: model, onOpen: onOpenLostPartition)
                 }
                 if totals.unrecoverableCount > 0 {
                     VStack(alignment: .leading, spacing: 8) {

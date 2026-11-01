@@ -46,11 +46,23 @@ public struct ScanSession: Sendable, Identifiable {
                 }
             }
             try await emit(.progress(bytesScanned: await measured.measured, totalBytes: total))
+            // Lost partitions (FR-9) are announced before any scanning so the app can show them while
+            // their files stream in; they are then scanned and swept exactly like mapped volumes.
+            for extent in extents where extent.isLost {
+                try await emit(.lostPartitionFound(LostPartitionCandidate(
+                    offset: extent.offset, sizeBytes: extent.length, formatName: extent.formatName ?? extent.format.displayName)))
+            }
             for extent in extents {
-                try await scanVolume(extent, reader: measured, device: device, emit: { event in
-                    if case .found(let file) = event, case .runs(let runs) = file.content { await claimed.add(runs) }
-                    try await emit(event)
-                })
+                do {
+                    try await scanVolume(extent, reader: measured, device: device, emit: { event in
+                        if case .found(let file) = event, case .runs(let runs) = file.content { await claimed.add(runs) }
+                        try await emit(event)
+                    })
+                } catch let error as ScanError where extent.isLost && error.isMetadataFailure {
+                    // A lost partition is detected, not confirmed: damaged or unsupported metadata inside it
+                    // stops only its own parser. Its files found so far stay, mapped volumes are unaffected,
+                    // and the sweep below still reads (and carves) every byte of it.
+                }
             }
             // Finish a bounded, read-only pass over supported volumes. Progress measures unique
             // source bytes actually read, including metadata; unsupported partitions are skipped.
@@ -168,6 +180,16 @@ public extension AsyncStream<ScanEvent>.Continuation {
                 try await Task.sleep(for: .milliseconds(1))
             @unknown default: throw CancellationError()
             }
+        }
+    }
+}
+
+extension ScanError {
+    /// Failures that describe the metadata being read rather than the device or the session.
+    var isMetadataFailure: Bool {
+        switch self {
+        case .malformed, .unsupportedFilesystem: true
+        default: false
         }
     }
 }
